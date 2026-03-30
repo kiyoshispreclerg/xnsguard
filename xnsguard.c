@@ -251,14 +251,17 @@ int is_ignored(const char *exe, int action_id) {
         return 0;
     }
 
+    const char *action_name = action_to_string(action_id);
+    if (!action_name || strcmp(action_name, "UNKNOWN") == 0)
+        return 0;
+
     pthread_mutex_lock(&ignored_lock);
     for (int i = 0; i < ignored_count; i++) {
-        if (fnmatch(ignored_cmds[i].exe_pattern, exe, FNM_PATHNAME | FNM_NOESCAPE) != 0) {
+        if (fnmatch(ignored_cmds[i].exe_pattern, exe, FNM_PATHNAME | FNM_NOESCAPE) != 0)
             continue;
-        }
-        
-        if (ignored_cmds[i].action > 0 ||
-            ignored_cmds[i].action == action_id) {
+
+        if (ignored_cmds[i].action[0] == '\0' || 
+            strcasecmp(ignored_cmds[i].action, action_name) == 0) {
             pthread_mutex_unlock(&ignored_lock);
             return 1;
         }
