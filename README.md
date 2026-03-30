@@ -70,3 +70,11 @@ Examples:
 `ALLOW ALL /home/kiyoshi/Downloads/syncthing`
 
 `DENY RECORD *`
+
+### Ignore Reports
+
+Because Xnotify sends notifications about every single interaction with protected places in its code, sometimes XnsGuard floods
+the terminal with these. So the user can add a list of programs to the file ignore.conf in the same path of perms.conf, and
+reports coming from these programs will not be shown. It can be a good idea to add programs required for the session, such as
+window, clipboard, keyboard layout and session managers.
+
