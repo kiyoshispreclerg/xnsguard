@@ -104,6 +104,7 @@ static char perms_file[512] = {0};
 static time_t last_config_mtime = 0;
 
 struct SeenAlert {
+    char exe[PATH_MAX];
     pid_t pid;
     int action;
 };
@@ -341,27 +342,27 @@ void save_ignored_entry(const char *exe, int action_id) {
     load_user_config();
 }
 
-int is_seen(pid_t pid, int action) {
+int is_seen(const char *exe, int action) {
     for (int i = 0; i < seen_count; i++) {
-        if (seen_alerts[i].pid == pid && seen_alerts[i].action == action) {
+        if (strcmp(seen_alerts[i].exe, exe) == 0 && seen_alerts[i].action == action) {
             return 1;
         }
     }
     return 0;
 }
 
-void add_seen(pid_t pid, int action) {
+void add_seen(const char *exe, int action) {
     if (seen_count < MAX_ALERTS) {
-        seen_alerts[seen_count].pid = pid;
+        strncpy(seen_alerts[seen_count].exe, exe, sizeof(seen_alerts[seen_count].exe)-1);
         seen_alerts[seen_count].action = action;
         seen_count++;
     }
 }
 
-void remove_seen_for_pid(pid_t pid) {
+void remove_seen_for_exe(const char *exe, int action) {
     int i = 0;
     while (i < seen_count) {
-        if (seen_alerts[i].pid == pid) {
+        if (strcmp(seen_alerts[i].exe, exe) == 0 && seen_alerts[i].action == action) {
             for (int j = i; j < seen_count - 1; j++) {
                 seen_alerts[j] = seen_alerts[j + 1];
             }
@@ -527,7 +528,7 @@ void handle_message(const char *msg) {
         return;
     }
     
-    if (is_seen(pid, action)) {
+    if (is_seen(exe, action)) {
         log_filtered(3, "Duplicate request %s %s (%d) - ignoring", action_str, exe, pid);
         return;
     }
@@ -541,7 +542,7 @@ void handle_message(const char *msg) {
         }
     }
 
-    add_seen(pid, action);
+    add_seen(exe, action);
 
     pthread_mutex_lock(&queue_lock);
     if (alert_count < MAX_ALERTS) {
@@ -576,7 +577,7 @@ void process_next_alert() {
     if (kill(alert.pid, 0) != 0 && errno == ESRCH) {
         log_filtered(2, "PID %d no longer exists, discarding alert", alert.pid);
         remove_all_alerts_for_pid(alert.pid);
-        remove_seen_for_pid(alert.pid);
+        remove_seen_for_exe(alert.exe, alert.action);
         //pthread_mutex_unlock(&queue_lock);
         return;
     }
