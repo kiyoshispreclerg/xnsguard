@@ -26,10 +26,11 @@
 #define XNOTIFY_COMPOSITE        3
 #define XNOTIFY_SCREEN           4
 #define XNOTIFY_RECORD           5
-#define XNOTIFY_INPUT            6
+#define XNOTIFY_CURSOR           6
 #define XNOTIFY_INPUT_GRAB       7
 #define XNOTIFY_INPUT_INJECT     8
 #define XNOTIFY_HOTKEY           9
+#define XNOTIFY_INPUT           10
 
 static const struct {
     int   id;
@@ -40,10 +41,11 @@ static const struct {
     { XNOTIFY_COMPOSITE,     "COMPOSITE" },
     { XNOTIFY_SCREEN,        "SCREEN" },
     { XNOTIFY_RECORD,        "RECORD" },
-    { XNOTIFY_INPUT,         "INPUT" },
+    { XNOTIFY_CURSOR,        "CURSOR" },
     { XNOTIFY_INPUT_GRAB,    "INPUT_GRAB" },
     { XNOTIFY_INPUT_INJECT,  "INPUT_INJECT" },
     { XNOTIFY_HOTKEY,        "HOTKEY" },
+    { XNOTIFY_INPUT,         "INPUT" },
     { 0, NULL }
 };
 
