@@ -105,6 +105,17 @@ static char config_dir[256] = "";
 static char perms_file[512] = {0};
 static time_t last_config_mtime = 0;
 
+static char ignore_file[512] = {0};
+static time_t last_ignore_mtime = 0;
+
+struct IgnoredReport {
+    char exe[PATH_MAX];
+};
+
+static struct IgnoredReport ignored_reports[MAX_IGNORED];
+static int ignored_reports_count = 0;
+static pthread_mutex_t report_ignore_lock = PTHREAD_MUTEX_INITIALIZER;
+
 struct SeenAlert {
     char exe[PATH_MAX];
     pid_t pid;
@@ -235,6 +246,43 @@ void load_user_config(void) {
     pthread_mutex_unlock(&ignored_lock);
 }
 
+/* ====================== IGNORE REPORTS CONFIG ====================== */
+
+void load_ignore_reports(void) {
+    pthread_mutex_lock(&report_ignore_lock);
+    ignored_reports_count = 0;
+
+    FILE *file = fopen(ignore_file, "r");
+    if (!file) {
+        log_filtered(3, "No ignore.conf found at %s (normal)", ignore_file);
+        pthread_mutex_unlock(&report_ignore_lock);
+        return;
+    }
+
+    char line[BUF_SIZE];
+    while (fgets(line, sizeof(line), file)) {
+        line[strcspn(line, "\n")] = 0;
+        char *trimmed = trim(line);
+
+        if (strlen(trimmed) == 0 || trimmed[0] == '#')
+            continue;
+
+        if (ignored_reports_count >= MAX_IGNORED) {
+            log_msg("Warning: maximum ignore reports (%d) reached", MAX_IGNORED);
+            continue;
+        }
+
+        strncpy(ignored_reports[ignored_reports_count].exe, trimmed, PATH_MAX - 1);
+        ignored_reports[ignored_reports_count].exe[PATH_MAX - 1] = '\0';
+        ignored_reports_count++;
+    }
+
+    fclose(file);
+    last_ignore_mtime = time(NULL);
+    log_filtered(3, "Loaded %d entries to ignore reports from %s", ignored_reports_count, ignore_file);
+    pthread_mutex_unlock(&report_ignore_lock);
+}
+
 int file_has_changed() {
     time_t current = get_config_max_mtime();
     if (current > last_config_mtime) {
@@ -269,6 +317,21 @@ int is_ignored(const char *exe, int action_id) {
         }
     }
     pthread_mutex_unlock(&ignored_lock);
+    return 0;
+}
+
+int is_report_ignored(const char *exe) {
+    if (!exe || *exe == '\0' || strcmp(exe, "?") == 0)
+        return 0;
+
+    pthread_mutex_lock(&report_ignore_lock);
+    for (int i = 0; i < ignored_reports_count; i++) {
+        if (strcmp(ignored_reports[i].exe, exe) == 0) {
+            pthread_mutex_unlock(&report_ignore_lock);
+            return 1;
+        }
+    }
+    pthread_mutex_unlock(&report_ignore_lock);
     return 0;
 }
 
@@ -512,6 +575,10 @@ void handle_message(const char *msg) {
     const char *action_str = action_to_string(action);
 
     if (strcmp(command, "REPORT") == 0) {
+        if (is_report_ignored(exe)) {
+            // Silencioso - não loga nada
+            return;
+        }
         log_msg("REPORT: %s is using %s (%d)", exe, action_str, action);
         time_t now = time(NULL);
         if (strcmp(exe, last_report.exe) == 0 && action == last_report.action &&
@@ -761,6 +828,7 @@ int main(int argc, char *argv[]) {
     }
 
     snprintf(perms_file, sizeof(perms_file), "%s/perms.conf", config_dir);
+    snprintf(ignore_file, sizeof(ignore_file), "%s/ignore.conf", config_dir);
     mkdir(config_dir, 0755);
 
     log_msg("XnsGuard starting - user config: %s", perms_file);
@@ -769,6 +837,7 @@ int main(int argc, char *argv[]) {
         return 1;
 
     load_user_config();
+    load_ignore_reports();
     send_heartbeat();
 
     /* === Server socket setup === */
