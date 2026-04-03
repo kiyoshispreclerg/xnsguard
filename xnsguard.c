@@ -246,6 +246,47 @@ void load_user_config(void) {
     pthread_mutex_unlock(&ignored_lock);
 }
 
+/* ====================== SYNC PERMISSIONS TO X SERVER ====================== */
+
+void send_all_permissions_to_xserver(void) {
+    pthread_mutex_lock(&ignored_lock);
+
+    int sent = 0;
+    for (int i = 0; i < ignored_count; i++) {
+        const char *pat = ignored_cmds[i].exe_pattern;
+        const char *act_str = ignored_cmds[i].action;
+
+        if (act_str[0] == '\0') {
+            /* ALLOW ALL <pattern> */
+            send_permission(0, pat, 0, 2);           /* command_type 2 = ALLOW_ALL */
+            sent++;
+        }
+        else if (strcmp(pat, "*") == 0) {
+            /* ALLOW <ACTION>  (sem exe → allow_all para essa ação) */
+            int action_id = string_to_action(act_str);
+            if (action_id > 0) {
+                send_permission(action_id, "", 0, 3); /* command_type 3 = ALLOW_ACTION */
+                sent++;
+            }
+        }
+        else {
+            /* ALLOW <ACTION> <exe> */
+            int action_id = string_to_action(act_str);
+            if (action_id > 0) {
+                send_permission(action_id, pat, 0, 0); /* command_type 0 = ALLOW normal */
+                sent++;
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&ignored_lock);
+
+    if (sent > 0)
+        log_filtered(2, "Full sync: sent %d permission rules to X server", sent);
+    else
+        log_filtered(3, "Full sync: no rules to send (perms.conf empty)");
+}
+
 /* ====================== IGNORE REPORTS CONFIG ====================== */
 
 void load_ignore_reports(void) {
@@ -838,6 +879,7 @@ int main(int argc, char *argv[]) {
 
     load_user_config();
     load_ignore_reports();
+    send_all_permissions_to_xserver();
     send_heartbeat();
 
     /* === Server socket setup === */
