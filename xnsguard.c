@@ -31,6 +31,8 @@
 #define XNOTIFY_INPUT_INJECT     8
 #define XNOTIFY_HOTKEY           9
 #define XNOTIFY_INPUT           10
+#define XNOTIFY_TREE            11
+#define XNOTIFY_PROP            12
 
 static const struct {
     int   id;
@@ -46,6 +48,27 @@ static const struct {
     { XNOTIFY_INPUT_INJECT,  "INPUT_INJECT" },
     { XNOTIFY_HOTKEY,        "HOTKEY" },
     { XNOTIFY_INPUT,         "INPUT" },
+    { XNOTIFY_TREE,          "TREE" },
+    { XNOTIFY_PROP,          "PROP" },
+    { 0, NULL }
+};
+
+static const struct {
+    int   id;
+    const char *name;
+} action_descriptions[] = {
+    { XNOTIFY_ATTACH,        "Access X server shared memory" },
+    { XNOTIFY_SELECTION,     "Access clipboard" },
+    { XNOTIFY_COMPOSITE,     "Access other windows" },
+    { XNOTIFY_SCREEN,        "Capture the screen" },
+    { XNOTIFY_RECORD,        "Capture events - like keystrokes" },
+    { XNOTIFY_CURSOR,        "Access cursor (mouse)" },
+    { XNOTIFY_INPUT_GRAB,    "Capture mouse or keyboard" },
+    { XNOTIFY_INPUT_INJECT,  "Insert keystrokes" },
+    { XNOTIFY_HOTKEY,        "Register global hotkeys" },
+    { XNOTIFY_INPUT,         "Capture input - even when unfocused" },
+    { XNOTIFY_TREE,          "List open windows" },
+    { XNOTIFY_PROP,          "Access properties of other windows" },
     { 0, NULL }
 };
 
@@ -53,6 +76,14 @@ static const char* action_to_string(int action_id) {
     for (int i = 0; action_names[i].id > 0; i++) {
         if (action_names[i].id == action_id)
             return action_names[i].name;
+    }
+    return "UNKNOWN";
+}
+
+static const char* action_to_description(int action_id) {
+    for (int i = 0; action_descriptions[i].id > 0; i++) {
+        if (action_descriptions[i].id == action_id)
+            return action_descriptions[i].name;
     }
     return "UNKNOWN";
 }
@@ -381,18 +412,20 @@ int is_report_ignored(const char *exe) {
 int show_zenity_dialog(const struct Alert *alert) { 
     char zenity_cmd[8192];
     const char *action_str = action_to_string(alert->action);
+    const char *action_desc = action_to_description(alert->action);
     snprintf(zenity_cmd, sizeof(zenity_cmd),
         "zenity --question "
         "--title='XnsGuard' "
         "--timeout=60 "
         "--text='<b>Program:</b> %s\\n"
-        "<b>Time:</b> %s' "
+        "<b>Time:</b> %s\\n"
+        "<b>Permission:</b> %s' "
         "--ok-label='Allow: %s' "
         "--cancel-label='Deny' "
         "--width=550 "
         "--no-wrap 2>/dev/null",
         alert->exe, alert->time_str,
-        action_str);
+        action_desc, action_str);
 
     log_msg("Showing Zenity dialog for action=%d, pid=%d, exe=%.120s...",
             alert->action, alert->pid, alert->exe);
