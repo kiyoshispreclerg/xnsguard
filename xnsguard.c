@@ -211,6 +211,65 @@ time_t get_config_max_mtime(void) {
     return max_t;
 }
 
+static char *
+trim_exe_for_log(const char *full_path)
+{
+    static char buffer[128];
+
+    if (!full_path || *full_path == '\0') {
+        strcpy(buffer, "?");
+        return buffer;
+    }
+
+    size_t len = strlen(full_path);
+    if (len <= 64) { 
+        strncpy(buffer, full_path, sizeof(buffer)-1);
+        buffer[sizeof(buffer)-1] = '\0';
+        return buffer;
+    }
+
+    const char *last_slash = strrchr(full_path, '/');
+    if (!last_slash) {
+        strncpy(buffer, full_path, sizeof(buffer)-1);
+        buffer[sizeof(buffer)-1] = '\0';
+        return buffer;
+    }
+
+    const char *exe_name = last_slash + 1;
+
+    const char *parent_end = last_slash;
+    while (parent_end > full_path && *(parent_end-1) != '/')
+        parent_end--;
+    size_t parent_len = last_slash - parent_end;
+
+    const char *parent_start = (parent_len > 0) ? parent_end : last_slash;
+
+    size_t fixed_len = strlen(exe_name) + parent_len + 5;
+    if (fixed_len >= sizeof(buffer)-1)
+        fixed_len = sizeof(buffer)-20;
+
+    size_t prefix_max = sizeof(buffer) - fixed_len - 1;
+
+    size_t prefix_len = (size_t)(parent_start - full_path);
+    if (prefix_len > prefix_max) {
+        strncpy(buffer, full_path, prefix_max - 3);
+        strcpy(buffer + prefix_max - 3, "...");
+    } else {
+        strncpy(buffer, full_path, prefix_len);
+        buffer[prefix_len] = '\0';
+    }
+
+    strcat(buffer, "/.../");
+    if (parent_len > 0) {
+        strncat(buffer, parent_start, parent_len);
+        strcat(buffer, "/");
+    }
+    strcat(buffer, exe_name);
+
+    buffer[sizeof(buffer)-1] = '\0';
+    return buffer;
+}
+
 /* ====================== CONFIG (USER ONLY) ====================== */
 
 void load_user_config(void) {
@@ -444,7 +503,7 @@ int show_zenity_dialog(const struct Alert *alert) {
         action_desc, action_str);
 
     log_msg("Showing Zenity dialog for action=%d, pid=%d, exe=%.120s...",
-            alert->action, alert->pid, alert->exe);
+            alert->action, alert->pid, trim_exe_for_log(alert->exe));
 
     int ret = system(zenity_cmd);
     log_msg("Zenity returned: %d (0=Allow, other=Deny)", ret);
@@ -484,7 +543,7 @@ void save_ignored_entry(const char *exe, int action_id) {
         if (strcmp(ignored_cmds[i].exe_pattern, exe) == 0 &&
             strcmp(ignored_cmds[i].action, action_str) == 0) {
             pthread_mutex_unlock(&ignored_lock);
-            log_msg("Rule already exists: %s:%s", exe, action_str);
+            log_msg("Rule already exists: %s:%s", trim_exe_for_log(exe), action_str);
             return;
         }
     }
@@ -617,7 +676,7 @@ void send_permission(int action, const char *exe, pid_t pid, int command_type) {
     if (sent == -1) {
         log_msg("Failed to send permission: %s", strerror(errno));
     } else if (command_type != 1) {
-        log_filtered(2, "Sent: %s (%d) for %s", cmd_name, action, exe);
+        log_filtered(2, "Sent: %s (%d) for %s", cmd_name, action, trim_exe_for_log(exe));
     }
 }
 
@@ -669,7 +728,7 @@ void handle_message(const char *msg) {
             // Silencioso - não loga nada
             return;
         }
-        log_msg("REPORT: %s is using %s (%d)", exe, action_str, action);
+        log_msg("REPORT: %s is using %s (%d)", trim_exe_for_log(exe), action_str, action);
         time_t now = time(NULL);
         if (strcmp(exe, last_report.exe) == 0 && action == last_report.action &&
             now - last_report.last_time < REPORT_THROTTLE_MS)
@@ -681,7 +740,7 @@ void handle_message(const char *msg) {
         return;
     }
 
-    log_msg("X server requested %s for %s", action_str, exe);
+    log_msg("X server requested %s for %s", action_str, trim_exe_for_log(exe));
 
     // file_has_changed();
 
@@ -691,7 +750,7 @@ void handle_message(const char *msg) {
     }
     
     if (is_seen(exe, action)) {
-        log_filtered(3, "Duplicate request %s %s (%d) - ignoring", action_str, exe, pid);
+        log_filtered(3, "Duplicate request %s %s (%d) - ignoring", action_str, trim_exe_for_log(exe), pid);
         return;
     }
 
@@ -714,9 +773,9 @@ void handle_message(const char *msg) {
         strcpy(alert_queue[alert_count].time_str, get_current_time());
         alert_queue[alert_count].paused = paused;
         alert_count++;
-        log_filtered(2, "Alert queued: %s : %s (%d pending)", exe, action_str, alert_count);
+        log_filtered(2, "Alert queued: %s : %s (%d pending)", trim_exe_for_log(exe), action_str, alert_count);
     } else {
-        log_msg("Alert queue full! Dropping request for %s", exe);
+        log_msg("Alert queue full! Dropping request for %s", trim_exe_for_log(exe));
     }
     pthread_mutex_unlock(&queue_lock);
 }
@@ -758,16 +817,16 @@ void process_next_alert() {
     }
 
     if (quiet_mode) {
-        log_msg("QUIET mode: default action is DENY for %s (PID %d)", alert.exe, alert.pid);
+        log_msg("QUIET mode: default action is DENY for %s (PID %d)", trim_exe_for_log(alert.exe), alert.pid);
         response = 2;
     }
 
     if (response == 0) {
-        log_filtered(1, "ALLOWED: %s : %s", alert.exe, action_to_string(alert.action));
+        log_filtered(1, "ALLOWED: %s : %s", trim_exe_for_log(alert.exe), action_to_string(alert.action));
         save_ignored_entry(alert.exe, alert.action);
         send_permission(alert.action, alert.exe, alert.pid, 0);
     } else { 
-        log_filtered(1, "DENIED: %s : %s", alert.exe, action_to_string(alert.action));
+        log_filtered(1, "DENIED: %s : %s", trim_exe_for_log(alert.exe), action_to_string(alert.action));
         send_permission(alert.action, alert.exe, alert.pid, 4);
     }
 
