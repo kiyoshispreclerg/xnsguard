@@ -367,6 +367,22 @@ int file_has_changed() {
 
 /* ====================== IGNORED CHECK ====================== */
 
+static int
+pattern_matches(const char *exe, const char *pattern) {
+    if (!exe || !pattern) return 0;
+    if (strcmp(pattern, "*") == 0) return 1;
+
+    size_t plen = strlen(pattern);
+    if (plen >= 2 && strcmp(pattern + plen - 2, "/*") == 0) {
+        size_t prelen = plen - 2;
+        if (strncmp(exe, pattern, prelen) == 0 &&
+            (exe[prelen] == '/' || exe[prelen] == '\0'))
+            return 1;
+        return 0;
+    }
+    return strcmp(exe, pattern) == 0;
+}
+
 int is_ignored(const char *exe, int action_id) {
     if (!exe || *exe == '\0' || strcmp(exe, "?") == 0) {
         pthread_mutex_unlock(&ignored_lock);
@@ -379,7 +395,7 @@ int is_ignored(const char *exe, int action_id) {
 
     pthread_mutex_lock(&ignored_lock);
     for (int i = 0; i < ignored_count; i++) {
-        if (fnmatch(ignored_cmds[i].exe_pattern, exe, FNM_PATHNAME | FNM_NOESCAPE) != 0)
+        if (!pattern_matches(exe, ignored_cmds[i].exe_pattern)) // barrieif (fnmatch(ignored_cmds[i].exe_pattern, exe, FNM_PATHNAME | FNM_NOESCAPE) != 0)
             continue;
 
         if (ignored_cmds[i].action[0] == '\0' || 
