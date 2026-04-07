@@ -13,8 +13,8 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <poll.h>
-#include <fnmatch.h>
 #include <limits.h>
+#include <sys/wait.h>
 
 #define MAX_ALERTS          100
 #define MAX_IGNORED         200
@@ -127,6 +127,7 @@ int alert_count = 0;
 struct IgnoredEntry {
     char exe_pattern[PATH_MAX];
     char action[64];
+    int  rule_type;   /* 0 = ALLOW, 1 = DENY */
 };
 
 struct IgnoredEntry ignored_cmds[MAX_IGNORED];
@@ -270,6 +271,22 @@ trim_exe_for_log(const char *full_path)
     return buffer;
 }
 
+static int
+pattern_matches(const char *exe, const char *pattern) {
+    if (!exe || !pattern) return 0;
+    if (strcmp(pattern, "*") == 0) return 1;
+
+    size_t plen = strlen(pattern);
+    if (plen >= 2 && strcmp(pattern + plen - 2, "/*") == 0) {
+        size_t prelen = plen - 2;
+        if (strncmp(exe, pattern, prelen) == 0 &&
+            (exe[prelen] == '/' || exe[prelen] == '\0'))
+            return 1;
+        return 0;
+    }
+    return strcmp(exe, pattern) == 0;
+}
+
 /* ====================== CONFIG (USER ONLY) ====================== */
 
 void load_user_config(void) {
@@ -298,6 +315,7 @@ void load_user_config(void) {
         if (!cmd) continue;
 
         if (strcasecmp(cmd, "ALLOW") == 0 || strcasecmp(cmd, "DENY") == 0) {
+            int is_allow = (strcasecmp(cmd, "ALLOW") == 0);
             char *token1 = strtok(NULL, " \t\r\n");   /* action or ALL */
             char *token2 = strtok(NULL, " \t\r\n");   /* pattern */
 
@@ -313,6 +331,7 @@ void load_user_config(void) {
                     strncpy(pattern, token2, sizeof(pattern)-1);
                     strcpy(ignored_cmds[ignored_count].exe_pattern, pattern);
                     ignored_cmds[ignored_count].action[0] = '\0';
+                    ignored_cmds[ignored_count].rule_type = is_allow ? 0 : 1;
                     ignored_count++;
                 }
             } else if (action > 0) {
@@ -326,6 +345,7 @@ void load_user_config(void) {
 
                 strncpy(ignored_cmds[ignored_count].exe_pattern, pattern, sizeof(ignored_cmds[ignored_count].exe_pattern)-1);
                 strncpy(ignored_cmds[ignored_count].action, action_name, sizeof(ignored_cmds[ignored_count].action)-1);
+                ignored_cmds[ignored_count].rule_type = is_allow ? 0 : 1;
                 ignored_count++;
             }
         }
@@ -334,6 +354,30 @@ void load_user_config(void) {
     last_config_mtime = time(NULL);
     log_filtered(3, "%d rules loaded", ignored_count);
     pthread_mutex_unlock(&ignored_lock);
+}
+
+int get_preconfig_rule(const char *exe, int action_id) {
+    if (!exe || *exe == '\0' || strcmp(exe, "?") == 0)
+        return 0;
+
+    const char *action_name = action_to_string(action_id);
+    if (!action_name || strcmp(action_name, "UNKNOWN") == 0)
+        return 0;
+
+    pthread_mutex_lock(&ignored_lock);
+    for (int i = 0; i < ignored_count; i++) {
+        if (!pattern_matches(exe, ignored_cmds[i].exe_pattern))
+            continue;
+
+        if (ignored_cmds[i].action[0] == '\0' || 
+            strcasecmp(ignored_cmds[i].action, action_name) == 0) {
+            int ret = (ignored_cmds[i].rule_type == 0) ? 1 : 2;
+            pthread_mutex_unlock(&ignored_lock);
+            return ret;   /* 1=allow, 2=deny */
+        }
+    }
+    pthread_mutex_unlock(&ignored_lock);
+    return 0;
 }
 
 /* ====================== SYNC PERMISSIONS TO X SERVER ====================== */
@@ -345,28 +389,29 @@ void send_all_permissions_to_xserver(void) {
     for (int i = 0; i < ignored_count; i++) {
         const char *pat = ignored_cmds[i].exe_pattern;
         const char *act_str = ignored_cmds[i].action;
-
-        if (act_str[0] == '\0') {
-            /* ALLOW ALL <pattern> */
-            send_permission(0, pat, 0, 2);           /* command_type 2 = ALLOW_ALL */
-            sent++;
-        }
-        else if (strcmp(pat, "*") == 0) {
-            /* ALLOW <ACTION>  (sem exe → allow_all para essa ação) */
-            int action_id = string_to_action(act_str);
-            if (action_id > 0) {
-                send_permission(action_id, "", 0, 3); /* command_type 3 = ALLOW_ACTION */
-                sent++;
+        int action_id = string_to_action(act_str);
+        
+        if (ignored_cmds[i].rule_type == 0) {   /* ALLOW */
+            if (act_str[0] == '\0') {
+                /* ALLOW ALL <pattern> */
+                send_permission(0, pat, 0, 2);           /* command_type 2 = ALLOW_ALL */
+            }
+            else if (strcmp(pat, "*") == 0) {
+                /* ALLOW <ACTION>  (sem exe → allow_all para essa ação) */
+                send_permission(action_id, "", 0, 3);
+            } else {
+                send_permission(action_id, pat, 0, 0);   /* command_type 3 = ALLOW_ACTION */
+            }
+        } else {   /* DENY */
+            if (act_str[0] == '\0') {
+                send_permission(0, pat, 0, 5);           /* DENY_ALL */
+            } else if (strcmp(pat, "*") == 0) {
+                send_permission(action_id, "", 0, 6);    /* DENY_ACTION */
+            } else {
+                send_permission(action_id, pat, 0, 4);   /* DENY normal */
             }
         }
-        else {
-            /* ALLOW <ACTION> <exe> */
-            int action_id = string_to_action(act_str);
-            if (action_id > 0) {
-                send_permission(action_id, pat, 0, 0); /* command_type 0 = ALLOW normal */
-                sent++;
-            }
-        }
+        sent++;
     }
 
     pthread_mutex_unlock(&ignored_lock);
@@ -375,6 +420,36 @@ void send_all_permissions_to_xserver(void) {
         log_filtered(2, "Full sync: sent %d permission rules to X server", sent);
     else
         log_filtered(3, "Full sync: no rules to send (perms.conf empty)");
+}
+
+/* ====================== SAVE RULES ====================== */
+
+void save_rule(const char *exe, int action_id, int is_allow) {
+    if (!exe || *exe == '\0') return;
+
+    const char *action_str = action_to_string(action_id);
+
+    pthread_mutex_lock(&ignored_lock);
+    for (int i = 0; i < ignored_count; i++) {
+        if (strcmp(ignored_cmds[i].exe_pattern, exe) == 0 &&
+            strcmp(ignored_cmds[i].action, action_str) == 0) {
+            pthread_mutex_unlock(&ignored_lock);
+            log_msg("Rule already exists: %s %s %s", is_allow ? "ALLOW" : "DENY", action_str, trim_exe_for_log(exe));
+            return;
+        }
+    }
+    pthread_mutex_unlock(&ignored_lock);
+
+    FILE *file = fopen(perms_file, "a");
+    if (!file) return;
+
+    fprintf(file, "%s %s %s\n", is_allow ? "ALLOW" : "DENY", action_str, exe);
+    fclose(file);
+    load_user_config();
+}
+
+void save_denied_entry(const char *exe, int action_id) {
+    save_rule(exe, action_id, 0);   /* is_allow = false */
 }
 
 /* ====================== IGNORE REPORTS CONFIG ====================== */
@@ -425,22 +500,6 @@ int file_has_changed() {
 }
 
 /* ====================== IGNORED CHECK ====================== */
-
-static int
-pattern_matches(const char *exe, const char *pattern) {
-    if (!exe || !pattern) return 0;
-    if (strcmp(pattern, "*") == 0) return 1;
-
-    size_t plen = strlen(pattern);
-    if (plen >= 2 && strcmp(pattern + plen - 2, "/*") == 0) {
-        size_t prelen = plen - 2;
-        if (strncmp(exe, pattern, prelen) == 0 &&
-            (exe[prelen] == '/' || exe[prelen] == '\0'))
-            return 1;
-        return 0;
-    }
-    return strcmp(exe, pattern) == 0;
-}
 
 int is_ignored(const char *exe, int action_id) {
     if (!exe || *exe == '\0' || strcmp(exe, "?") == 0) {
@@ -497,8 +556,9 @@ int show_zenity_dialog(const struct Alert *alert) {
         "--text='<b>Permission:</b> %s (%s)\n"
                  "<b>Program:</b> %s' "
         "--ok-label='Allow' "
-        "--cancel-label='Deny' "
+        "--cancel-label='Deny this session' "
         "--extra-button='Allow this session' "
+        "--extra-button='Deny' "
         "--width=550 "
         "--no-wrap 2>/dev/null",
         action_str, action_desc, trim_exe_for_log(alert->exe));
@@ -509,7 +569,7 @@ int show_zenity_dialog(const struct Alert *alert) {
     FILE *fp = popen(zenity_cmd, "r");
     if (!fp) {
         log_msg("ERROR: failed to call zenity");
-        return 2;
+        return 3;
     }
 
     char output[256] = {0};
@@ -524,10 +584,12 @@ int show_zenity_dialog(const struct Alert *alert) {
 
     if (code == 0) {
         return 0;
-    } else if (code == 1 && strstr(output, "Allow this session") != NULL) {
+    } else if (strstr(output, "Allow this session") != NULL) {
         return 1;
-    } else {
+    } else if (strstr(output, "Deny") != NULL) {
         return 2;
+    } else {
+        return 3;
     }
 }
 
@@ -665,6 +727,12 @@ void send_permission(int action, const char *exe, pid_t pid, int command_type) {
             snprintf(msg, sizeof(msg), "{\"command\":\"DENY\",\"action\":%d,\"exe\":\"%s\"}", action, exe);
             cmd_name = "DENY";
             break;
+        case 5: /* DENY_ALL */
+            snprintf(msg, sizeof(msg), "{\"command\":\"DENY_ALL\",\"exe\":\"%s\"}", exe);
+            break;
+        case 6: /* DENY_ACTION */
+            snprintf(msg, sizeof(msg), "{\"command\":\"DENY_ACTION\",\"action\":%d}", action);
+            break;
         default: /* ALLOW */
             snprintf(msg, sizeof(msg), "{\"command\":\"ALLOW\",\"action\":%d,\"exe\":\"%s\"}", action, exe);
             break;
@@ -744,10 +812,14 @@ void handle_message(const char *msg) {
 
     log_msg("X server requested %s for %s", action_str, trim_exe_for_log(exe));
 
-    // file_has_changed();
-
-    if (is_ignored(exe, action)) {
+    int pre = get_preconfig_rule(exe, action);
+    
+    if (pre == 1) {
         send_permission(action, exe, pid, 0);
+        return;
+    }
+    if (pre == 2) {
+        send_permission(action, exe, pid, 4);
         return;
     }
     
@@ -819,19 +891,23 @@ void process_next_alert() {
     }
 
     if (quiet_mode) {
-        log_msg("QUIET mode: default action is DENY for %s (PID %d)", trim_exe_for_log(alert.exe), alert.pid);
+        log_msg("QUIET mode: default action is DENY THIS SESSION for %s (PID %d)", trim_exe_for_log(alert.exe), alert.pid);
         response = 2;
     }
 
     if (response == 0) {
         log_filtered(1, "ALLOWED: %s : %s", trim_exe_for_log(alert.exe), action_to_string(alert.action));
-        save_ignored_entry(alert.exe, alert.action);
+        save_rule(alert.exe, alert.action, 1);
         send_permission(alert.action, alert.exe, alert.pid, 0);
     } else if (response == 1) {
         log_filtered(1, "ALLOWED THIS SESSION: %s : %s", trim_exe_for_log(alert.exe), action_to_string(alert.action));
         send_permission(alert.action, alert.exe, alert.pid, 0);
-    } else { 
+    } else if (response == 2) {
         log_filtered(1, "DENIED: %s : %s", trim_exe_for_log(alert.exe), action_to_string(alert.action));
+        save_denied_entry(alert.exe, alert.action);
+        send_permission(alert.action, alert.exe, alert.pid, 4);
+    } else { 
+        log_filtered(1, "DENIED THIS SESSION: %s : %s", trim_exe_for_log(alert.exe), action_to_string(alert.action));
         send_permission(alert.action, alert.exe, alert.pid, 4);
     }
 
