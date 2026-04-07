@@ -491,42 +491,44 @@ int show_zenity_dialog(const struct Alert *alert) {
     snprintf(zenity_cmd, sizeof(zenity_cmd),
         "zenity --question "
         "--title='XnsGuard' "
+        "--icon-name=dialog-warning "
+        "--modal "
         "--timeout=60 "
-        "--text='<b>Program:</b> %s\\n"
-        "<b>Time:</b> %s\\n"
-        "<b>Permission:</b> %s' "
-        "--ok-label='Allow: %s' "
+        "--text='<b>Permission:</b> %s (%s)\n"
+                 "<b>Program:</b> %s' "
+        "--ok-label='Allow' "
         "--cancel-label='Deny' "
+        "--extra-button='Allow this session' "
         "--width=550 "
         "--no-wrap 2>/dev/null",
-        alert->exe, alert->time_str,
-        action_desc, action_str);
+        action_str, action_desc, trim_exe_for_log(alert->exe));
 
-    log_msg("Showing Zenity dialog for action=%d, pid=%d, exe=%.120s...",
-            alert->action, alert->pid, trim_exe_for_log(alert->exe));
+    log_msg("Showing Zenity dialog for %s %s (%d)",
+            action_str, trim_exe_for_log(alert->exe), alert->pid);
 
-    int ret = system(zenity_cmd);
-    log_msg("Zenity returned: %d (0=Allow, other=Deny)", ret);
+    FILE *fp = popen(zenity_cmd, "r");
+    if (!fp) {
+        log_msg("ERROR: failed to call zenity");
+        return 2;
+    }
 
-    return (ret == 0) ? 0 : 2;   /* 0 = Allow, anything else = Deny */
-}
+    char output[256] = {0};
+    if (fgets(output, sizeof(output), fp) != NULL) {
+        output[strcspn(output, "\n")] = '\0';
+    }
 
-int show_portal_dialog(const struct Alert *alert) {
-    char cmd[4096];
-    const char *action_str = action_to_string(alert->action);
+    int status = pclose(fp);
+    int code = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 
-    snprintf(cmd, sizeof(cmd),
-        "dbus-send --session --print-reply --dest=org.freedesktop.portal.Desktop "
-        "/org/freedesktop/portal/desktop "
-        "org.freedesktop.portal.Request.Prompt "
-        "string:'XnsGuard' "
-        "string:'Permission request' "
-        "string:'Action: %s\\nProgram: %s' "
-        "uint32:0",   /* flags */
-        action_str, alert->exe);
+    log_msg("Zenity returned %d | '%s'", code, output);
 
-    int ret = system(cmd);
-    return (ret == 0) ? 0 : 2;   /* 0 = Allow, anything else = Deny */
+    if (code == 0) {
+        return 0;
+    } else if (code == 1 && strstr(output, "Allow this session") != NULL) {
+        return 1;
+    } else {
+        return 2;
+    }
 }
 
 
@@ -824,6 +826,9 @@ void process_next_alert() {
     if (response == 0) {
         log_filtered(1, "ALLOWED: %s : %s", trim_exe_for_log(alert.exe), action_to_string(alert.action));
         save_ignored_entry(alert.exe, alert.action);
+        send_permission(alert.action, alert.exe, alert.pid, 0);
+    } else if (response == 1) {
+        log_filtered(1, "ALLOWED THIS SESSION: %s : %s", trim_exe_for_log(alert.exe), action_to_string(alert.action));
         send_permission(alert.action, alert.exe, alert.pid, 0);
     } else { 
         log_filtered(1, "DENIED: %s : %s", trim_exe_for_log(alert.exe), action_to_string(alert.action));
