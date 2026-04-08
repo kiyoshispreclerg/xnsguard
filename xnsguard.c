@@ -729,12 +729,15 @@ void send_permission(int action, const char *exe, pid_t pid, int command_type) {
             break;
         case 5: /* DENY_ALL */
             snprintf(msg, sizeof(msg), "{\"command\":\"DENY_ALL\",\"exe\":\"%s\"}", exe);
+            cmd_name = "DENY_ALL";
             break;
         case 6: /* DENY_ACTION */
             snprintf(msg, sizeof(msg), "{\"command\":\"DENY_ACTION\",\"action\":%d}", action);
+            cmd_name = "DENY_ACTION";
             break;
         default: /* ALLOW */
             snprintf(msg, sizeof(msg), "{\"command\":\"ALLOW\",\"action\":%d,\"exe\":\"%s\"}", action, exe);
+            cmd_name = "ALLOW";
             break;
     }
 
