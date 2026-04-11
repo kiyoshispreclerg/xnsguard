@@ -31,8 +31,7 @@
 #define XNOTIFY_INPUT_INJECT     8
 #define XNOTIFY_HOTKEY           9
 #define XNOTIFY_INPUT           10
-#define XNOTIFY_TREE            11
-#define XNOTIFY_PROP            12
+#define XNOTIFY_MANAGE          11
 
 #define COMMAND_HEARTBEAT     1
 #define COMMAND_ALLOW_ALL     2
@@ -56,8 +55,7 @@ static const struct {
     { XNOTIFY_INPUT_INJECT,  "INPUT_INJECT" },
     { XNOTIFY_HOTKEY,        "HOTKEY" },
     { XNOTIFY_INPUT,         "INPUT" },
-    { XNOTIFY_TREE,          "TREE" },
-    { XNOTIFY_PROP,          "PROP" },
+    { XNOTIFY_MANAGE,        "MANAGE" },
     { 0, NULL }
 };
 
@@ -75,8 +73,7 @@ static const struct {
     { XNOTIFY_INPUT_INJECT,  "Insert keystrokes" },
     { XNOTIFY_HOTKEY,        "Register global hotkeys" },
     { XNOTIFY_INPUT,         "Capture input - even when unfocused" },
-    { XNOTIFY_TREE,          "List open windows" },
-    { XNOTIFY_PROP,          "Access properties of other windows" },
+    { XNOTIFY_MANAGE,        "List and get properties of other windows" },
     { 0, NULL }
 };
 
