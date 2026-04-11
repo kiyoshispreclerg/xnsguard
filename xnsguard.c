@@ -34,6 +34,14 @@
 #define XNOTIFY_TREE            11
 #define XNOTIFY_PROP            12
 
+#define COMMAND_HEARTBEAT     1
+#define COMMAND_ALLOW_ALL     2
+#define COMMAND_ALLOW_ACTION  3
+#define COMMAND_DENY          4
+#define COMMAND_DENY_ALL      5
+#define COMMAND_DENY_ACTION   6
+#define COMMAND_ALLOW         0
+
 static const struct {
     int   id;
     const char *name;
@@ -73,6 +81,9 @@ static const struct {
 };
 
 static const char* action_to_string(int action_id) {
+    if (action_id == -1)
+        return "ALL";
+
     for (int i = 0; action_names[i].id > 0; i++) {
         if (action_names[i].id == action_id)
             return action_names[i].name;
@@ -81,6 +92,9 @@ static const char* action_to_string(int action_id) {
 }
 
 static const char* action_to_description(int action_id) {
+    if (action_id == -1)
+        return "All the X server permissions";
+
     for (int i = 0; action_descriptions[i].id > 0; i++) {
         if (action_descriptions[i].id == action_id)
             return action_descriptions[i].name;
@@ -90,6 +104,9 @@ static const char* action_to_description(int action_id) {
 
 static int string_to_action(const char *str) {
     if (!str) return 0;
+    if (strcasecmp(str, "ALL") == 0)
+            return -1;
+
     for (int i = 0; action_names[i].name; i++) {
         if (strcasecmp(str, action_names[i].name) == 0)
             return action_names[i].id;
@@ -394,21 +411,21 @@ void send_all_permissions_to_xserver(void) {
         if (ignored_cmds[i].rule_type == 0) {   /* ALLOW */
             if (act_str[0] == '\0') {
                 /* ALLOW ALL <pattern> */
-                send_permission(0, pat, 0, 2);           /* command_type 2 = ALLOW_ALL */
+                send_permission(0, pat, 0, COMMAND_ALLOW_ALL);           /* command_type 2 = ALLOW_ALL */
             }
             else if (strcmp(pat, "*") == 0) {
                 /* ALLOW <ACTION>  (sem exe → allow_all para essa ação) */
-                send_permission(action_id, "", 0, 3);
+                send_permission(action_id, "", 0, COMMAND_ALLOW_ACTION);
             } else {
-                send_permission(action_id, pat, 0, 0);   /* command_type 3 = ALLOW_ACTION */
+                send_permission(action_id, pat, 0, COMMAND_ALLOW);   /* command_type 3 = ALLOW_ACTION */
             }
         } else {   /* DENY */
             if (act_str[0] == '\0') {
-                send_permission(0, pat, 0, 5);           /* DENY_ALL */
+                send_permission(0, pat, 0, COMMAND_DENY_ALL);           /* DENY_ALL */
             } else if (strcmp(pat, "*") == 0) {
-                send_permission(action_id, "", 0, 6);    /* DENY_ACTION */
+                send_permission(action_id, "", 0, COMMAND_DENY_ACTION);    /* DENY_ACTION */
             } else {
-                send_permission(action_id, pat, 0, 4);   /* DENY normal */
+                send_permission(action_id, pat, 0, COMMAND_DENY);   /* DENY normal */
             }
         }
         sent++;
@@ -559,6 +576,7 @@ int show_zenity_dialog(const struct Alert *alert) {
         "--cancel-label='Deny this session' "
         "--extra-button='Allow this session' "
         "--extra-button='Deny' "
+        "--extra-button='Allow all actions' "
         "--width=550 "
         "--no-wrap 2>/dev/null",
         action_str, action_desc, trim_exe_for_log(alert->exe));
@@ -588,8 +606,10 @@ int show_zenity_dialog(const struct Alert *alert) {
         return 1;
     } else if (strstr(output, "Deny") != NULL) {
         return 2;
-    } else {
+    } else if (strstr(output, "Allow all actions") != NULL) {
         return 3;
+    } else {
+        return 99;
     }
 }
 
@@ -711,27 +731,27 @@ void send_permission(int action, const char *exe, pid_t pid, int command_type) {
     const char *cmd_name = "ALLOW";
 
     switch (command_type) {
-        case 1:  /* heartbeat */
+        case COMMAND_HEARTBEAT:  /* heartbeat */
             snprintf(msg, sizeof(msg), "{\"command\":\"XNOTIFY\",\"pid\":%d}", pid);
             cmd_name = "HEARTBEAT";
             break;
-        case 2:  /* ALLOW_ALL */
+        case COMMAND_ALLOW_ALL:  /* ALLOW_ALL */
             snprintf(msg, sizeof(msg), "{\"command\":\"ALLOW_ALL\",\"exe\":\"%s\",\"action\":%d}", exe, action);
             cmd_name = "ALLOW_ALL";
             break;
-        case 3:  /* ALLOW_ACTION */
+        case COMMAND_ALLOW_ACTION:  /* ALLOW_ACTION */
             snprintf(msg, sizeof(msg), "{\"command\":\"ALLOW_ACTION\",\"action\":%d}", action);
             cmd_name = "ALLOW_ACTION";
             break;
-        case 4:  /* DENY */
+        case COMMAND_DENY:  /* DENY */
             snprintf(msg, sizeof(msg), "{\"command\":\"DENY\",\"action\":%d,\"exe\":\"%s\"}", action, exe);
             cmd_name = "DENY";
             break;
-        case 5: /* DENY_ALL */
+        case COMMAND_DENY_ALL: /* DENY_ALL */
             snprintf(msg, sizeof(msg), "{\"command\":\"DENY_ALL\",\"exe\":\"%s\"}", exe);
             cmd_name = "DENY_ALL";
             break;
-        case 6: /* DENY_ACTION */
+        case COMMAND_DENY_ACTION: /* DENY_ACTION */
             snprintf(msg, sizeof(msg), "{\"command\":\"DENY_ACTION\",\"action\":%d}", action);
             cmd_name = "DENY_ACTION";
             break;
@@ -818,11 +838,11 @@ void handle_message(const char *msg) {
     int pre = get_preconfig_rule(exe, action);
     
     if (pre == 1) {
-        send_permission(action, exe, pid, 0);
+        send_permission(action, exe, pid, COMMAND_ALLOW);
         return;
     }
     if (pre == 2) {
-        send_permission(action, exe, pid, 4);
+        send_permission(action, exe, pid, COMMAND_DENY);
         return;
     }
     
@@ -893,17 +913,21 @@ void process_next_alert() {
     if (response == 0) {
         log_filtered(1, "ALLOWED: %s : %s", trim_exe_for_log(alert.exe), action_to_string(alert.action));
         save_rule(alert.exe, alert.action, 1);
-        send_permission(alert.action, alert.exe, alert.pid, 0);
+        send_permission(alert.action, alert.exe, alert.pid, COMMAND_ALLOW);
     } else if (response == 1) {
         log_filtered(1, "ALLOWED THIS SESSION: %s : %s", trim_exe_for_log(alert.exe), action_to_string(alert.action));
-        send_permission(alert.action, alert.exe, alert.pid, 0);
+        send_permission(alert.action, alert.exe, alert.pid, COMMAND_ALLOW);
     } else if (response == 2) {
         log_filtered(1, "DENIED: %s : %s", trim_exe_for_log(alert.exe), action_to_string(alert.action));
         save_denied_entry(alert.exe, alert.action);
-        send_permission(alert.action, alert.exe, alert.pid, 4);
+        send_permission(alert.action, alert.exe, alert.pid, COMMAND_DENY);
+    } else if (response == 3) {
+        log_filtered(1, "ALL ALLOWED: %s", trim_exe_for_log(alert.exe));
+        save_rule(alert.exe, -1, -1);
+        send_permission(alert.action, alert.exe, alert.pid, COMMAND_ALLOW_ALL);
     } else { 
         log_filtered(1, "DENIED THIS SESSION: %s : %s", trim_exe_for_log(alert.exe), action_to_string(alert.action));
-        send_permission(alert.action, alert.exe, alert.pid, 4);
+        send_permission(alert.action, alert.exe, alert.pid, COMMAND_DENY);
     }
 
     if (alert.paused && !no_pause_mode)
@@ -922,7 +946,7 @@ void process_next_alert() {
 /* ====================== HEARTBEAT ====================== */
 
 void send_heartbeat() {
-    send_permission(0, "", getpid(), 1);
+    send_permission(0, "", getpid(), COMMAND_HEARTBEAT);
 }
 
 /* ====================== THREADS ====================== */
