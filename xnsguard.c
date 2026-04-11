@@ -872,14 +872,6 @@ void process_next_alert() {
     alert_count--;
     pthread_mutex_unlock(&queue_lock);
 
-    if (kill(alert.pid, 0) != 0 && errno == ESRCH) {
-        log_filtered(2, "PID %d no longer exists, discarding alert", alert.pid);
-        remove_all_alerts_for_pid(alert.pid);
-        // remove_seen_for_exe(alert.exe, alert.action);
-        //pthread_mutex_unlock(&queue_lock);
-        return;
-    }
-
     int response = -1;
 
     pthread_mutex_unlock(&queue_lock);
@@ -918,6 +910,12 @@ void process_next_alert() {
         kill(alert.pid, SIGCONT);
 
     remove_seen_for_exe(alert.exe, alert.action);
+
+    if (kill(alert.pid, 0) != 0 && errno == ESRCH) {
+        log_filtered(2, "PID %d no longer exists, discarding alert", alert.pid);
+        remove_all_alerts_for_pid(alert.pid);
+    }
+
     pthread_mutex_unlock(&queue_lock);
 }
 
