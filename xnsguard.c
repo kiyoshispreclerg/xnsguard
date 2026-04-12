@@ -922,6 +922,7 @@ void process_next_alert() {
         log_filtered(1, "ALL ALLOWED: %s", trim_exe_for_log(alert.exe));
         save_rule(alert.exe, -1, -1);
         send_permission(alert.action, alert.exe, alert.pid, COMMAND_ALLOW_ALL);
+        remove_all_alerts_for_pid(alert.pid);
     } else { 
         log_filtered(1, "DENIED THIS SESSION: %s : %s", trim_exe_for_log(alert.exe), action_to_string(alert.action));
         send_permission(alert.action, alert.exe, alert.pid, COMMAND_DENY);
