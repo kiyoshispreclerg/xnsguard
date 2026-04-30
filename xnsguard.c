@@ -286,19 +286,32 @@ trim_exe_for_log(const char *full_path)
 }
 
 static int
-pattern_matches(const char *exe, const char *pattern) {
-    if (!exe || !pattern) return 0;
-    if (strcmp(pattern, "*") == 0) return 1;
+pattern_matches(const char *s, const char *p) {
+    if (!s || !p) return 0;
 
-    size_t plen = strlen(pattern);
-    if (plen >= 2 && strcmp(pattern + plen - 2, "/*") == 0) {
-        size_t prelen = plen - 2;
-        if (strncmp(exe, pattern, prelen) == 0 &&
-            (exe[prelen] == '/' || exe[prelen] == '\0'))
-            return 1;
-        return 0;
+    const char *star = NULL;
+    const char *ss = NULL;
+
+    while (*s) {
+        if (*p == '*') {
+            star = p++;
+            ss = s;
+        } else if (*p == *s) {
+            p++;
+            s++;
+        } else if (star) {
+            p = star + 1;
+            s = ++ss;
+        } else {
+            return 0;
+        }
     }
-    return strcmp(exe, pattern) == 0;
+
+    while (*p == '*') {
+        p++;
+    }
+
+    return *p == '\0';
 }
 
 /* ====================== CONFIG (USER ONLY) ====================== */
