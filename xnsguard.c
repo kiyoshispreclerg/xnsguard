@@ -383,9 +383,12 @@ void load_user_config(void) {
     pthread_mutex_unlock(&ignored_lock);
 }
 
-int get_preconfig_rule(const char *exe, int action_id) {
+int get_preconfig_rule(const char *exe, int action_id, char *matched_pattern, size_t max_len) {
     if (!exe || *exe == '\0' || strcmp(exe, "?") == 0)
         return 0;
+
+    if (matched_pattern && max_len > 0)
+        matched_pattern[0] = '\0';
 
     const char *action_name = action_to_string(action_id);
     if (!action_name || strcmp(action_name, "UNKNOWN") == 0)
@@ -399,6 +402,12 @@ int get_preconfig_rule(const char *exe, int action_id) {
         if (ignored_cmds[i].action[0] == '\0' || 
             strcasecmp(ignored_cmds[i].action, action_name) == 0) {
             int ret = (ignored_cmds[i].rule_type == 0) ? 1 : 2;
+            
+            if (matched_pattern && max_len > 0) {
+                strncpy(matched_pattern, ignored_cmds[i].exe_pattern, max_len - 1);
+                matched_pattern[max_len - 1] = '\0';
+            }
+
             pthread_mutex_unlock(&ignored_lock);
             return ret;   /* 1=allow, 2=deny */
         }
@@ -540,7 +549,7 @@ int is_ignored(const char *exe, int action_id) {
 
     pthread_mutex_lock(&ignored_lock);
     for (int i = 0; i < ignored_count; i++) {
-        if (!pattern_matches(exe, ignored_cmds[i].exe_pattern)) // barrieif (fnmatch(ignored_cmds[i].exe_pattern, exe, FNM_PATHNAME | FNM_NOESCAPE) != 0)
+        if (!pattern_matches(exe, ignored_cmds[i].exe_pattern))
             continue;
 
         if (ignored_cmds[i].action[0] == '\0' || 
@@ -559,7 +568,7 @@ int is_report_ignored(const char *exe) {
 
     pthread_mutex_lock(&report_ignore_lock);
     for (int i = 0; i < ignored_reports_count; i++) {
-        if (strcmp(ignored_reports[i].exe, exe) == 0) {
+        if (pattern_matches(exe, ignored_reports[i].exe)) {
             pthread_mutex_unlock(&report_ignore_lock);
             return 1;
         }
@@ -845,14 +854,16 @@ void handle_message(const char *msg) {
 
     log_msg("X server requested %s for %s", action_str, trim_exe_for_log(exe));
 
-    int pre = get_preconfig_rule(exe, action);
+    char matched_rule[PATH_MAX] = {0};
+    int pre = get_preconfig_rule(exe, action, matched_rule, sizeof(matched_rule));
+    const char *rule_to_send = (matched_rule[0] != '\0') ? matched_rule : exe;
     
     if (pre == 1) {
-        send_permission(action, exe, pid, COMMAND_ALLOW);
+        send_permission(action, rule_to_send, pid, COMMAND_ALLOW);
         return;
     }
     if (pre == 2) {
-        send_permission(action, exe, pid, COMMAND_DENY);
+        send_permission(action, rule_to_send, pid, COMMAND_DENY);
         return;
     }
     
