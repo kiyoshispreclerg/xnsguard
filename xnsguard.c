@@ -124,6 +124,8 @@ static int quiet_mode = 0;         /* 1 = no Zenity, terminal logs only */
 static int always_kill_mode = 0;   /* 1 = kill unknown processes immediately */
 static int log_level = 2;          /* 0=silent, 1=clean, 2=normal, 3=verbose, 4=debug */
 
+static int display = 0;
+
 static pthread_mutex_t queue_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t ignored_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -712,7 +714,7 @@ void send_query_action(const char *action) {
     const char *base_dir = (runtime_dir && *runtime_dir) ? runtime_dir : "/tmp";
 
     char socket_path[108];
-    snprintf(socket_path, sizeof(socket_path), "%s/xperms.sock", base_dir);
+    snprintf(socket_path, sizeof(socket_path), "%s/xperms.%d.sock", base_dir, display);
 
     int sock = socket(AF_UNIX, SOCK_DGRAM, 0);
     if (sock == -1) return;
@@ -734,7 +736,7 @@ void send_permission(int action, const char *exe, pid_t pid, int command_type) {
     const char *base_dir = (runtime_dir && *runtime_dir) ? runtime_dir : "/tmp";
 
     char socket_path[108];
-    snprintf(socket_path, sizeof(socket_path), "%s/xperms.sock", base_dir);
+    snprintf(socket_path, sizeof(socket_path), "%s/xperms.%d.sock", base_dir, display);
 
     int sock = socket(AF_UNIX, SOCK_DGRAM, 0);
     if (sock == -1) {
@@ -1091,10 +1093,18 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    const char *display_env = getenv("DISPLAY");
+    if (display_env && sscanf(display_env, ":%d", &display) == 1)
+        log_msg("Connecting to display %d", display);
+    else {
+        log_msg("No display found. Exiting.");
+        return 0;
+    }
+
     const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
     const char *base_dir = (runtime_dir && *runtime_dir) ? runtime_dir : "/tmp";
-    snprintf(SOCKET_PATH_BUF, sizeof(SOCKET_PATH_BUF), "%s/xnotify.sock", base_dir);
-    snprintf(LOCK_SOCKET_PATH_BUF, sizeof(LOCK_SOCKET_PATH_BUF), "%s/xnotify.lock.sock", base_dir);
+    snprintf(SOCKET_PATH_BUF, sizeof(SOCKET_PATH_BUF), "%s/xnotify.%d.sock", base_dir, display);
+    snprintf(LOCK_SOCKET_PATH_BUF, sizeof(LOCK_SOCKET_PATH_BUF), "%s/xnotify.%d.lock.sock", base_dir, display);
 
     if (config_dir[0] == '\0') {
         const char *home = getenv("HOME");
