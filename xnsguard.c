@@ -914,11 +914,7 @@ void process_next_alert() {
     alert_count--;
     pthread_mutex_unlock(&queue_lock);
 
-    int response = -1;
-
-    pthread_mutex_unlock(&queue_lock);
-
-    response = show_zenity_dialog(&alert);
+    int response = show_zenity_dialog(&alert);
 
     pthread_mutex_lock(&queue_lock);
     
