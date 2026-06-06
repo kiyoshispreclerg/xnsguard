@@ -184,7 +184,9 @@ static struct {
 char* get_current_time() {
     static char buf[20];
     time_t now = time(NULL);
-    strftime(buf, sizeof(buf), "%H:%M:%S", localtime(&now));
+    struct tm tm_local;
+    localtime_r(&now, &tm_local);
+    strftime(buf, sizeof(buf), "%H:%M:%S", &tm_local);
     return buf;
 }
 
