@@ -19,7 +19,7 @@
 #define MAX_ALERTS          100
 #define MAX_IGNORED         200
 #define BUF_SIZE            4096
-#define REPORT_THROTTLE_MS  1000
+#define REPORT_THROTTLE_S   1
 
 #define XNOTIFY_ATTACH           1
 #define XNOTIFY_SELECTION        2
@@ -868,7 +868,7 @@ void handle_message(const char *msg) {
         log_msg("REPORT: %s is using %s (%d)", trim_exe_for_log(exe), action_str, action);
         time_t now = time(NULL);
         if (strcmp(exe, last_report.exe) == 0 && action == last_report.action &&
-            now - last_report.last_time < REPORT_THROTTLE_MS)
+            now - last_report.last_time < REPORT_THROTTLE_S)
             return;
 
         strncpy(last_report.exe, exe, sizeof(last_report.exe)-1);
