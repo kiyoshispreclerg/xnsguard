@@ -63,13 +63,13 @@ static const struct {
     int   id;
     const char *name;
 } action_descriptions[] = {
-    { XNOTIFY_ATTACH,        "Access X server shared memory" },
+    { XNOTIFY_ATTACH,        "Use shared memory" },
     { XNOTIFY_SELECTION,     "Access clipboard" },
     { XNOTIFY_COMPOSITE,     "Access other windows" },
-    { XNOTIFY_SCREEN,        "Capture the screen" },
-    { XNOTIFY_RECORD,        "Capture events - like keystrokes" },
-    { XNOTIFY_CURSOR,        "Access cursor (mouse)" },
-    { XNOTIFY_INPUT_GRAB,    "Capture mouse or keyboard" },
+    { XNOTIFY_SCREEN,        "Capture and draw to the screen" },
+    { XNOTIFY_RECORD,        "Record events - like keystrokes" },
+    { XNOTIFY_CURSOR,        "Access cursor (mouse) image and position" },
+    { XNOTIFY_INPUT_GRAB,    "Grab mouse or keyboard" },
     { XNOTIFY_INPUT_INJECT,  "Insert keystrokes" },
     { XNOTIFY_HOTKEY,        "Register global hotkeys" },
     { XNOTIFY_INPUT,         "Capture input - even when unfocused" },
@@ -541,7 +541,6 @@ int file_has_changed() {
 
 int is_ignored(const char *exe, int action_id) {
     if (!exe || *exe == '\0' || strcmp(exe, "?") == 0) {
-        pthread_mutex_unlock(&ignored_lock);
         return 0;
     }
 
@@ -590,17 +589,17 @@ int show_zenity_dialog(const struct Alert *alert) {
         "--title='XnsGuard' "
         "--icon-name=dialog-warning "
         "--modal "
-        "--timeout=60 "
+        "--timeout=90 "
         "--text='<b>Permission:</b> %s (%s)\n"
-                 "<b>Program:</b> %s' "
+                 "<b>Program:</b> %s (%d)' "
         "--ok-label='Allow' "
         "--cancel-label='Deny this session' "
         "--extra-button='Allow this session' "
         "--extra-button='Deny' "
-        "--extra-button='Allow all actions' "
+        "--extra-button='TRUST (allow all)' "
         "--width=550 "
         "--no-wrap 2>/dev/null",
-        action_str, action_desc, trim_exe_for_log(alert->exe));
+        action_str, action_desc, trim_exe_for_log(alert->exe), alert->pid);
 
     log_msg("Showing Zenity dialog for %s %s (%d)",
             action_str, trim_exe_for_log(alert->exe), alert->pid);
@@ -627,7 +626,7 @@ int show_zenity_dialog(const struct Alert *alert) {
         return 1;
     } else if (strstr(output, "Deny") != NULL) {
         return 2;
-    } else if (strstr(output, "Allow all actions") != NULL) {
+    } else if (strstr(output, "TRUST (allow all)") != NULL) {
         return 3;
     } else {
         return 99;
@@ -936,22 +935,22 @@ void process_next_alert() {
     if (response == 0) {
         log_filtered(1, "ALLOWED: %s : %s", trim_exe_for_log(alert.exe), action_to_string(alert.action));
         save_rule(alert.exe, alert.action, 1);
-        send_permission(alert.action, alert.exe, alert.pid, COMMAND_ALLOW);
+        send_permission(alert.action, alert.exe, alert.pid, COMMAND_ALLOW); // TODO passar com wildcard
     } else if (response == 1) {
         log_filtered(1, "ALLOWED THIS SESSION: %s : %s", trim_exe_for_log(alert.exe), action_to_string(alert.action));
-        send_permission(alert.action, alert.exe, alert.pid, COMMAND_ALLOW);
+        send_permission(alert.action, alert.exe, alert.pid, COMMAND_ALLOW); // TODO passar com wildcard
     } else if (response == 2) {
         log_filtered(1, "DENIED: %s : %s", trim_exe_for_log(alert.exe), action_to_string(alert.action));
         save_denied_entry(alert.exe, alert.action);
-        send_permission(alert.action, alert.exe, alert.pid, COMMAND_DENY);
+        send_permission(alert.action, alert.exe, alert.pid, COMMAND_DENY); // TODO passar com wildcard
     } else if (response == 3) {
         log_filtered(1, "ALL ALLOWED: %s", trim_exe_for_log(alert.exe));
         save_rule(alert.exe, -1, -1);
-        send_permission(alert.action, alert.exe, alert.pid, COMMAND_ALLOW_ALL);
+        send_permission(alert.action, alert.exe, alert.pid, COMMAND_ALLOW_ALL); // TODO passar com wildcard
         remove_all_alerts_for_pid(alert.pid);
     } else { 
         log_filtered(1, "DENIED THIS SESSION: %s : %s", trim_exe_for_log(alert.exe), action_to_string(alert.action));
-        send_permission(alert.action, alert.exe, alert.pid, COMMAND_DENY);
+        send_permission(alert.action, alert.exe, alert.pid, COMMAND_DENY); // TODO passar com wildcard
     }
 
     if (alert.paused && !no_pause_mode)
