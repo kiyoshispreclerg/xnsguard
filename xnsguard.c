@@ -962,19 +962,27 @@ void process_next_alert() {
     alert_count--;
     pthread_mutex_unlock(&queue_lock);
 
-    int response = show_zenity_dialog(&alert);
+    int response;
+    if (always_kill_mode || quiet_mode) {
+        response = always_kill_mode ? -1 : 99;
+    } else {
+        response = show_zenity_dialog(&alert);
+    }
 
     pthread_mutex_lock(&queue_lock);
-    
-    if (always_kill_mode) {
-        log_msg("ALWAYS-KILL mode active → denying PID %d (%s)", alert.pid, alert.exe);
-        response = 2;
+
+    if (response == -1) {
+        log_msg("ALWAYS-KILL mode: killing PID %d (%s)", alert.pid, trim_exe_for_log(alert.exe));
+        send_permission(alert.action, alert.exe, alert.pid, COMMAND_DENY);
+        kill(alert.pid, SIGKILL);
+        remove_all_alerts_for_pid(alert.pid);
+        remove_seen_for_exe(alert.exe, alert.action);
+        pthread_mutex_unlock(&queue_lock);
+        return;
     }
 
-    if (quiet_mode) {
-        log_msg("QUIET mode: default action is DENY THIS SESSION for %s (PID %d)", trim_exe_for_log(alert.exe), alert.pid);
-        response = 2;
-    }
+    if (quiet_mode)
+        log_msg("QUIET mode: denying this session for %s (PID %d)", trim_exe_for_log(alert.exe), alert.pid);
 
     if (response == 0) {
         log_filtered(1, "ALLOWED: %s : %s", trim_exe_for_log(alert.exe), action_to_string(alert.action));
@@ -992,7 +1000,7 @@ void process_next_alert() {
         save_rule(alert.exe, -1, -1);
         send_permission(alert.action, alert.exe, alert.pid, COMMAND_ALLOW_ALL); // TODO passar com wildcard
         remove_all_alerts_for_pid(alert.pid);
-    } else { 
+    } else {
         log_filtered(1, "DENIED THIS SESSION: %s : %s", trim_exe_for_log(alert.exe), action_to_string(alert.action));
         send_permission(alert.action, alert.exe, alert.pid, COMMAND_DENY); // TODO passar com wildcard
     }
@@ -1127,8 +1135,8 @@ int main(int argc, char *argv[]) {
             printf("Usage: %s [options]\n", argv[0]);
             printf("Options:\n");
             printf("  --no-pause / --notify-only     Do not send SIGSTOP/SIGCONT\n");
-            printf("  --quiet / --no-zenity          No Zenity dialogs, logs only\n");
-            printf("  --always-kill                  Kill unknown processes immediately\n");
+            printf("  --quiet / --no-zenity          No Zenity dialogs; deny this session (no perms.conf changes)\n");
+            printf("  --always-kill                  Kill (SIGKILL) all unauthorized processes immediately\n");
             printf("  --conf <dir> or --conf=<dir>   Base config directory (default: ~/.config/xnsguard)\n");
             printf("  --log-level N                  Verbosity level (0-4)\n");
             printf("  --help / -h                    Show this help\n");
