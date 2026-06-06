@@ -804,8 +804,10 @@ void handle_message(const char *msg) {
         p += 11;
         char *end = strchr(p, '"');
         if (end) {
-            strncpy(command, p, end - p);
-            command[end - p] = '\0';
+            size_t len = (size_t)(end - p);
+            if (len >= sizeof(command)) len = sizeof(command) - 1;
+            strncpy(command, p, len);
+            command[len] = '\0';
         }
     }
 
@@ -814,7 +816,7 @@ void handle_message(const char *msg) {
         sscanf(p + 9, "%d", &action);
 
     p = strstr(msg, "\"pid\":");
-    if (p) 
+    if (p)
         sscanf(p + 6, "%d", &pid);
 
     p = strstr(msg, "\"exe\":\"");
@@ -822,8 +824,10 @@ void handle_message(const char *msg) {
         p += 7;
         char *end = strchr(p, '"');
         if (end) {
-            strncpy(exe, p, end - p);
-            exe[end - p] = '\0';
+            size_t len = (size_t)(end - p);
+            if (len >= sizeof(exe)) len = sizeof(exe) - 1;
+            strncpy(exe, p, len);
+            exe[len] = '\0';
         }
     }
 
