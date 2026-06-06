@@ -967,8 +967,8 @@ void process_next_alert() {
     pthread_mutex_lock(&queue_lock);
     
     if (always_kill_mode) {
-        log_msg("ALWAYS-KILL mode active → killing PID %d (%s)", alert.pid, alert.exe);
-        response = 1;
+        log_msg("ALWAYS-KILL mode active → denying PID %d (%s)", alert.pid, alert.exe);
+        response = 2;
     }
 
     if (quiet_mode) {
