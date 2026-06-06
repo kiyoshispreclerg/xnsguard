@@ -752,6 +752,21 @@ void send_query_action(const char *action) {
     close(sock);
 }
 
+/* Escapa " e \ em strings JSON; descarta caracteres de controle. */
+static void json_escape_str(char *dst, size_t dst_sz, const char *src) {
+    size_t j = 0;
+    for (size_t i = 0; src[i] && j + 1 < dst_sz; i++) {
+        if (src[i] == '"' || src[i] == '\\') {
+            if (j + 2 >= dst_sz) break;
+            dst[j++] = '\\';
+            dst[j++] = src[i];
+        } else if ((unsigned char)src[i] >= 0x20) {
+            dst[j++] = src[i];
+        }
+    }
+    dst[j] = '\0';
+}
+
 void send_permission(int action, const char *exe, pid_t pid, int command_type) {
     const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
     const char *base_dir = (runtime_dir && *runtime_dir) ? runtime_dir : "/tmp";
@@ -769,6 +784,9 @@ void send_permission(int action, const char *exe, pid_t pid, int command_type) {
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
 
+    char safe_exe[200];
+    json_escape_str(safe_exe, sizeof(safe_exe), exe ? exe : "");
+
     char msg[256];
     const char *cmd_name = "ALLOW";
 
@@ -778,7 +796,7 @@ void send_permission(int action, const char *exe, pid_t pid, int command_type) {
             cmd_name = "HEARTBEAT";
             break;
         case COMMAND_ALLOW_ALL:  /* ALLOW_ALL */
-            snprintf(msg, sizeof(msg), "{\"command\":\"ALLOW_ALL\",\"exe\":\"%s\",\"action\":%d}", exe, action);
+            snprintf(msg, sizeof(msg), "{\"command\":\"ALLOW_ALL\",\"exe\":\"%s\",\"action\":%d}", safe_exe, action);
             cmd_name = "ALLOW_ALL";
             break;
         case COMMAND_ALLOW_ACTION:  /* ALLOW_ACTION */
@@ -786,11 +804,11 @@ void send_permission(int action, const char *exe, pid_t pid, int command_type) {
             cmd_name = "ALLOW_ACTION";
             break;
         case COMMAND_DENY:  /* DENY */
-            snprintf(msg, sizeof(msg), "{\"command\":\"DENY\",\"action\":%d,\"exe\":\"%s\"}", action, exe);
+            snprintf(msg, sizeof(msg), "{\"command\":\"DENY\",\"action\":%d,\"exe\":\"%s\"}", action, safe_exe);
             cmd_name = "DENY";
             break;
         case COMMAND_DENY_ALL: /* DENY_ALL */
-            snprintf(msg, sizeof(msg), "{\"command\":\"DENY_ALL\",\"exe\":\"%s\"}", exe);
+            snprintf(msg, sizeof(msg), "{\"command\":\"DENY_ALL\",\"exe\":\"%s\"}", safe_exe);
             cmd_name = "DENY_ALL";
             break;
         case COMMAND_DENY_ACTION: /* DENY_ACTION */
@@ -798,7 +816,7 @@ void send_permission(int action, const char *exe, pid_t pid, int command_type) {
             cmd_name = "DENY_ACTION";
             break;
         default: /* ALLOW */
-            snprintf(msg, sizeof(msg), "{\"command\":\"ALLOW\",\"action\":%d,\"exe\":\"%s\"}", action, exe);
+            snprintf(msg, sizeof(msg), "{\"command\":\"ALLOW\",\"action\":%d,\"exe\":\"%s\"}", action, safe_exe);
             cmd_name = "ALLOW";
             break;
     }
