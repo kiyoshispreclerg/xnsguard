@@ -580,10 +580,32 @@ int is_report_ignored(const char *exe) {
 
 /* ====================== ZENITY DIALOG ====================== */
 
-int show_zenity_dialog(const struct Alert *alert) { 
+/* Escapa aspas simples para uso dentro de strings single-quoted no shell.
+ * ' → '\'' (fecha aspas, barra+aspas literal, reabre aspas). */
+static void shell_sq_escape(char *dst, size_t dst_sz, const char *src) {
+    size_t j = 0;
+    for (size_t i = 0; src[i] && j + 1 < dst_sz; i++) {
+        if (src[i] == '\'') {
+            if (j + 4 >= dst_sz) break;
+            dst[j++] = '\'';
+            dst[j++] = '\\';
+            dst[j++] = '\'';
+            dst[j++] = '\'';
+        } else {
+            dst[j++] = src[i];
+        }
+    }
+    dst[j] = '\0';
+}
+
+int show_zenity_dialog(const struct Alert *alert) {
     char zenity_cmd[8192];
     const char *action_str = action_to_string(alert->action);
     const char *action_desc = action_to_description(alert->action);
+
+    char safe_exe[256];
+    shell_sq_escape(safe_exe, sizeof(safe_exe), trim_exe_for_log(alert->exe));
+
     snprintf(zenity_cmd, sizeof(zenity_cmd),
         "zenity --question "
         "--title='XnsGuard' "
@@ -599,7 +621,7 @@ int show_zenity_dialog(const struct Alert *alert) {
         "--extra-button='TRUST (allow all)' "
         "--width=550 "
         "--no-wrap 2>/dev/null",
-        action_str, action_desc, trim_exe_for_log(alert->exe), alert->pid);
+        action_str, action_desc, safe_exe, alert->pid);
 
     log_msg("Showing Zenity dialog for %s %s (%d)",
             action_str, trim_exe_for_log(alert->exe), alert->pid);
