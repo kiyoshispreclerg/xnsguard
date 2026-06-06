@@ -238,52 +238,50 @@ trim_exe_for_log(const char *full_path)
         return buffer;
     }
 
-    size_t len = strlen(full_path);
-    if (len <= 64) { 
-        strncpy(buffer, full_path, sizeof(buffer)-1);
-        buffer[sizeof(buffer)-1] = '\0';
+    if (strlen(full_path) < sizeof(buffer)) {
+        strcpy(buffer, full_path);
         return buffer;
     }
 
     const char *last_slash = strrchr(full_path, '/');
     if (!last_slash) {
-        strncpy(buffer, full_path, sizeof(buffer)-1);
-        buffer[sizeof(buffer)-1] = '\0';
+        strncpy(buffer, full_path, sizeof(buffer) - 1);
+        buffer[sizeof(buffer) - 1] = '\0';
         return buffer;
     }
 
     const char *exe_name = last_slash + 1;
 
+    /* Encontra o componente pai (diretório imediatamente antes do exe) */
     const char *parent_end = last_slash;
-    while (parent_end > full_path && *(parent_end-1) != '/')
+    while (parent_end > full_path && *(parent_end - 1) != '/')
         parent_end--;
-    size_t parent_len = last_slash - parent_end;
+    size_t parent_len = (size_t)(last_slash - parent_end);
 
-    const char *parent_start = (parent_len > 0) ? parent_end : last_slash;
-
-    size_t fixed_len = strlen(exe_name) + parent_len + 5;
-    if (fixed_len >= sizeof(buffer)-1)
-        fixed_len = sizeof(buffer)-20;
-
-    size_t prefix_max = sizeof(buffer) - fixed_len - 1;
-
-    size_t prefix_len = (size_t)(parent_start - full_path);
-    if (prefix_len > prefix_max) {
-        strncpy(buffer, full_path, prefix_max - 3);
-        strcpy(buffer + prefix_max - 3, "...");
-    } else {
-        strncpy(buffer, full_path, prefix_len);
-        buffer[prefix_len] = '\0';
+    /* Monta o sufixo ".../<parent>/<exe>" em buffer temporário */
+    char suffix[128];
+    int sfx_len = snprintf(suffix, sizeof(suffix), ".../%.*s/%s",
+                           (int)parent_len, parent_end, exe_name);
+    if (sfx_len <= 0) {
+        strncpy(buffer, full_path, sizeof(buffer) - 1);
+        buffer[sizeof(buffer) - 1] = '\0';
+        return buffer;
     }
 
-    strcat(buffer, "/.../");
-    if (parent_len > 0) {
-        strncat(buffer, parent_start, parent_len);
-        strcat(buffer, "/");
+    if ((size_t)sfx_len >= sizeof(buffer)) {
+        /* Sufixo sozinho já estoura: trunca e retorna */
+        strncpy(buffer, suffix, sizeof(buffer) - 1);
+        buffer[sizeof(buffer) - 1] = '\0';
+        return buffer;
     }
-    strcat(buffer, exe_name);
 
-    buffer[sizeof(buffer)-1] = '\0';
+    /* Quantos bytes do prefixo cabem antes do sufixo */
+    size_t avail   = sizeof(buffer) - 1 - (size_t)sfx_len;
+    size_t pfx_len = (size_t)(parent_end - full_path);
+    if (pfx_len > avail) pfx_len = avail;
+
+    strncpy(buffer, full_path, pfx_len);
+    strcpy(buffer + pfx_len, suffix);   /* sufixo já cabe — tamanho garantido acima */
     return buffer;
 }
 
