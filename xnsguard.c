@@ -476,14 +476,17 @@ void save_rule(const char *exe, int action_id, int is_allow) {
             return;
         }
     }
+
+    /* Grava enquanto o mutex está preso — check+write atômico. */
+    FILE *file = fopen(perms_file, "a");
+    if (file) {
+        fprintf(file, "%s %s %s\n", is_allow ? "ALLOW" : "DENY", action_str, exe);
+        fclose(file);
+    }
     pthread_mutex_unlock(&ignored_lock);
 
-    FILE *file = fopen(perms_file, "a");
-    if (!file) return;
-
-    fprintf(file, "%s %s %s\n", is_allow ? "ALLOW" : "DENY", action_str, exe);
-    fclose(file);
-    load_user_config();
+    if (file)
+        load_user_config();
 }
 
 void save_denied_entry(const char *exe, int action_id) {
@@ -673,16 +676,17 @@ void save_ignored_entry(const char *exe, int action_id) {
             return;
         }
     }
+
+    /* Grava enquanto o mutex está preso — check+write atômico. */
+    FILE *file = fopen(perms_file, "a");
+    if (file) {
+        fprintf(file, "ALLOW %s %s\n", action_str, exe);
+        fclose(file);
+    }
     pthread_mutex_unlock(&ignored_lock);
 
-    FILE *file = fopen(perms_file, "a");
-    if (!file) {
-        return;
-    }
-
-    fprintf(file, "ALLOW %s %s\n", action_str, exe);
-    fclose(file);
-    load_user_config();
+    if (file)
+        load_user_config();
 }
 
 int is_seen(const char *exe, int action) {
