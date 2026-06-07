@@ -2,7 +2,7 @@
 
 **XnsGuard** is a lightweight external permission guardian for X11.
 
-It communicates with the **Xnotify** mechanism (present in [my experimental XLibre fork](https://github.com/kiyoshispreclerg/xserver/tree/experiments) of the X server) to control privileged actions that X11 clients attempt to perform in real time, such as:
+It communicates with the **Xnotify** extension (present in [my personal XLibre fork](https://github.com/kiyoshispreclerg/xserver/tree/xnotify) of the X server) to control privileged actions that X11 clients attempt to perform in real time, such as:
 
 - Clipboard access (SELECTION)
 - Screen recording or capture (RECORD, COMPOSITE, SCREEN)
@@ -18,15 +18,17 @@ When a program tries to perform a protected action, Xnotify notifies XnsGuard, w
 - And yes, I use AI in many parts of the code, but always reading and testing them before compiling 😊
 
 ### What is Xnotify?
-Xnotify is **not** a classic X extension (it is not loaded via `XInitExtension`). It is an internal notification mechanism using Unix domain sockets.
-It works with static rules in `/etc` or dynamically with the external guardian (XnsGuard).
-[More about Xnotify here](https://github.com/kiyoshispreclerg/xserver/blob/experiments/doc/Xnotify.md).
+Xnotify is a small X extension present in [this XLibre fork](https://github.com/kiyoshispreclerg/xserver/tree/xnotify).
+It intercepts privileged client requests and notifies an external guardian via Unix domain socket, allowing real-time permission decisions.
+It works with static rules or dynamically with the external guardian (XnsGuard).
+[More about Xnotify here](https://github.com/kiyoshispreclerg/xserver/blob/xnotify/doc/Xnotify.md).
 
 ### Dependencies
 - Linux (recommended) — uses Unix domain sockets
 - Zenity (for graphical permission dialogs)
 - GCC or Clang with pthread support
-- [This XLibre experimental fork with Xnotify enabled](https://github.com/kiyoshispreclerg/xserver/tree/experiments)
+- libX11 (for Xnotify extension detection at startup)
+- [This XLibre experimental fork with Xnotify enabled](https://github.com/kiyoshispreclerg/xserver/tree/xnotify)
 
 ### How to Compile and Install
 
@@ -36,7 +38,7 @@ It works with static rules in `/etc` or dynamically with the external guardian (
 
 Or manually:
 
-`gcc -O2 -Wall -Wextra -pthread -D_FORTIFY_SOURCE=2 -fstack-protector-strong -o xnsguard xnsguard.c`
+`gcc -O2 -Wall -Wextra -pthread -D_FORTIFY_SOURCE=2 -fstack-protector-strong -o xnsguard xnsguard.c -lX11`
 
 ### How to Use
 
@@ -50,11 +52,11 @@ Useful options:
 
 `xnsguard --always-kill`                 # automatically kill unauthorized processes
 
-`xnsguard --conf=$HOME/.config/xnsguard` # diretório de configuração personalizado
+`xnsguard --conf=$HOME/.config/xnsguard` # custom configuration directory
 
 ### Permission Configuration
 
-Xlibre with Xnotify already loads fixed permissions from /etc/X11/xnotify.conf*, but the user can allow (or deny) more programs
+XLibre with Xnotify already loads fixed permissions from xnotify.conf*, but the user can allow (or deny) more programs
 by creating the file ~/.config/xnsguard/perms.conf with more rules, or just by allowing them when xnsguard asks for permission.
 
 Examples:
@@ -73,8 +75,7 @@ Examples:
 
 ### Ignore Reports
 
-Because Xnotify sends notifications about every single interaction with protected places in its code, sometimes XnsGuard floods
-the terminal with these. So the user can add a list of programs to the file ignore.conf in the same path of perms.conf, and
-reports coming from these programs will not be shown. It can be a good idea to add programs required for the session, such as
+The user can add a list of programs to the file ignore.conf (in the same path of perms.conf), and
+reports coming from these programs will not be shown. It can be a good idea to add programs always required for the session, such as
 window, clipboard, keyboard layout and session managers.
 

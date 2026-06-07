@@ -15,6 +15,7 @@
 #include <poll.h>
 #include <limits.h>
 #include <sys/wait.h>
+#include <X11/Xlib.h>
 
 #define MAX_ALERTS          100
 #define MAX_IGNORED         200
@@ -1098,6 +1099,30 @@ void cleanup(int sig) {
     exit(0);
 }
 
+/* ====================== XNOTIFY EXTENSION CHECK ====================== */
+
+static int check_xnotify_extension(void) {
+    char display_str[32];
+    snprintf(display_str, sizeof(display_str), ":%d", display);
+
+    Display *dpy = XOpenDisplay(display_str);
+    if (!dpy) {
+        log_filtered(2, "Could not open display %s to check Xnotify extension", display_str);
+        return 0;
+    }
+
+    int opcode, event_base, error_base;
+    int found = XQueryExtension(dpy, "XNOTIFY", &opcode, &event_base, &error_base);
+    XCloseDisplay(dpy);
+
+    if (found)
+        log_msg("Xnotify extension detected on display %s (opcode %d)", display_str, opcode);
+    else
+        log_msg("Warning: Xnotify extension not found on display %s - continuing via socket only", display_str);
+
+    return found;
+}
+
 /* ====================== MAIN ====================== */
 
 int main(int argc, char *argv[]) {
@@ -1135,7 +1160,7 @@ int main(int argc, char *argv[]) {
             printf("Usage: %s [options]\n", argv[0]);
             printf("Options:\n");
             printf("  --no-pause / --notify-only     Do not send SIGSTOP/SIGCONT\n");
-            printf("  --quiet / --no-zenity          No Zenity dialogs; deny this session (no perms.conf changes)\n");
+            printf("  --quiet / --no-zenity          No Zenity dialogs; deny all unauthorized processes for the current session\n");
             printf("  --always-kill                  Kill (SIGKILL) all unauthorized processes immediately\n");
             printf("  --conf <dir> or --conf=<dir>   Base config directory (default: ~/.config/xnsguard)\n");
             printf("  --log-level N                  Verbosity level (0-4)\n");
@@ -1149,6 +1174,11 @@ int main(int argc, char *argv[]) {
         log_msg("Connecting to display %d", display);
     else {
         log_msg("No display found. Exiting.");
+        return 0;
+    }
+
+    if(!check_xnotify_extension()){
+        log_msg("No XNOTIFY Extension found on display %d. Exiting.", display);
         return 0;
     }
 

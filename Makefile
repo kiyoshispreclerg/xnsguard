@@ -1,7 +1,7 @@
 # XnsGuard - Permission Guard for XLibre
 CC ?= gcc
 CFLAGS ?= -O2 -Wall -Wextra -pthread -D_FORTIFY_SOURCE=2 -fstack-protector-strong
-LDFLAGS ?= -pthread
+LDFLAGS ?= -pthread -lX11
 
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
