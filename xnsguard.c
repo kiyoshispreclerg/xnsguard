@@ -607,8 +607,15 @@ int show_zenity_dialog(const struct Alert *alert) {
     const char *action_str = action_to_string(alert->action);
     const char *action_desc = action_to_description(alert->action);
 
-    char safe_exe[256];
-    shell_sq_escape(safe_exe, sizeof(safe_exe), trim_exe_for_log(alert->exe));
+    /* Replace '|' with space for display (zenity shows "exe args" instead of "exe|args") */
+    char display_exe[PATH_MAX + 1024];
+    strncpy(display_exe, alert->exe, sizeof(display_exe) - 1);
+    display_exe[sizeof(display_exe) - 1] = '\0';
+    char *pipe_pos = strchr(display_exe, '|');
+    if (pipe_pos) *pipe_pos = ' ';
+
+    char safe_exe[512];
+    shell_sq_escape(safe_exe, sizeof(safe_exe), trim_exe_for_log(display_exe));
 
     snprintf(zenity_cmd, sizeof(zenity_cmd),
         "zenity --question "
@@ -789,10 +796,10 @@ void send_permission(int action, const char *exe, pid_t pid, int command_type) {
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
 
-    char safe_exe[200];
+    char safe_exe[1024];
     json_escape_str(safe_exe, sizeof(safe_exe), exe ? exe : "");
 
-    char msg[256];
+    char msg[1280];
     const char *cmd_name = "ALLOW";
 
     switch (command_type) {
@@ -842,6 +849,7 @@ void handle_message(const char *msg) {
     int action = 0;
     pid_t pid = 0;
     char exe[PATH_MAX] = "?";
+    char args[1024] = {0};
     char command[64] = "?";
 
     char *p = strstr(msg, "\"command\":\"");
@@ -876,8 +884,31 @@ void handle_message(const char *msg) {
         }
     }
 
+    p = strstr(msg, "\"args\":\"");
+    if (p) {
+        p += 8;
+        char *end = strchr(p, '"');
+        if (end) {
+            size_t len = (size_t)(end - p);
+            if (len >= sizeof(args)) len = sizeof(args) - 1;
+            strncpy(args, p, len);
+            args[len] = '\0';
+        }
+    }
+
     if (exe[0] == '\0') {
         strcpy(exe, "?");
+    }
+
+    /* Build combined key exe|args when args are present */
+    if (args[0] != '\0' && exe[0] != '\0' && strcmp(exe, "?") != 0) {
+        size_t exe_len = strlen(exe);
+        size_t args_len = strlen(args);
+        if (exe_len + 1 + args_len < (size_t)(PATH_MAX - 1)) {
+            exe[exe_len] = '|';
+            strncpy(exe + exe_len + 1, args, PATH_MAX - exe_len - 2);
+            exe[PATH_MAX - 1] = '\0';
+        }
     }
 
     if (action <= 0 || pid <= 0) 
