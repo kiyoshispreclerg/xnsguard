@@ -79,7 +79,7 @@ static const struct {
 };
 
 static const char* action_to_string(int action_id) {
-    if (action_id == -1)
+    if (action_id == -1 || action_id == 0)
         return "ALL";
 
     for (int i = 0; action_names[i].id > 0; i++) {
@@ -624,7 +624,7 @@ int show_zenity_dialog(const struct Alert *alert) {
         "--modal "
         "--timeout=90 "
         "--text='<b>Permission:</b> %s (%s)\n"
-                 "<b>Program:</b> %s (%d)' "
+                 "Program: <b>%s</b> (%d)' "
         "--ok-label='Allow' "
         "--cancel-label='Deny this session' "
         "--extra-button='Allow this session' "
@@ -809,11 +809,11 @@ void send_permission(int action, const char *exe, pid_t pid, int command_type) {
             break;
         case COMMAND_ALLOW_ALL:  /* ALLOW_ALL */
             snprintf(msg, sizeof(msg), "{\"command\":\"ALLOW_ALL\",\"exe\":\"%s\",\"action\":%d}", safe_exe, action);
-            cmd_name = "ALLOW_ALL";
+            cmd_name = "ALLOW";
             break;
         case COMMAND_ALLOW_ACTION:  /* ALLOW_ACTION */
             snprintf(msg, sizeof(msg), "{\"command\":\"ALLOW_ACTION\",\"action\":%d}", action);
-            cmd_name = "ALLOW_ACTION";
+            cmd_name = "ALLOW ACTION";
             break;
         case COMMAND_DENY:  /* DENY */
             snprintf(msg, sizeof(msg), "{\"command\":\"DENY\",\"action\":%d,\"exe\":\"%s\"}", action, safe_exe);
@@ -821,11 +821,11 @@ void send_permission(int action, const char *exe, pid_t pid, int command_type) {
             break;
         case COMMAND_DENY_ALL: /* DENY_ALL */
             snprintf(msg, sizeof(msg), "{\"command\":\"DENY_ALL\",\"exe\":\"%s\"}", safe_exe);
-            cmd_name = "DENY_ALL";
+            cmd_name = "DENY";
             break;
         case COMMAND_DENY_ACTION: /* DENY_ACTION */
             snprintf(msg, sizeof(msg), "{\"command\":\"DENY_ACTION\",\"action\":%d}", action);
-            cmd_name = "DENY_ACTION";
+            cmd_name = "DENY ACTION";
             break;
         default: /* ALLOW */
             snprintf(msg, sizeof(msg), "{\"command\":\"ALLOW\",\"action\":%d,\"exe\":\"%s\"}", action, safe_exe);
@@ -841,7 +841,7 @@ void send_permission(int action, const char *exe, pid_t pid, int command_type) {
     if (sent == -1) {
         log_msg("Failed to send permission: %s", strerror(errno));
     } else if (command_type != 1) {
-        log_filtered(2, "Sent: %s (%d) for %s", cmd_name, action, trim_exe_for_log(exe));
+        log_filtered(2, "Sent: %s %s for %s", cmd_name, action_to_string(action), trim_exe_for_log(exe));
     }
 }
 
