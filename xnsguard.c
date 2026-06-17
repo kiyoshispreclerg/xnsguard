@@ -33,6 +33,7 @@
 #define XNOTIFY_HOTKEY           9
 #define XNOTIFY_INPUT           10
 #define XNOTIFY_MANAGE          11
+#define XNOTIFY_GRAB_OVERRIDE   12
 
 #define COMMAND_HEARTBEAT     1
 #define COMMAND_ALLOW_ALL     2
@@ -57,6 +58,7 @@ static const struct {
     { XNOTIFY_HOTKEY,        "HOTKEY" },
     { XNOTIFY_INPUT,         "INPUT" },
     { XNOTIFY_MANAGE,        "MANAGE" },
+    { XNOTIFY_GRAB_OVERRIDE, "GRAB_OVERRIDE" },
     { 0, NULL }
 };
 
@@ -75,6 +77,7 @@ static const struct {
     { XNOTIFY_HOTKEY,        "Register global hotkeys" },
     { XNOTIFY_INPUT,         "Capture input - even when unfocused" },
     { XNOTIFY_MANAGE,        "List and get properties of other windows" },
+    { XNOTIFY_GRAB_OVERRIDE, "Allow to steal a grab (for screensavers)" },
     { 0, NULL }
 };
 
@@ -373,8 +376,8 @@ void load_user_config(void) {
                     strncpy(action_name, token1, sizeof(action_name)-1);
                 }
 
-                strncpy(ignored_cmds[ignored_count].exe_pattern, pattern, sizeof(ignored_cmds[ignored_count].exe_pattern)-1);
-                strncpy(ignored_cmds[ignored_count].action, action_name, sizeof(ignored_cmds[ignored_count].action)-1);
+                snprintf(ignored_cmds[ignored_count].exe_pattern, sizeof(ignored_cmds[ignored_count].exe_pattern), "%s", pattern);
+                snprintf(ignored_cmds[ignored_count].action, sizeof(ignored_cmds[ignored_count].action), "%s", action_name);
                 ignored_cmds[ignored_count].rule_type = is_allow ? 0 : 1;
                 ignored_count++;
             }
@@ -420,6 +423,8 @@ int get_preconfig_rule(const char *exe, int action_id, char *matched_pattern, si
 }
 
 /* ====================== SYNC PERMISSIONS TO X SERVER ====================== */
+
+void send_permission(int action, const char *exe, pid_t pid, int command_type);
 
 void send_all_permissions_to_xserver(void) {
     pthread_mutex_lock(&ignored_lock);
@@ -708,7 +713,7 @@ int is_seen(const char *exe, int action) {
 
 void add_seen(const char *exe, int action) {
     if (seen_count < MAX_ALERTS) {
-        strncpy(seen_alerts[seen_count].exe, exe, sizeof(seen_alerts[seen_count].exe)-1);
+        snprintf(seen_alerts[seen_count].exe, sizeof(seen_alerts[seen_count].exe), "%s", exe);
         seen_alerts[seen_count].action = action;
         seen_count++;
     }
@@ -754,7 +759,7 @@ void send_query_action(const char *action) {
 
     struct sockaddr_un addr = {0};
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path)-1);
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socket_path);
 
     char msg[256];
     snprintf(msg, sizeof(msg),
@@ -794,7 +799,7 @@ void send_permission(int action, const char *exe, pid_t pid, int command_type) {
 
     struct sockaddr_un addr = {0};
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socket_path);
 
     char safe_exe[1024];
     json_escape_str(safe_exe, sizeof(safe_exe), exe ? exe : "");
@@ -927,7 +932,7 @@ void handle_message(const char *msg) {
             now - last_report.last_time < REPORT_THROTTLE_S)
             return;
 
-        strncpy(last_report.exe, exe, sizeof(last_report.exe)-1);
+        snprintf(last_report.exe, sizeof(last_report.exe), "%s", exe);
         last_report.action = action;
         last_report.last_time = now;
         return;
@@ -1089,7 +1094,7 @@ int acquire_lock() {
 
     struct sockaddr_un addr = {0};
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, LOCK_SOCKET_PATH_BUF, sizeof(addr.sun_path) - 1);
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", LOCK_SOCKET_PATH_BUF);
     
     unlink(LOCK_SOCKET_PATH_BUF);
 
@@ -1253,7 +1258,7 @@ int main(int argc, char *argv[]) {
 
     struct sockaddr_un addr = {0};
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, SOCKET_PATH_BUF, sizeof(addr.sun_path) - 1);
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", SOCKET_PATH_BUF);
 
     unlink(SOCKET_PATH_BUF);
     if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
