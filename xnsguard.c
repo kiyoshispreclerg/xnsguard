@@ -402,13 +402,27 @@ int get_preconfig_rule(const char *exe, int action_id, char *matched_pattern, si
 
     pthread_mutex_lock(&ignored_lock);
     for (int i = 0; i < ignored_count; i++) {
-        if (!pattern_matches(exe, ignored_cmds[i].exe_pattern))
+        /* Pattern without '|' matches any args: compare against exe only.
+         * Pattern with '|' requires exact exe|args match. */
+        char exe_buf[PATH_MAX];
+        const char *match_key;
+        if (strchr(ignored_cmds[i].exe_pattern, '|') == NULL) {
+            strncpy(exe_buf, exe, sizeof(exe_buf) - 1);
+            exe_buf[sizeof(exe_buf) - 1] = '\0';
+            char *p = strchr(exe_buf, '|');
+            if (p) *p = '\0';
+            match_key = exe_buf;
+        } else {
+            match_key = exe;
+        }
+
+        if (!pattern_matches(match_key, ignored_cmds[i].exe_pattern))
             continue;
 
-        if (ignored_cmds[i].action[0] == '\0' || 
+        if (ignored_cmds[i].action[0] == '\0' ||
             strcasecmp(ignored_cmds[i].action, action_name) == 0) {
             int ret = (ignored_cmds[i].rule_type == 0) ? 1 : 2;
-            
+
             if (matched_pattern && max_len > 0) {
                 strncpy(matched_pattern, ignored_cmds[i].exe_pattern, max_len - 1);
                 matched_pattern[max_len - 1] = '\0';
@@ -559,10 +573,22 @@ int is_ignored(const char *exe, int action_id) {
 
     pthread_mutex_lock(&ignored_lock);
     for (int i = 0; i < ignored_count; i++) {
-        if (!pattern_matches(exe, ignored_cmds[i].exe_pattern))
+        char exe_buf[PATH_MAX];
+        const char *match_key;
+        if (strchr(ignored_cmds[i].exe_pattern, '|') == NULL) {
+            strncpy(exe_buf, exe, sizeof(exe_buf) - 1);
+            exe_buf[sizeof(exe_buf) - 1] = '\0';
+            char *p = strchr(exe_buf, '|');
+            if (p) *p = '\0';
+            match_key = exe_buf;
+        } else {
+            match_key = exe;
+        }
+
+        if (!pattern_matches(match_key, ignored_cmds[i].exe_pattern))
             continue;
 
-        if (ignored_cmds[i].action[0] == '\0' || 
+        if (ignored_cmds[i].action[0] == '\0' ||
             strcasecmp(ignored_cmds[i].action, action_name) == 0) {
             pthread_mutex_unlock(&ignored_lock);
             return 1;
@@ -622,22 +648,45 @@ int show_zenity_dialog(const struct Alert *alert) {
     char safe_exe[512];
     shell_sq_escape(safe_exe, sizeof(safe_exe), trim_exe_for_log(display_exe));
 
-    snprintf(zenity_cmd, sizeof(zenity_cmd),
-        "zenity --question "
-        "--title='XnsGuard' "
-        "--icon-name=dialog-warning "
-        "--modal "
-        "--timeout=90 "
-        "--text='<b>Permission:</b> %s (%s)\n"
-                 "Program: <b>%s</b> (%d)' "
-        "--ok-label='Allow' "
-        "--cancel-label='Deny this session' "
-        "--extra-button='Allow this session' "
-        "--extra-button='Deny' "
-        "--extra-button='TRUST (allow all)' "
-        "--width=550 "
-        "--no-wrap 2>/dev/null",
-        action_str, action_desc, safe_exe, alert->pid);
+    int has_args = (strchr(alert->exe, '|') != NULL);
+
+    if (has_args) {
+        snprintf(zenity_cmd, sizeof(zenity_cmd),
+            "zenity --question "
+            "--title='XnsGuard' "
+            "--icon-name=dialog-warning "
+            "--modal "
+            "--timeout=90 "
+            "--text='<b>Permission:</b> %s (%s)\n"
+                     "Program: <b>%s</b> (%d)' "
+            "--ok-label='Allow' "
+            "--cancel-label='Deny this session' "
+            "--extra-button='Allow this session' "
+            "--extra-button='Deny' "
+            "--extra-button='Allow EXACT' "
+            "--extra-button='Allow EXACT (session)' "
+            "--extra-button='TRUST (allow all)' "
+            "--width=550 "
+            "--no-wrap 2>/dev/null",
+            action_str, action_desc, safe_exe, alert->pid);
+    } else {
+        snprintf(zenity_cmd, sizeof(zenity_cmd),
+            "zenity --question "
+            "--title='XnsGuard' "
+            "--icon-name=dialog-warning "
+            "--modal "
+            "--timeout=90 "
+            "--text='<b>Permission:</b> %s (%s)\n"
+                     "Program: <b>%s</b> (%d)' "
+            "--ok-label='Allow' "
+            "--cancel-label='Deny this session' "
+            "--extra-button='Allow this session' "
+            "--extra-button='Deny' "
+            "--extra-button='TRUST (allow all)' "
+            "--width=550 "
+            "--no-wrap 2>/dev/null",
+            action_str, action_desc, safe_exe, alert->pid);
+    }
 
     log_msg("Showing Zenity dialog for %s %s (%d)",
             action_str, trim_exe_for_log(alert->exe), alert->pid);
@@ -659,15 +708,19 @@ int show_zenity_dialog(const struct Alert *alert) {
     log_msg("Zenity returned %d | '%s'", code, output);
 
     if (code == 0) {
-        return 0;
-    } else if (strstr(output, "Allow this session") != NULL) {
-        return 1;
-    } else if (strstr(output, "Deny") != NULL) {
-        return 2;
+        return 0;  /* Allow (exe only) */
     } else if (strstr(output, "TRUST (allow all)") != NULL) {
         return 3;
+    } else if (strstr(output, "Allow exact (session)") != NULL) {
+        return 5;  /* Allow exact this session (exe|args) */
+    } else if (strstr(output, "Allow exact") != NULL) {
+        return 4;  /* Allow exact permanent (exe|args) */
+    } else if (strstr(output, "Allow this session") != NULL) {
+        return 1;  /* Allow this session (exe only) */
+    } else if (strstr(output, "Deny") != NULL) {
+        return 2;  /* Deny permanent (exe only) */
     } else {
-        return 99;
+        return 99; /* Deny this session (cancel/timeout) */
     }
 }
 
@@ -1006,11 +1059,18 @@ void process_next_alert() {
         response = show_zenity_dialog(&alert);
     }
 
+    /* Extract exe without args for non-exact rules */
+    char exe_only[PATH_MAX];
+    strncpy(exe_only, alert.exe, sizeof(exe_only) - 1);
+    exe_only[sizeof(exe_only) - 1] = '\0';
+    char *pipe_sep = strchr(exe_only, '|');
+    if (pipe_sep) *pipe_sep = '\0';
+
     pthread_mutex_lock(&queue_lock);
 
     if (response == -1) {
-        log_msg("ALWAYS-KILL mode: killing PID %d (%s)", alert.pid, trim_exe_for_log(alert.exe));
-        send_permission(alert.action, alert.exe, alert.pid, COMMAND_DENY);
+        log_msg("ALWAYS-KILL mode: killing PID %d (%s)", alert.pid, trim_exe_for_log(exe_only));
+        send_permission(alert.action, exe_only, alert.pid, COMMAND_DENY);
         kill(alert.pid, SIGKILL);
         remove_all_alerts_for_pid(alert.pid);
         remove_seen_for_exe(alert.exe, alert.action);
@@ -1019,27 +1079,34 @@ void process_next_alert() {
     }
 
     if (quiet_mode)
-        log_msg("QUIET mode: denying this session for %s (PID %d)", trim_exe_for_log(alert.exe), alert.pid);
+        log_msg("QUIET mode: denying this session for %s (PID %d)", trim_exe_for_log(exe_only), alert.pid);
 
     if (response == 0) {
-        log_filtered(1, "ALLOWED: %s : %s", trim_exe_for_log(alert.exe), action_to_string(alert.action));
-        save_rule(alert.exe, alert.action, 1);
-        send_permission(alert.action, alert.exe, alert.pid, COMMAND_ALLOW); // TODO passar com wildcard
+        log_filtered(1, "ALLOWED: %s : %s", trim_exe_for_log(exe_only), action_to_string(alert.action));
+        save_rule(exe_only, alert.action, 1);
+        send_permission(alert.action, exe_only, alert.pid, COMMAND_ALLOW);
     } else if (response == 1) {
-        log_filtered(1, "ALLOWED THIS SESSION: %s : %s", trim_exe_for_log(alert.exe), action_to_string(alert.action));
-        send_permission(alert.action, alert.exe, alert.pid, COMMAND_ALLOW); // TODO passar com wildcard
+        log_filtered(1, "ALLOWED THIS SESSION: %s : %s", trim_exe_for_log(exe_only), action_to_string(alert.action));
+        send_permission(alert.action, exe_only, alert.pid, COMMAND_ALLOW);
     } else if (response == 2) {
-        log_filtered(1, "DENIED: %s : %s", trim_exe_for_log(alert.exe), action_to_string(alert.action));
-        save_denied_entry(alert.exe, alert.action);
-        send_permission(alert.action, alert.exe, alert.pid, COMMAND_DENY); // TODO passar com wildcard
+        log_filtered(1, "DENIED: %s : %s", trim_exe_for_log(exe_only), action_to_string(alert.action));
+        save_denied_entry(exe_only, alert.action);
+        send_permission(alert.action, exe_only, alert.pid, COMMAND_DENY);
     } else if (response == 3) {
-        log_filtered(1, "ALL ALLOWED: %s", trim_exe_for_log(alert.exe));
-        save_rule(alert.exe, -1, -1);
-        send_permission(alert.action, alert.exe, alert.pid, COMMAND_ALLOW_ALL); // TODO passar com wildcard
+        log_filtered(1, "ALL ALLOWED: %s", trim_exe_for_log(exe_only));
+        save_rule(exe_only, -1, -1);
+        send_permission(alert.action, exe_only, alert.pid, COMMAND_ALLOW_ALL);
         remove_all_alerts_for_pid(alert.pid);
+    } else if (response == 4) {
+        log_filtered(1, "ALLOWED EXACT: %s : %s", trim_exe_for_log(alert.exe), action_to_string(alert.action));
+        save_rule(alert.exe, alert.action, 1);
+        send_permission(alert.action, alert.exe, alert.pid, COMMAND_ALLOW);
+    } else if (response == 5) {
+        log_filtered(1, "ALLOWED EXACT THIS SESSION: %s : %s", trim_exe_for_log(alert.exe), action_to_string(alert.action));
+        send_permission(alert.action, alert.exe, alert.pid, COMMAND_ALLOW);
     } else {
-        log_filtered(1, "DENIED THIS SESSION: %s : %s", trim_exe_for_log(alert.exe), action_to_string(alert.action));
-        send_permission(alert.action, alert.exe, alert.pid, COMMAND_DENY); // TODO passar com wildcard
+        log_filtered(1, "DENIED THIS SESSION: %s : %s", trim_exe_for_log(exe_only), action_to_string(alert.action));
+        send_permission(alert.action, exe_only, alert.pid, COMMAND_DENY);
     }
 
     if (alert.paused && !no_pause_mode)
