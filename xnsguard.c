@@ -43,6 +43,14 @@
 #define COMMAND_DENY_ACTION   6
 #define COMMAND_ALLOW         0
 
+#define BTN_ALLOW               "Allow"
+#define BTN_DENY_SESSION        "Deny this session"
+#define BTN_ALLOW_SESSION       "Allow this session"
+#define BTN_DENY                "Deny"
+#define BTN_ALLOW_EXACT         "Allow EXACT"
+#define BTN_ALLOW_EXACT_SESSION "Allow EXACT (session)"
+#define BTN_TRUST               "TRUST (allow all)"
+
 static const struct {
     int   id;
     const char *name;
@@ -659,13 +667,13 @@ int show_zenity_dialog(const struct Alert *alert) {
             "--timeout=90 "
             "--text='<b>Permission:</b> %s (%s)\n"
                      "Program: <b>%s</b> (%d)' "
-            "--ok-label='Allow' "
-            "--cancel-label='Deny this session' "
-            "--extra-button='Allow this session' "
-            "--extra-button='Deny' "
-            "--extra-button='Allow EXACT' "
-            "--extra-button='Allow EXACT (session)' "
-            "--extra-button='TRUST (allow all)' "
+            "--ok-label='" BTN_ALLOW "' "
+            "--cancel-label='" BTN_DENY_SESSION "' "
+            "--extra-button='" BTN_ALLOW_SESSION "' "
+            "--extra-button='" BTN_DENY "' "
+            "--extra-button='" BTN_ALLOW_EXACT "' "
+            "--extra-button='" BTN_ALLOW_EXACT_SESSION "' "
+            "--extra-button='" BTN_TRUST "' "
             "--width=550 "
             "--no-wrap 2>/dev/null",
             action_str, action_desc, safe_exe, alert->pid);
@@ -678,11 +686,11 @@ int show_zenity_dialog(const struct Alert *alert) {
             "--timeout=90 "
             "--text='<b>Permission:</b> %s (%s)\n"
                      "Program: <b>%s</b> (%d)' "
-            "--ok-label='Allow' "
-            "--cancel-label='Deny this session' "
-            "--extra-button='Allow this session' "
-            "--extra-button='Deny' "
-            "--extra-button='TRUST (allow all)' "
+            "--ok-label='" BTN_ALLOW "' "
+            "--cancel-label='" BTN_DENY_SESSION "' "
+            "--extra-button='" BTN_ALLOW_SESSION "' "
+            "--extra-button='" BTN_DENY "' "
+            "--extra-button='" BTN_TRUST "' "
             "--width=550 "
             "--no-wrap 2>/dev/null",
             action_str, action_desc, safe_exe, alert->pid);
@@ -708,19 +716,19 @@ int show_zenity_dialog(const struct Alert *alert) {
     log_msg("Zenity returned %d | '%s'", code, output);
 
     if (code == 0) {
-        return 0;  /* Allow (exe only) */
-    } else if (strstr(output, "TRUST (allow all)") != NULL) {
+        return 0;  /* BTN_ALLOW (exe only) */
+    } else if (strstr(output, BTN_TRUST) != NULL) {
         return 3;
-    } else if (strstr(output, "Allow exact (session)") != NULL) {
+    } else if (strstr(output, BTN_ALLOW_EXACT_SESSION) != NULL) {
         return 5;  /* Allow exact this session (exe|args) */
-    } else if (strstr(output, "Allow exact") != NULL) {
+    } else if (strstr(output, BTN_ALLOW_EXACT) != NULL) {
         return 4;  /* Allow exact permanent (exe|args) */
-    } else if (strstr(output, "Allow this session") != NULL) {
+    } else if (strstr(output, BTN_ALLOW_SESSION) != NULL) {
         return 1;  /* Allow this session (exe only) */
-    } else if (strstr(output, "Deny") != NULL) {
+    } else if (strstr(output, BTN_DENY) != NULL) {
         return 2;  /* Deny permanent (exe only) */
     } else {
-        return 99; /* Deny this session (cancel/timeout) */
+        return 99; /* BTN_DENY_SESSION (cancel/timeout) */
     }
 }
 
