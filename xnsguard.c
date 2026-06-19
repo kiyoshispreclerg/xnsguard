@@ -22,6 +22,8 @@
 #define BUF_SIZE            4096
 #define REPORT_THROTTLE_S   1
 
+#define XNSGUARD_VERSION    "0.3.0"
+
 #define XNOTIFY_ATTACH           1
 #define XNOTIFY_SELECTION        2
 #define XNOTIFY_COMPOSITE        3
@@ -1267,6 +1269,9 @@ int main(int argc, char *argv[]) {
         } else if (strncmp(argv[i], "--log-level=", 12) == 0) {
             int lvl = atoi(argv[i] + 12);
             if (lvl >= 0 && lvl <= 4) log_level = lvl;
+        } else if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-V") == 0) {
+            printf("xnsguard %s\n", XNSGUARD_VERSION);
+            return 0;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Usage: %s [options]\n", argv[0]);
             printf("Options:\n");
@@ -1275,6 +1280,7 @@ int main(int argc, char *argv[]) {
             printf("  --always-kill                  Kill (SIGKILL) all unauthorized processes immediately\n");
             printf("  --conf <dir> or --conf=<dir>   Base config directory (default: ~/.config/xnsguard)\n");
             printf("  --log-level N                  Verbosity level (0-4)\n");
+            printf("  --version / -V                 Print version and exit\n");
             printf("  --help / -h                    Show this help\n");
             return 0;
         }
