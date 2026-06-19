@@ -170,6 +170,9 @@ static time_t last_config_mtime = 0;
 static char ignore_file[512] = {0};
 static time_t last_ignore_mtime = 0;
 
+static char xnotify_conf_file[512] = {0};
+static time_t last_xnotify_conf_mtime = 0;
+
 struct IgnoredReport {
     char exe[PATH_MAX];
 };
@@ -568,6 +571,67 @@ int file_has_changed() {
         return 1;
     }
     return 0;
+}
+
+/* ====================== XNOTIFY CONF (PERSISTENT FLAGS) ====================== */
+
+static void load_xnotify_conf(void) {
+    FILE *f = fopen(xnotify_conf_file, "r");
+    if (!f) return;
+
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\n")] = 0;
+        char *t = trim(line);
+        if (!*t || *t == '#') continue;
+
+        char key[64] = {0}, val[64] = {0};
+        if (sscanf(t, "%63[^=]=%63s", key, val) != 2) continue;
+
+        char *k = trim(key);
+        char *v = trim(val);
+        if (strcmp(k, "no_pause") == 0)
+            no_pause_mode = atoi(v) ? 1 : 0;
+        else if (strcmp(k, "quiet") == 0)
+            quiet_mode = atoi(v) ? 1 : 0;
+        else if (strcmp(k, "always_kill") == 0)
+            always_kill_mode = atoi(v) ? 1 : 0;
+        else if (strcmp(k, "log_level") == 0) {
+            int lvl = atoi(v);
+            if (lvl >= 0 && lvl <= 4) log_level = lvl;
+        }
+    }
+    fclose(f);
+    last_xnotify_conf_mtime = time(NULL);
+    log_filtered(3, "Loaded xnotify.conf: no_pause=%d quiet=%d always_kill=%d log_level=%d",
+                 no_pause_mode, quiet_mode, always_kill_mode, log_level);
+}
+
+static void save_xnotify_conf(void) {
+    if (!xnotify_conf_file[0]) return;
+    FILE *f = fopen(xnotify_conf_file, "w");
+    if (!f) {
+        log_msg("Warning: could not save xnotify.conf: %s", strerror(errno));
+        return;
+    }
+    fprintf(f, "# XnsGuard runtime configuration — edited automatically on startup\n");
+    fprintf(f, "no_pause=%d\n", no_pause_mode);
+    fprintf(f, "quiet=%d\n", quiet_mode);
+    fprintf(f, "always_kill=%d\n", always_kill_mode);
+    fprintf(f, "log_level=%d\n", log_level);
+    fclose(f);
+    last_xnotify_conf_mtime = time(NULL);
+    log_filtered(3, "Saved xnotify.conf");
+}
+
+static void check_xnotify_conf_changed(void) {
+    if (!xnotify_conf_file[0]) return;
+    struct stat st;
+    if (stat(xnotify_conf_file, &st) != 0) return;
+    if (st.st_mtime > last_xnotify_conf_mtime) {
+        log_msg("xnotify.conf changed externally, reloading...");
+        load_xnotify_conf();
+    }
 }
 
 /* ====================== IGNORED CHECK ====================== */
@@ -1155,6 +1219,7 @@ void* file_monitor_loop(void *arg) {
     log_msg("File monitor thread started");
     while (!should_exit) {
         file_has_changed();
+        check_xnotify_conf_changed();
         sleep(1);
     }
     return NULL;
@@ -1243,33 +1308,9 @@ int main(int argc, char *argv[]) {
     signal(SIGTERM, cleanup);
     signal(SIGPIPE, SIG_IGN);
 
+    /* --version / --help don't need anything else — handle them first */
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--no-pause") == 0 ||
-            strcmp(argv[i], "--notify-only") == 0) {
-            no_pause_mode = 1;
-            log_msg("NOTIFY-ONLY mode activated (no process pausing)");
-        } else if (strcmp(argv[i], "--quiet") == 0 ||
-                 strcmp(argv[i], "--no-zenity") == 0) {
-            quiet_mode = 1;
-            log_msg("QUIET mode activated (no Zenity dialogs)");
-        } else if (strcmp(argv[i], "--always-kill") == 0) {
-            always_kill_mode = 1;
-            log_msg("ALWAYS-KILL mode activated (unknown processes will be killed)");
-        } else if (strncmp(argv[i], "--conf=", 7) == 0) {
-            strncpy(config_dir, argv[i] + 7, sizeof(config_dir) - 1);
-            config_dir[sizeof(config_dir)-1] = '\0';
-        } else if (strcmp(argv[i], "--conf") == 0 && i + 1 < argc) {
-            strncpy(config_dir, argv[i + 1], sizeof(config_dir) - 1);
-            config_dir[sizeof(config_dir)-1] = '\0';
-            i++;
-        } else if (strcmp(argv[i], "--log-level") == 0 && i + 1 < argc) {
-            int lvl = atoi(argv[i+1]);
-            if (lvl >= 0 && lvl <= 4) log_level = lvl;
-            i++;
-        } else if (strncmp(argv[i], "--log-level=", 12) == 0) {
-            int lvl = atoi(argv[i] + 12);
-            if (lvl >= 0 && lvl <= 4) log_level = lvl;
-        } else if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-V") == 0) {
+        if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-V") == 0) {
             printf("xnsguard %s\n", XNSGUARD_VERSION);
             return 0;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -1285,6 +1326,62 @@ int main(int argc, char *argv[]) {
             return 0;
         }
     }
+
+    /* Quick scan: resolve --conf so we can set up file paths before loading xnotify.conf */
+    for (int i = 1; i < argc; i++) {
+        if (strncmp(argv[i], "--conf=", 7) == 0) {
+            strncpy(config_dir, argv[i] + 7, sizeof(config_dir) - 1);
+            config_dir[sizeof(config_dir)-1] = '\0';
+        } else if (strcmp(argv[i], "--conf") == 0 && i + 1 < argc) {
+            strncpy(config_dir, argv[i + 1], sizeof(config_dir) - 1);
+            config_dir[sizeof(config_dir)-1] = '\0';
+        }
+    }
+
+    if (config_dir[0] == '\0') {
+        const char *home = getenv("HOME");
+        if (home && *home)
+            snprintf(config_dir, sizeof(config_dir), "%s/.config/xnsguard", home);
+        else
+            strcpy(config_dir, "/tmp/xnsguard");
+    }
+
+    snprintf(perms_file, sizeof(perms_file), "%s/perms.conf", config_dir);
+    snprintf(ignore_file, sizeof(ignore_file), "%s/ignore.conf", config_dir);
+    snprintf(xnotify_conf_file, sizeof(xnotify_conf_file), "%s/xnotify.conf", config_dir);
+    mkdir(config_dir, 0755);
+
+    /* Load saved runtime flags; CLI args below will override them */
+    load_xnotify_conf();
+
+    /* Full CLI parse — overrides anything loaded from xnotify.conf */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--no-pause") == 0 ||
+            strcmp(argv[i], "--notify-only") == 0) {
+            no_pause_mode = 1;
+            log_msg("NOTIFY-ONLY mode activated (no process pausing)");
+        } else if (strcmp(argv[i], "--quiet") == 0 ||
+                 strcmp(argv[i], "--no-zenity") == 0) {
+            quiet_mode = 1;
+            log_msg("QUIET mode activated (no Zenity dialogs)");
+        } else if (strcmp(argv[i], "--always-kill") == 0) {
+            always_kill_mode = 1;
+            log_msg("ALWAYS-KILL mode activated (unknown processes will be killed)");
+        } else if (strncmp(argv[i], "--conf=", 7) == 0 ||
+                   (strcmp(argv[i], "--conf") == 0 && i + 1 < argc && ++i)) {
+            /* already handled above */
+        } else if (strcmp(argv[i], "--log-level") == 0 && i + 1 < argc) {
+            int lvl = atoi(argv[i+1]);
+            if (lvl >= 0 && lvl <= 4) log_level = lvl;
+            i++;
+        } else if (strncmp(argv[i], "--log-level=", 12) == 0) {
+            int lvl = atoi(argv[i] + 12);
+            if (lvl >= 0 && lvl <= 4) log_level = lvl;
+        }
+    }
+
+    /* Persist the final runtime flags for the next invocation */
+    save_xnotify_conf();
 
     const char *display_env = getenv("DISPLAY");
     if (display_env && sscanf(display_env, ":%d", &display) == 1)
@@ -1303,19 +1400,6 @@ int main(int argc, char *argv[]) {
     const char *base_dir = (runtime_dir && *runtime_dir) ? runtime_dir : "/tmp";
     snprintf(SOCKET_PATH_BUF, sizeof(SOCKET_PATH_BUF), "%s/xnotify.%d.sock", base_dir, display);
     snprintf(LOCK_SOCKET_PATH_BUF, sizeof(LOCK_SOCKET_PATH_BUF), "%s/xnotify.%d.lock.sock", base_dir, display);
-
-    if (config_dir[0] == '\0') {
-        const char *home = getenv("HOME");
-        if (home && *home) {
-            snprintf(config_dir, sizeof(config_dir), "%s/.config/xnsguard", home);
-        } else {
-            strcpy(config_dir, "/tmp/xnsguard");
-        }
-    }
-
-    snprintf(perms_file, sizeof(perms_file), "%s/perms.conf", config_dir);
-    snprintf(ignore_file, sizeof(ignore_file), "%s/ignore.conf", config_dir);
-    mkdir(config_dir, 0755);
 
     log_msg("XnsGuard starting - user config: %s", perms_file);
 
