@@ -36,6 +36,10 @@
 #define XNOTIFY_INPUT           10
 #define XNOTIFY_MANAGE          11
 #define XNOTIFY_GRAB_OVERRIDE   12
+#define XNOTIFY_WARP            13
+#define XNOTIFY_FOCUS           14
+#define XNOTIFY_RANDR           15
+#define XNOTIFY_OVERLAY         16
 
 #define COMMAND_HEARTBEAT     1
 #define COMMAND_ALLOW_ALL     2
@@ -69,6 +73,10 @@ static const struct {
     { XNOTIFY_INPUT,         "INPUT" },
     { XNOTIFY_MANAGE,        "MANAGE" },
     { XNOTIFY_GRAB_OVERRIDE, "GRAB_OVERRIDE" },
+    { XNOTIFY_WARP,          "WARP" },
+    { XNOTIFY_FOCUS,         "FOCUS" },
+    { XNOTIFY_RANDR,         "RANDR" },
+    { XNOTIFY_OVERLAY,       "OVERLAY" },
     { 0, NULL }
 };
 
@@ -88,6 +96,10 @@ static const struct {
     { XNOTIFY_INPUT,         "Capture input - even when unfocused" },
     { XNOTIFY_MANAGE,        "List and get properties of other windows" },
     { XNOTIFY_GRAB_OVERRIDE, "Allow to steal a grab (for screensavers)" },
+    { XNOTIFY_WARP,          "Move the mouse cursor" },
+    { XNOTIFY_FOCUS,         "Steal input focus" },
+    { XNOTIFY_RANDR,         "Change display configuration" },
+    { XNOTIFY_OVERLAY,       "Create overlay (transparent) window" },
     { 0, NULL }
 };
 
