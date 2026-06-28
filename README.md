@@ -54,6 +54,32 @@ Useful options:
 
 `xnsguard --conf=$HOME/.config/xnsguard` # custom configuration directory
 
+#### Global action overrides
+
+The `--allow ACTION` and `--deny ACTION` flags make XnsGuard respond immediately to any program requesting that action,
+without consulting `perms.conf` or asking the user. They can be repeated to cover multiple actions.
+These overrides take **priority over `perms.conf`** rules; if the same action appears in both, `--deny` wins over `--allow`.
+
+```
+xnsguard --allow SCREEN --deny RECORD
+```
+Any program requesting SCREEN is always allowed; any program requesting RECORD is always denied.
+
+```
+xnsguard --deny ALL
+```
+Deny every action globally — useful as a strict default when combined with targeted `--allow` flags.
+
+```
+xnsguard --allow INPUT --allow SELECTION --deny RECORD --deny SCREEN
+```
+Multiple flags are accumulated. Order does not matter.
+
+Valid ACTION names: `ATTACH` `SELECTION` `COMPOSITE` `SCREEN` `RECORD` `CURSOR` `INPUT_GRAB` `INPUT_INJECT`
+`HOTKEY` `INPUT` `MANAGE` `GRAB_OVERRIDE` `WARP` `FOCUS` `RANDR` `OVERLAY` `ALL`
+
+These flags are **not** persisted in `xnotify.conf` and must be passed explicitly on each launch.
+
 ### Permission Configuration
 
 XLibre with Xnotify already loads fixed permissions from xnotify.conf*, but the user can allow (or deny) more programs
@@ -72,6 +98,15 @@ Examples:
 `ALLOW ALL /home/kiyoshi/Downloads/syncthing`
 
 `DENY RECORD *`
+
+### Persistent Runtime Configuration
+
+XnsGuard saves the runtime flags (`--no-pause`, `--quiet`, `--always-kill`, `--log-level`) to
+`~/.config/xnsguard/xnotify.conf` on every startup. If the program is launched with no flags the
+values from the last run are restored automatically. CLI flags always take precedence over the saved
+values and overwrite them for the next run.
+
+The file monitor thread watches `xnotify.conf` for external changes and reloads it live.
 
 ### Ignore Reports
 

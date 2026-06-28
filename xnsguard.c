@@ -15,6 +15,7 @@
 #include <poll.h>
 #include <limits.h>
 #include <sys/wait.h>
+#include <stdint.h>
 #include <X11/Xlib.h>
 
 #define MAX_ALERTS          100
@@ -149,6 +150,11 @@ static int no_pause_mode = 0;      /* 1 = notify only, no SIGSTOP */
 static int quiet_mode = 0;         /* 1 = no Zenity, terminal logs only */
 static int always_kill_mode = 0;   /* 1 = kill unknown processes immediately */
 static int log_level = 2;          /* 0=silent, 1=clean, 2=normal, 3=verbose, 4=debug */
+
+/* Bitmasks for per-action CLI overrides (bit N-1 = action N, 1-16).
+ * Checked before perms.conf; deny wins if both bits are set for same action. */
+static uint32_t cli_allow_mask = 0;
+static uint32_t cli_deny_mask  = 0;
 
 static int display = 0;
 
@@ -1079,6 +1085,21 @@ void handle_message(const char *msg) {
 
     log_msg("X server requested %s for %s", action_str, trim_exe_for_log(exe));
 
+    /* CLI global overrides: checked before perms.conf; deny wins over allow */
+    if (action > 0 && action <= 16) {
+        uint32_t bit = 1u << (action - 1);
+        if (cli_deny_mask & bit) {
+            log_filtered(2, "CLI override: DENY %s for %s", action_str, trim_exe_for_log(exe));
+            send_permission(action, exe, pid, COMMAND_DENY);
+            return;
+        }
+        if (cli_allow_mask & bit) {
+            log_filtered(2, "CLI override: ALLOW %s for %s", action_str, trim_exe_for_log(exe));
+            send_permission(action, exe, pid, COMMAND_ALLOW);
+            return;
+        }
+    }
+
     char matched_rule[PATH_MAX] = {0};
     int pre = get_preconfig_rule(exe, action, matched_rule, sizeof(matched_rule));
     const char *rule_to_send = (matched_rule[0] != '\0') ? matched_rule : exe;
@@ -1333,6 +1354,11 @@ int main(int argc, char *argv[]) {
             printf("  --always-kill                  Kill (SIGKILL) all unauthorized processes immediately\n");
             printf("  --conf <dir> or --conf=<dir>   Base config directory (default: ~/.config/xnsguard)\n");
             printf("  --log-level N                  Verbosity level (0-4)\n");
+            printf("  --allow ACTION                 Always allow ACTION for any program (overrides perms.conf)\n");
+            printf("  --deny  ACTION                 Always deny  ACTION for any program (overrides perms.conf)\n");
+            printf("                                 Can be repeated. ACTION: ATTACH SELECTION COMPOSITE SCREEN\n");
+            printf("                                   RECORD CURSOR INPUT_GRAB INPUT_INJECT HOTKEY INPUT\n");
+            printf("                                   MANAGE GRAB_OVERRIDE WARP FOCUS RANDR OVERLAY ALL\n");
             printf("  --version / -V                 Print version and exit\n");
             printf("  --help / -h                    Show this help\n");
             return 0;
@@ -1379,6 +1405,28 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--always-kill") == 0) {
             always_kill_mode = 1;
             log_msg("ALWAYS-KILL mode activated (unknown processes will be killed)");
+        } else if (strcmp(argv[i], "--allow") == 0 && i + 1 < argc) {
+            int act = string_to_action(argv[++i]);
+            if (act == -1) {
+                cli_allow_mask = 0xFFFFu;
+                log_msg("CLI override: ALLOW ALL actions");
+            } else if (act > 0 && act <= 16) {
+                cli_allow_mask |= (1u << (act - 1));
+                log_msg("CLI override: ALLOW %s", argv[i]);
+            } else {
+                log_msg("Warning: unknown action '%s' for --allow", argv[i]);
+            }
+        } else if (strcmp(argv[i], "--deny") == 0 && i + 1 < argc) {
+            int act = string_to_action(argv[++i]);
+            if (act == -1) {
+                cli_deny_mask = 0xFFFFu;
+                log_msg("CLI override: DENY ALL actions");
+            } else if (act > 0 && act <= 16) {
+                cli_deny_mask |= (1u << (act - 1));
+                log_msg("CLI override: DENY %s", argv[i]);
+            } else {
+                log_msg("Warning: unknown action '%s' for --deny", argv[i]);
+            }
         } else if (strncmp(argv[i], "--conf=", 7) == 0 ||
                    (strcmp(argv[i], "--conf") == 0 && i + 1 < argc && ++i)) {
             /* already handled above */
