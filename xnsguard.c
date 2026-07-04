@@ -789,7 +789,7 @@ int show_zenity_dialog(const struct Alert *alert) {
     FILE *fp = popen(zenity_cmd, "r");
     if (!fp) {
         log_msg("ERROR: failed to call zenity");
-        return 3;
+        return 99;
     }
 
     char output[256] = {0};
