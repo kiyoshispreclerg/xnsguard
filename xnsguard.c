@@ -51,12 +51,15 @@
 #define COMMAND_ALLOW         0
 
 #define BTN_ALLOW               "Allow"
-#define BTN_DENY_SESSION        "Deny this session"
-#define BTN_ALLOW_SESSION       "Allow this session"
 #define BTN_DENY                "Deny"
+#define BTN_TRUST               "TRUST"
+#define BTN_DENY_SESSION        "Deny (session)"
+#define BTN_ALLOW_SESSION       "Allow (session)"
+#define BTN_TRUST_SESSION       "Trust (session)"
 #define BTN_ALLOW_EXACT         "Allow EXACT"
+#define BTN_TRUST_EXACT         "Trust EXACT"
 #define BTN_ALLOW_EXACT_SESSION "Allow EXACT (session)"
-#define BTN_TRUST               "TRUST (allow all)"
+#define BTN_TRUST_EXACT_SESSION "Trust EXACT (session)"
 
 static const struct {
     int   id;
