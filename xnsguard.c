@@ -761,6 +761,9 @@ int show_zenity_dialog(const struct Alert *alert) {
             "--extra-button='" BTN_ALLOW_EXACT "' "
             "--extra-button='" BTN_ALLOW_EXACT_SESSION "' "
             "--extra-button='" BTN_TRUST "' "
+            "--extra-button='" BTN_TRUST_SESSION "' "
+            "--extra-button='" BTN_TRUST_EXACT "' "
+            "--extra-button='" BTN_TRUST_EXACT_SESSION "' "
             "--width=550 "
             "--no-wrap 2>/dev/null",
             action_str, action_desc, safe_exe, alert->pid);
@@ -778,6 +781,7 @@ int show_zenity_dialog(const struct Alert *alert) {
             "--extra-button='" BTN_ALLOW_SESSION "' "
             "--extra-button='" BTN_DENY "' "
             "--extra-button='" BTN_TRUST "' "
+            "--extra-button='" BTN_TRUST_SESSION "' "
             "--width=550 "
             "--no-wrap 2>/dev/null",
             action_str, action_desc, safe_exe, alert->pid);
@@ -804,8 +808,14 @@ int show_zenity_dialog(const struct Alert *alert) {
 
     if (code == 0) {
         return 0;  /* BTN_ALLOW (exe only) */
+    } else if (strstr(output, BTN_TRUST_EXACT_SESSION) != NULL) {
+        return 8;  /* Trust all this session exact (exe|args) */
+    } else if (strstr(output, BTN_TRUST_EXACT) != NULL) {
+        return 7;  /* Trust all permanent exact (exe|args) */
+    } else if (strstr(output, BTN_TRUST_SESSION) != NULL) {
+        return 6;  /* Trust all this session (exe only) */
     } else if (strstr(output, BTN_TRUST) != NULL) {
-        return 3;
+        return 3;  /* Trust all permanent (exe only) */
     } else if (strstr(output, BTN_ALLOW_EXACT_SESSION) != NULL) {
         return 5;  /* Allow exact this session (exe|args) */
     } else if (strstr(output, BTN_ALLOW_EXACT) != NULL) {
@@ -1214,6 +1224,19 @@ void process_next_alert() {
     } else if (response == 5) {
         log_filtered(1, "ALLOWED EXACT THIS SESSION: %s : %s", trim_exe_for_log(alert.exe), action_to_string(alert.action));
         send_permission(alert.action, alert.exe, alert.pid, COMMAND_ALLOW);
+    } else if (response == 6) {
+        log_filtered(1, "ALL ALLOWED THIS SESSION: %s", trim_exe_for_log(exe_only));
+        send_permission(alert.action, exe_only, alert.pid, COMMAND_ALLOW_ALL);
+        remove_all_alerts_for_pid(alert.pid);
+    } else if (response == 7) {
+        log_filtered(1, "ALL ALLOWED EXACT: %s", trim_exe_for_log(alert.exe));
+        save_rule(alert.exe, -1, -1);
+        send_permission(alert.action, alert.exe, alert.pid, COMMAND_ALLOW_ALL);
+        remove_all_alerts_for_pid(alert.pid);
+    } else if (response == 8) {
+        log_filtered(1, "ALL ALLOWED EXACT THIS SESSION: %s", trim_exe_for_log(alert.exe));
+        send_permission(alert.action, alert.exe, alert.pid, COMMAND_ALLOW_ALL);
+        remove_all_alerts_for_pid(alert.pid);
     } else {
         log_filtered(1, "DENIED THIS SESSION: %s : %s", trim_exe_for_log(exe_only), action_to_string(alert.action));
         send_permission(alert.action, exe_only, alert.pid, COMMAND_DENY);
