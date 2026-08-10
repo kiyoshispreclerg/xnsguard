@@ -1,0 +1,1831 @@
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <signal.h>
+#include <errno.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <time.h>
+#include <stdarg.h>
+#include <ctype.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <poll.h>
+#include <limits.h>
+#include <sys/wait.h>
+#include <stdint.h>
+#include <X11/Xlib.h>
+
+#define MAX_ALERTS          100
+#define MAX_IGNORED         200
+#define BUF_SIZE            4096
+#define CTL_BUF_SIZE        65536
+#define REPORT_THROTTLE_S   1
+
+#define XISGUARD_VERSION    "0.4.0"
+
+#define XNOTIFY_ATTACH           1
+#define XNOTIFY_SELECTION        2
+#define XNOTIFY_COMPOSITE        3
+#define XNOTIFY_SCREEN           4
+#define XNOTIFY_RECORD           5
+#define XNOTIFY_CURSOR           6
+#define XNOTIFY_INPUT_GRAB       7
+#define XNOTIFY_INPUT_INJECT     8
+#define XNOTIFY_HOTKEY           9
+#define XNOTIFY_INPUT           10
+#define XNOTIFY_MANAGE          11
+#define XNOTIFY_GRAB_OVERRIDE   12
+#define XNOTIFY_WARP            13
+#define XNOTIFY_FOCUS           14
+#define XNOTIFY_RANDR           15
+#define XNOTIFY_OVERLAY         16
+
+#define COMMAND_HEARTBEAT     1
+#define COMMAND_ALLOW_ALL     2
+#define COMMAND_ALLOW_ACTION  3
+#define COMMAND_DENY          4
+#define COMMAND_DENY_ALL      5
+#define COMMAND_DENY_ACTION   6
+#define COMMAND_ALLOW         0
+
+#define BTN_ALLOW               "Allow"
+#define BTN_DENY                "Deny"
+#define BTN_TRUST               "TRUST"
+#define BTN_DENY_SESSION        "Deny (session)"
+#define BTN_ALLOW_SESSION       "Allow (session)"
+#define BTN_TRUST_SESSION       "Trust (session)"
+#define BTN_ALLOW_EXACT         "Allow EXACT"
+#define BTN_TRUST_EXACT         "Trust EXACT"
+#define BTN_ALLOW_EXACT_SESSION "Allow EXACT (session)"
+#define BTN_TRUST_EXACT_SESSION "Trust EXACT (session)"
+
+static const struct {
+    int   id;
+    const char *name;
+} action_names[] = {
+    { XNOTIFY_ATTACH,        "ATTACH" },
+    { XNOTIFY_SELECTION,     "SELECTION" },
+    { XNOTIFY_COMPOSITE,     "COMPOSITE" },
+    { XNOTIFY_SCREEN,        "SCREEN" },
+    { XNOTIFY_RECORD,        "RECORD" },
+    { XNOTIFY_CURSOR,        "CURSOR" },
+    { XNOTIFY_INPUT_GRAB,    "INPUT_GRAB" },
+    { XNOTIFY_INPUT_INJECT,  "INPUT_INJECT" },
+    { XNOTIFY_HOTKEY,        "HOTKEY" },
+    { XNOTIFY_INPUT,         "INPUT" },
+    { XNOTIFY_MANAGE,        "MANAGE" },
+    { XNOTIFY_GRAB_OVERRIDE, "GRAB_OVERRIDE" },
+    { XNOTIFY_WARP,          "WARP" },
+    { XNOTIFY_FOCUS,         "FOCUS" },
+    { XNOTIFY_RANDR,         "RANDR" },
+    { XNOTIFY_OVERLAY,       "OVERLAY" },
+    { 0, NULL }
+};
+
+static const struct {
+    int   id;
+    const char *name;
+} action_descriptions[] = {
+    { XNOTIFY_ATTACH,        "Use shared memory" },
+    { XNOTIFY_SELECTION,     "Access clipboard" },
+    { XNOTIFY_COMPOSITE,     "Access other windows" },
+    { XNOTIFY_SCREEN,        "Capture and draw to the screen" },
+    { XNOTIFY_RECORD,        "Record events - like keystrokes" },
+    { XNOTIFY_CURSOR,        "Access cursor (mouse) image and position" },
+    { XNOTIFY_INPUT_GRAB,    "Grab mouse or keyboard" },
+    { XNOTIFY_INPUT_INJECT,  "Insert keystrokes" },
+    { XNOTIFY_HOTKEY,        "Register global hotkeys" },
+    { XNOTIFY_INPUT,         "Capture input - even when unfocused" },
+    { XNOTIFY_MANAGE,        "List and get properties of other windows" },
+    { XNOTIFY_GRAB_OVERRIDE, "Allow to steal a grab (for screensavers)" },
+    { XNOTIFY_WARP,          "Move the mouse cursor" },
+    { XNOTIFY_FOCUS,         "Steal input focus" },
+    { XNOTIFY_RANDR,         "Change display configuration" },
+    { XNOTIFY_OVERLAY,       "Create overlay (transparent) window" },
+    { 0, NULL }
+};
+
+static const char* action_to_string(int action_id) {
+    if (action_id == -1 || action_id == 0)
+        return "ALL";
+
+    for (int i = 0; action_names[i].id > 0; i++) {
+        if (action_names[i].id == action_id)
+            return action_names[i].name;
+    }
+    return "UNKNOWN";
+}
+
+static const char* action_to_description(int action_id) {
+    if (action_id == -1)
+        return "All the X server permissions";
+
+    for (int i = 0; action_descriptions[i].id > 0; i++) {
+        if (action_descriptions[i].id == action_id)
+            return action_descriptions[i].name;
+    }
+    return "UNKNOWN";
+}
+
+static int string_to_action(const char *str) {
+    if (!str) return 0;
+    if (strcasecmp(str, "ALL") == 0)
+            return -1;
+
+    for (int i = 0; action_names[i].name; i++) {
+        if (strcasecmp(str, action_names[i].name) == 0)
+            return action_names[i].id;
+    }
+    return 0;
+}
+
+static char SOCKET_PATH_BUF[108] = {0};
+static char LOCK_SOCKET_PATH_BUF[108] = {0};
+static char CTL_SOCKET_PATH_BUF[108] = {0};
+static int lock_fd = -1;
+static int server_fd = -1;
+static int ctl_fd = -1;
+static pthread_t file_monitor_thread;
+static pthread_t processor_thread;
+static pthread_t control_thread;
+static volatile int should_exit = 0;
+
+static int no_pause_mode = 0;      /* 1 = notify only, no SIGSTOP */
+static int quiet_mode = 0;         /* 1 = no Zenity, terminal logs only */
+static int always_kill_mode = 0;   /* 1 = kill unknown processes immediately */
+static int log_level = 2;          /* 0=silent, 1=clean, 2=normal, 3=verbose, 4=debug */
+
+/* Bitmasks for per-action CLI overrides (bit N-1 = action N, 1-16).
+ * Checked before perms.conf; deny wins if both bits are set for same action. */
+static uint32_t cli_allow_mask = 0;
+static uint32_t cli_deny_mask  = 0;
+
+static int display = 0;
+
+static pthread_mutex_t queue_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t ignored_lock = PTHREAD_MUTEX_INITIALIZER;
+
+struct Alert {
+    int action;
+    pid_t pid;
+    char  exe[PATH_MAX];
+    char time_str[20];
+    int paused;
+};
+
+struct Alert alert_queue[MAX_ALERTS];
+int alert_count = 0;
+
+struct IgnoredEntry {
+    char exe_pattern[PATH_MAX];
+    char action[64];
+    int  rule_type;   /* 0 = ALLOW, 1 = DENY */
+};
+
+struct IgnoredEntry ignored_cmds[MAX_IGNORED];
+int ignored_count = 0;
+
+static char config_dir[256] = "";
+static char perms_file[512] = {0};
+static time_t last_config_mtime = 0;
+
+static char ignore_file[512] = {0};
+static time_t last_ignore_mtime = 0;
+
+static char xnotify_conf_file[512] = {0};
+static time_t last_xnotify_conf_mtime = 0;
+
+struct IgnoredReport {
+    char exe[PATH_MAX];
+};
+
+static struct IgnoredReport ignored_reports[MAX_IGNORED];
+static int ignored_reports_count = 0;
+static pthread_mutex_t report_ignore_lock = PTHREAD_MUTEX_INITIALIZER;
+
+struct SeenAlert {
+    char exe[PATH_MAX];
+    pid_t pid;
+    int action;
+};
+
+struct SeenAlert seen_alerts[MAX_ALERTS];
+int seen_count = 0;
+
+static struct {
+    char  exe[PATH_MAX];
+    int   action;
+    time_t  last_time;
+} last_report = {0};
+
+/* ====================== LOGGING ====================== */
+
+char* get_current_time() {
+    static char buf[20];
+    time_t now = time(NULL);
+    struct tm tm_local;
+    localtime_r(&now, &tm_local);
+    strftime(buf, sizeof(buf), "%H:%M:%S", &tm_local);
+    return buf;
+}
+
+void log_msg(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    fprintf(stderr, "[%s] ", get_current_time());
+    vfprintf(stderr, format, args);
+    va_end(args);
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
+static void log_filtered(int min_level, const char *format, ...) {
+    if (log_level < min_level) return;
+    va_list args;
+    va_start(args, format);
+    fprintf(stderr, "[%s] ", get_current_time());
+    vfprintf(stderr, format, args);
+    va_end(args);
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
+/* ====================== UTILITIES ====================== */
+
+char* trim(char *str) {
+    char *end;
+    while (*str == ' ' || *str == '\t') str++;
+    if (*str == 0) return str;
+    end = str + strlen(str) - 1;
+    while (end > str && (*end == ' ' || *end == '\t')) end--;
+    *(end + 1) = 0;
+    return str;
+}
+
+time_t get_config_max_mtime(void) {
+    time_t max_t = 0;
+    struct stat st;
+    if (stat(perms_file, &st) == 0 && st.st_mtime > max_t) max_t = st.st_mtime;
+    return max_t;
+}
+
+static char *
+trim_exe_for_log(const char *full_path)
+{
+    static char buffer[128];
+
+    if (!full_path || *full_path == '\0') {
+        strcpy(buffer, "?");
+        return buffer;
+    }
+
+    if (strlen(full_path) < sizeof(buffer)) {
+        strcpy(buffer, full_path);
+        return buffer;
+    }
+
+    const char *last_slash = strrchr(full_path, '/');
+    if (!last_slash) {
+        strncpy(buffer, full_path, sizeof(buffer) - 1);
+        buffer[sizeof(buffer) - 1] = '\0';
+        return buffer;
+    }
+
+    const char *exe_name = last_slash + 1;
+
+    /* Encontra o componente pai (diretório imediatamente antes do exe) */
+    const char *parent_end = last_slash;
+    while (parent_end > full_path && *(parent_end - 1) != '/')
+        parent_end--;
+    size_t parent_len = (size_t)(last_slash - parent_end);
+
+    /* Monta o sufixo ".../<parent>/<exe>" em buffer temporário */
+    char suffix[128];
+    int sfx_len = snprintf(suffix, sizeof(suffix), ".../%.*s/%s",
+                           (int)parent_len, parent_end, exe_name);
+    if (sfx_len <= 0) {
+        strncpy(buffer, full_path, sizeof(buffer) - 1);
+        buffer[sizeof(buffer) - 1] = '\0';
+        return buffer;
+    }
+
+    if ((size_t)sfx_len >= sizeof(buffer)) {
+        /* Sufixo sozinho já estoura: trunca e retorna */
+        strncpy(buffer, suffix, sizeof(buffer) - 1);
+        buffer[sizeof(buffer) - 1] = '\0';
+        return buffer;
+    }
+
+    /* Quantos bytes do prefixo cabem antes do sufixo */
+    size_t avail   = sizeof(buffer) - 1 - (size_t)sfx_len;
+    size_t pfx_len = (size_t)(parent_end - full_path);
+    if (pfx_len > avail) pfx_len = avail;
+
+    strncpy(buffer, full_path, pfx_len);
+    strcpy(buffer + pfx_len, suffix);   /* sufixo já cabe — tamanho garantido acima */
+    return buffer;
+}
+
+static int
+pattern_matches(const char *s, const char *p) {
+    if (!s || !p) return 0;
+
+    const char *star = NULL;
+    const char *ss = NULL;
+
+    while (*s) {
+        if (*p == '*') {
+            star = p++;
+            ss = s;
+        } else if (*p == *s) {
+            p++;
+            s++;
+        } else if (star) {
+            p = star + 1;
+            s = ++ss;
+        } else {
+            return 0;
+        }
+    }
+
+    while (*p == '*') {
+        p++;
+    }
+
+    return *p == '\0';
+}
+
+/* ====================== CONFIG (USER ONLY) ====================== */
+
+void load_user_config(void) {
+    pthread_mutex_lock(&ignored_lock);
+    ignored_count = 0;
+
+    FILE *file = fopen(perms_file, "r");
+    if (!file) {
+        log_filtered(2, "No user config found at %s (normal on first run)", perms_file);
+        pthread_mutex_unlock(&ignored_lock);
+        return;
+    }
+
+    char line[BUF_SIZE];
+    while (fgets(line, sizeof(line), file)) {
+        line[strcspn(line, "\n")] = 0;
+        char *trimmed = trim(line);
+        if (strlen(trimmed) == 0 || trimmed[0] == '#') continue;
+
+        if (ignored_count >= MAX_IGNORED) {
+            log_msg("Warning: maximum number of rules (%d) reached", MAX_IGNORED);
+            continue;
+        }
+
+        char *cmd = strtok(trimmed, " \t\r\n");
+        if (!cmd) continue;
+
+        if (strcasecmp(cmd, "ALLOW") == 0 || strcasecmp(cmd, "DENY") == 0) {
+            int is_allow = (strcasecmp(cmd, "ALLOW") == 0);
+            char *token1 = strtok(NULL, " \t\r\n");   /* action or ALL */
+            char *token2 = strtok(NULL, " \t\r\n");   /* pattern */
+
+            if (!token1) continue;
+
+            int action = string_to_action(token1);
+
+            char pattern[PATH_MAX] = {0};
+            char action_name[64] = {0};
+
+            if (action == -1) {                      /* ALL */
+                if (token2) {
+                    strncpy(pattern, token2, sizeof(pattern)-1);
+                    strcpy(ignored_cmds[ignored_count].exe_pattern, pattern);
+                    ignored_cmds[ignored_count].action[0] = '\0';
+                    ignored_cmds[ignored_count].rule_type = is_allow ? 0 : 1;
+                    ignored_count++;
+                }
+            } else if (action > 0) {
+                if (token2) {
+                    strncpy(pattern, token2, sizeof(pattern)-1);
+                    strncpy(action_name, token1, sizeof(action_name)-1);
+                } else {
+                    strcpy(pattern, "*");
+                    strncpy(action_name, token1, sizeof(action_name)-1);
+                }
+
+                snprintf(ignored_cmds[ignored_count].exe_pattern, sizeof(ignored_cmds[ignored_count].exe_pattern), "%s", pattern);
+                snprintf(ignored_cmds[ignored_count].action, sizeof(ignored_cmds[ignored_count].action), "%s", action_name);
+                ignored_cmds[ignored_count].rule_type = is_allow ? 0 : 1;
+                ignored_count++;
+            }
+        }
+    }
+    fclose(file);
+    last_config_mtime = time(NULL);
+    log_filtered(3, "%d rules loaded", ignored_count);
+    pthread_mutex_unlock(&ignored_lock);
+}
+
+int get_preconfig_rule(const char *exe, int action_id, char *matched_pattern, size_t max_len) {
+    if (!exe || *exe == '\0' || strcmp(exe, "?") == 0)
+        return 0;
+
+    if (matched_pattern && max_len > 0)
+        matched_pattern[0] = '\0';
+
+    const char *action_name = action_to_string(action_id);
+    if (!action_name || strcmp(action_name, "UNKNOWN") == 0)
+        return 0;
+
+    pthread_mutex_lock(&ignored_lock);
+    for (int i = 0; i < ignored_count; i++) {
+        /* Pattern without '|' matches any args: compare against exe only.
+         * Pattern with '|' requires exact exe|args match. */
+        char exe_buf[PATH_MAX];
+        const char *match_key;
+        if (strchr(ignored_cmds[i].exe_pattern, '|') == NULL) {
+            strncpy(exe_buf, exe, sizeof(exe_buf) - 1);
+            exe_buf[sizeof(exe_buf) - 1] = '\0';
+            char *p = strchr(exe_buf, '|');
+            if (p) *p = '\0';
+            match_key = exe_buf;
+        } else {
+            match_key = exe;
+        }
+
+        if (!pattern_matches(match_key, ignored_cmds[i].exe_pattern))
+            continue;
+
+        if (ignored_cmds[i].action[0] == '\0' ||
+            strcasecmp(ignored_cmds[i].action, action_name) == 0) {
+            int ret = (ignored_cmds[i].rule_type == 0) ? 1 : 2;
+
+            if (matched_pattern && max_len > 0) {
+                strncpy(matched_pattern, ignored_cmds[i].exe_pattern, max_len - 1);
+                matched_pattern[max_len - 1] = '\0';
+            }
+
+            pthread_mutex_unlock(&ignored_lock);
+            return ret;   /* 1=allow, 2=deny */
+        }
+    }
+    pthread_mutex_unlock(&ignored_lock);
+    return 0;
+}
+
+/* ====================== SYNC PERMISSIONS TO X SERVER ====================== */
+
+void send_permission(int action, const char *exe, pid_t pid, int command_type);
+
+void send_all_permissions_to_xserver(void) {
+    pthread_mutex_lock(&ignored_lock);
+
+    int sent = 0;
+    for (int i = 0; i < ignored_count; i++) {
+        const char *pat = ignored_cmds[i].exe_pattern;
+        const char *act_str = ignored_cmds[i].action;
+        int action_id = string_to_action(act_str);
+        
+        if (ignored_cmds[i].rule_type == 0) {   /* ALLOW */
+            if (act_str[0] == '\0') {
+                /* ALLOW ALL <pattern> */
+                send_permission(0, pat, 0, COMMAND_ALLOW_ALL);           /* command_type 2 = ALLOW_ALL */
+            }
+            else if (strcmp(pat, "*") == 0) {
+                /* ALLOW <ACTION>  (sem exe → allow_all para essa ação) */
+                send_permission(action_id, "", 0, COMMAND_ALLOW_ACTION);
+            } else {
+                send_permission(action_id, pat, 0, COMMAND_ALLOW);   /* command_type 3 = ALLOW_ACTION */
+            }
+        } else {   /* DENY */
+            if (act_str[0] == '\0') {
+                send_permission(0, pat, 0, COMMAND_DENY_ALL);           /* DENY_ALL */
+            } else if (strcmp(pat, "*") == 0) {
+                send_permission(action_id, "", 0, COMMAND_DENY_ACTION);    /* DENY_ACTION */
+            } else {
+                send_permission(action_id, pat, 0, COMMAND_DENY);   /* DENY normal */
+            }
+        }
+        sent++;
+    }
+
+    pthread_mutex_unlock(&ignored_lock);
+
+    if (sent > 0)
+        log_filtered(2, "Full sync: sent %d permission rules to X server", sent);
+    else
+        log_filtered(3, "Full sync: no rules to send (perms.conf empty)");
+}
+
+/* ====================== SAVE RULES ====================== */
+
+void save_rule(const char *exe, int action_id, int is_allow) {
+    if (!exe || *exe == '\0') return;
+
+    const char *action_str = action_to_string(action_id);
+
+    pthread_mutex_lock(&ignored_lock);
+    for (int i = 0; i < ignored_count; i++) {
+        if (strcmp(ignored_cmds[i].exe_pattern, exe) == 0 &&
+            strcmp(ignored_cmds[i].action, action_str) == 0) {
+            pthread_mutex_unlock(&ignored_lock);
+            log_msg("Rule already exists: %s %s %s", is_allow ? "ALLOW" : "DENY", action_str, trim_exe_for_log(exe));
+            return;
+        }
+    }
+
+    /* Grava enquanto o mutex está preso — check+write atômico. */
+    FILE *file = fopen(perms_file, "a");
+    if (file) {
+        fprintf(file, "%s %s %s\n", is_allow ? "ALLOW" : "DENY", action_str, exe);
+        fclose(file);
+    }
+    pthread_mutex_unlock(&ignored_lock);
+
+    if (file)
+        load_user_config();
+}
+
+void save_denied_entry(const char *exe, int action_id) {
+    save_rule(exe, action_id, 0);   /* is_allow = false */
+}
+
+/* Rewrites perms_file from the in-memory ignored_cmds array.
+ * Caller must hold ignored_lock. */
+static void rewrite_perms_file_locked(void) {
+    FILE *file = fopen(perms_file, "w");
+    if (!file) {
+        log_msg("Warning: could not rewrite %s: %s", perms_file, strerror(errno));
+        return;
+    }
+    for (int i = 0; i < ignored_count; i++) {
+        const char *type_str = (ignored_cmds[i].rule_type == 0) ? "ALLOW" : "DENY";
+        if (ignored_cmds[i].action[0] == '\0')
+            fprintf(file, "%s ALL %s\n", type_str, ignored_cmds[i].exe_pattern);
+        else
+            fprintf(file, "%s %s %s\n", type_str, ignored_cmds[i].action, ignored_cmds[i].exe_pattern);
+    }
+    fclose(file);
+}
+
+/* Removes a rule matching pattern + action_str (NULL/""/"ALL" = the ALL-actions rule)
+ * + rule_type (0=ALLOW,1=DENY) from perms.conf. Returns 1 if a rule was removed. */
+int remove_rule(const char *pattern, const char *action_str, int rule_type) {
+    if (!pattern || *pattern == '\0') return 0;
+    int is_all = (!action_str || *action_str == '\0' || strcasecmp(action_str, "ALL") == 0);
+
+    pthread_mutex_lock(&ignored_lock);
+    int removed = 0;
+    for (int i = 0; i < ignored_count; i++) {
+        int entry_is_all = (ignored_cmds[i].action[0] == '\0');
+        if (strcmp(ignored_cmds[i].exe_pattern, pattern) != 0)
+            continue;
+        if (ignored_cmds[i].rule_type != rule_type)
+            continue;
+        if (entry_is_all != is_all)
+            continue;
+        if (!is_all && strcasecmp(ignored_cmds[i].action, action_str) != 0)
+            continue;
+
+        for (int j = i; j < ignored_count - 1; j++)
+            ignored_cmds[j] = ignored_cmds[j + 1];
+        ignored_count--;
+        removed = 1;
+        break;
+    }
+
+    if (removed)
+        rewrite_perms_file_locked();
+
+    pthread_mutex_unlock(&ignored_lock);
+
+    if (removed)
+        log_msg("Rule removed: %s %s %s", rule_type == 0 ? "ALLOW" : "DENY",
+                 is_all ? "ALL" : action_str, trim_exe_for_log(pattern));
+
+    return removed;
+}
+
+/* ====================== IGNORE REPORTS CONFIG ====================== */
+
+void load_ignore_reports(void) {
+    pthread_mutex_lock(&report_ignore_lock);
+    ignored_reports_count = 0;
+
+    FILE *file = fopen(ignore_file, "r");
+    if (!file) {
+        log_filtered(3, "No ignore.conf found at %s (normal)", ignore_file);
+        pthread_mutex_unlock(&report_ignore_lock);
+        return;
+    }
+
+    char line[BUF_SIZE];
+    while (fgets(line, sizeof(line), file)) {
+        line[strcspn(line, "\n")] = 0;
+        char *trimmed = trim(line);
+
+        if (strlen(trimmed) == 0 || trimmed[0] == '#')
+            continue;
+
+        if (ignored_reports_count >= MAX_IGNORED) {
+            log_msg("Warning: maximum ignore reports (%d) reached", MAX_IGNORED);
+            continue;
+        }
+
+        strncpy(ignored_reports[ignored_reports_count].exe, trimmed, PATH_MAX - 1);
+        ignored_reports[ignored_reports_count].exe[PATH_MAX - 1] = '\0';
+        ignored_reports_count++;
+    }
+
+    fclose(file);
+    last_ignore_mtime = time(NULL);
+    log_filtered(3, "Loaded %d entries to ignore reports from %s", ignored_reports_count, ignore_file);
+    pthread_mutex_unlock(&report_ignore_lock);
+}
+
+int file_has_changed() {
+    time_t current = get_config_max_mtime();
+    if (current > last_config_mtime) {
+        log_msg("Config file changed externally, reloading...");
+        load_user_config();
+        return 1;
+    }
+    return 0;
+}
+
+/* ====================== XNOTIFY CONF (PERSISTENT FLAGS) ====================== */
+
+static void load_xnotify_conf(void) {
+    FILE *f = fopen(xnotify_conf_file, "r");
+    if (!f) return;
+
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\n")] = 0;
+        char *t = trim(line);
+        if (!*t || *t == '#') continue;
+
+        char key[64] = {0}, val[64] = {0};
+        if (sscanf(t, "%63[^=]=%63s", key, val) != 2) continue;
+
+        char *k = trim(key);
+        char *v = trim(val);
+        if (strcmp(k, "no_pause") == 0)
+            no_pause_mode = atoi(v) ? 1 : 0;
+        else if (strcmp(k, "quiet") == 0)
+            quiet_mode = atoi(v) ? 1 : 0;
+        else if (strcmp(k, "always_kill") == 0)
+            always_kill_mode = atoi(v) ? 1 : 0;
+        else if (strcmp(k, "log_level") == 0) {
+            int lvl = atoi(v);
+            if (lvl >= 0 && lvl <= 4) log_level = lvl;
+        }
+    }
+    fclose(f);
+    last_xnotify_conf_mtime = time(NULL);
+    log_filtered(3, "Loaded xnotify.conf: no_pause=%d quiet=%d always_kill=%d log_level=%d",
+                 no_pause_mode, quiet_mode, always_kill_mode, log_level);
+}
+
+static void save_xnotify_conf(void) {
+    if (!xnotify_conf_file[0]) return;
+    FILE *f = fopen(xnotify_conf_file, "w");
+    if (!f) {
+        log_msg("Warning: could not save xnotify.conf: %s", strerror(errno));
+        return;
+    }
+    fprintf(f, "# XisGuard runtime configuration — edited automatically on startup\n");
+    fprintf(f, "no_pause=%d\n", no_pause_mode);
+    fprintf(f, "quiet=%d\n", quiet_mode);
+    fprintf(f, "always_kill=%d\n", always_kill_mode);
+    fprintf(f, "log_level=%d\n", log_level);
+    fclose(f);
+    last_xnotify_conf_mtime = time(NULL);
+    log_filtered(3, "Saved xnotify.conf");
+}
+
+static void check_xnotify_conf_changed(void) {
+    if (!xnotify_conf_file[0]) return;
+    struct stat st;
+    if (stat(xnotify_conf_file, &st) != 0) return;
+    if (st.st_mtime > last_xnotify_conf_mtime) {
+        log_msg("xnotify.conf changed externally, reloading...");
+        load_xnotify_conf();
+    }
+}
+
+/* ====================== IGNORED CHECK ====================== */
+
+int is_ignored(const char *exe, int action_id) {
+    if (!exe || *exe == '\0' || strcmp(exe, "?") == 0) {
+        return 0;
+    }
+
+    const char *action_name = action_to_string(action_id);
+    if (!action_name || strcmp(action_name, "UNKNOWN") == 0)
+        return 0;
+
+    pthread_mutex_lock(&ignored_lock);
+    for (int i = 0; i < ignored_count; i++) {
+        char exe_buf[PATH_MAX];
+        const char *match_key;
+        if (strchr(ignored_cmds[i].exe_pattern, '|') == NULL) {
+            strncpy(exe_buf, exe, sizeof(exe_buf) - 1);
+            exe_buf[sizeof(exe_buf) - 1] = '\0';
+            char *p = strchr(exe_buf, '|');
+            if (p) *p = '\0';
+            match_key = exe_buf;
+        } else {
+            match_key = exe;
+        }
+
+        if (!pattern_matches(match_key, ignored_cmds[i].exe_pattern))
+            continue;
+
+        if (ignored_cmds[i].action[0] == '\0' ||
+            strcasecmp(ignored_cmds[i].action, action_name) == 0) {
+            pthread_mutex_unlock(&ignored_lock);
+            return 1;
+        }
+    }
+    pthread_mutex_unlock(&ignored_lock);
+    return 0;
+}
+
+int is_report_ignored(const char *exe) {
+    if (!exe || *exe == '\0' || strcmp(exe, "?") == 0)
+        return 0;
+
+    pthread_mutex_lock(&report_ignore_lock);
+    for (int i = 0; i < ignored_reports_count; i++) {
+        if (pattern_matches(exe, ignored_reports[i].exe)) {
+            pthread_mutex_unlock(&report_ignore_lock);
+            return 1;
+        }
+    }
+    pthread_mutex_unlock(&report_ignore_lock);
+    return 0;
+}
+
+/* ====================== ZENITY DIALOG ====================== */
+
+/* Escapa aspas simples para uso dentro de strings single-quoted no shell.
+ * ' → '\'' (fecha aspas, barra+aspas literal, reabre aspas). */
+static void shell_sq_escape(char *dst, size_t dst_sz, const char *src) {
+    size_t j = 0;
+    for (size_t i = 0; src[i] && j + 1 < dst_sz; i++) {
+        if (src[i] == '\'') {
+            if (j + 4 >= dst_sz) break;
+            dst[j++] = '\'';
+            dst[j++] = '\\';
+            dst[j++] = '\'';
+            dst[j++] = '\'';
+        } else {
+            dst[j++] = src[i];
+        }
+    }
+    dst[j] = '\0';
+}
+
+int show_zenity_dialog(const struct Alert *alert) {
+    char zenity_cmd[8192];
+    const char *action_str = action_to_string(alert->action);
+    const char *action_desc = action_to_description(alert->action);
+
+    /* Replace '|' with space for display (zenity shows "exe args" instead of "exe|args") */
+    char display_exe[PATH_MAX + 1024];
+    strncpy(display_exe, alert->exe, sizeof(display_exe) - 1);
+    display_exe[sizeof(display_exe) - 1] = '\0';
+    char *pipe_pos = strchr(display_exe, '|');
+    if (pipe_pos) *pipe_pos = ' ';
+
+    char safe_exe[512];
+    shell_sq_escape(safe_exe, sizeof(safe_exe), trim_exe_for_log(display_exe));
+
+    int has_args = (strchr(alert->exe, '|') != NULL);
+
+    if (has_args) {
+        snprintf(zenity_cmd, sizeof(zenity_cmd),
+            "zenity --question "
+            "--title='XisGuard' "
+            "--icon-name=dialog-warning "
+            "--modal "
+            "--timeout=90 "
+            "--text='<b>Permission:</b> %s (%s)\n"
+                     "Program: <b>%s</b> (%d)' "
+            "--ok-label='" BTN_ALLOW "' "
+            "--cancel-label='" BTN_DENY_SESSION "' "
+            "--extra-button='" BTN_ALLOW_SESSION "' "
+            "--extra-button='" BTN_DENY "' "
+            "--extra-button='" BTN_ALLOW_EXACT "' "
+            "--extra-button='" BTN_ALLOW_EXACT_SESSION "' "
+            "--extra-button='" BTN_TRUST "' "
+            "--extra-button='" BTN_TRUST_SESSION "' "
+            "--extra-button='" BTN_TRUST_EXACT "' "
+            "--extra-button='" BTN_TRUST_EXACT_SESSION "' "
+            "--width=550 "
+            "--no-wrap 2>/dev/null",
+            action_str, action_desc, safe_exe, alert->pid);
+    } else {
+        snprintf(zenity_cmd, sizeof(zenity_cmd),
+            "zenity --question "
+            "--title='XisGuard' "
+            "--icon-name=dialog-warning "
+            "--modal "
+            "--timeout=90 "
+            "--text='<b>Permission:</b> %s (%s)\n"
+                     "Program: <b>%s</b> (%d)' "
+            "--ok-label='" BTN_ALLOW "' "
+            "--cancel-label='" BTN_DENY_SESSION "' "
+            "--extra-button='" BTN_ALLOW_SESSION "' "
+            "--extra-button='" BTN_DENY "' "
+            "--extra-button='" BTN_TRUST "' "
+            "--extra-button='" BTN_TRUST_SESSION "' "
+            "--width=550 "
+            "--no-wrap 2>/dev/null",
+            action_str, action_desc, safe_exe, alert->pid);
+    }
+
+    log_msg("Showing Zenity dialog for %s %s (%d)",
+            action_str, trim_exe_for_log(alert->exe), alert->pid);
+
+    FILE *fp = popen(zenity_cmd, "r");
+    if (!fp) {
+        log_msg("ERROR: failed to call zenity");
+        return 99;
+    }
+
+    char output[256] = {0};
+    if (fgets(output, sizeof(output), fp) != NULL) {
+        output[strcspn(output, "\n")] = '\0';
+    }
+
+    int status = pclose(fp);
+    int code = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+
+    log_msg("Zenity returned %d | '%s'", code, output);
+
+    if (code == 0) {
+        return 0;  /* BTN_ALLOW (exe only) */
+    } else if (strstr(output, BTN_TRUST_EXACT_SESSION) != NULL) {
+        return 8;  /* Trust all this session exact (exe|args) */
+    } else if (strstr(output, BTN_TRUST_EXACT) != NULL) {
+        return 7;  /* Trust all permanent exact (exe|args) */
+    } else if (strstr(output, BTN_TRUST_SESSION) != NULL) {
+        return 6;  /* Trust all this session (exe only) */
+    } else if (strstr(output, BTN_TRUST) != NULL) {
+        return 3;  /* Trust all permanent (exe only) */
+    } else if (strstr(output, BTN_ALLOW_EXACT_SESSION) != NULL) {
+        return 5;  /* Allow exact this session (exe|args) */
+    } else if (strstr(output, BTN_ALLOW_EXACT) != NULL) {
+        return 4;  /* Allow exact permanent (exe|args) */
+    } else if (strstr(output, BTN_ALLOW_SESSION) != NULL) {
+        return 1;  /* Allow this session (exe only) */
+    } else if (strstr(output, BTN_DENY) != NULL) {
+        return 2;  /* Deny permanent (exe only) */
+    } else {
+        return 99; /* BTN_DENY_SESSION (cancel/timeout) */
+    }
+}
+
+
+/* ====================== ALERT HANDLING ====================== */
+
+void save_ignored_entry(const char *exe, int action_id) {
+    if (!exe || *exe == '\0') return;
+
+    const char *action_str = action_to_string(action_id);
+
+    pthread_mutex_lock(&ignored_lock);
+
+    for (int i = 0; i < ignored_count; i++) {
+        if (strcmp(ignored_cmds[i].exe_pattern, exe) == 0 &&
+            strcmp(ignored_cmds[i].action, action_str) == 0) {
+            pthread_mutex_unlock(&ignored_lock);
+            log_msg("Rule already exists: %s:%s", trim_exe_for_log(exe), action_str);
+            return;
+        }
+    }
+
+    /* Grava enquanto o mutex está preso — check+write atômico. */
+    FILE *file = fopen(perms_file, "a");
+    if (file) {
+        fprintf(file, "ALLOW %s %s\n", action_str, exe);
+        fclose(file);
+    }
+    pthread_mutex_unlock(&ignored_lock);
+
+    if (file)
+        load_user_config();
+}
+
+int is_seen(const char *exe, int action) {
+    for (int i = 0; i < seen_count; i++) {
+        if (strcmp(seen_alerts[i].exe, exe) == 0 && seen_alerts[i].action == action) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+void add_seen(const char *exe, int action) {
+    if (seen_count < MAX_ALERTS) {
+        snprintf(seen_alerts[seen_count].exe, sizeof(seen_alerts[seen_count].exe), "%s", exe);
+        seen_alerts[seen_count].action = action;
+        seen_count++;
+    }
+}
+
+void remove_seen_for_exe(const char *exe, int action) {
+    int i = 0;
+    while (i < seen_count) {
+        if (strcmp(seen_alerts[i].exe, exe) == 0 && seen_alerts[i].action == action) {
+            for (int j = i; j < seen_count - 1; j++) {
+                seen_alerts[j] = seen_alerts[j + 1];
+            }
+            seen_count--;
+        } else {
+            i++;
+        }
+    }
+}
+
+void remove_all_alerts_for_pid(pid_t pid) {
+    int i = 0;
+    while (i < alert_count) {
+        if (alert_queue[i].pid == pid) {
+            for (int j = i; j < alert_count - 1; j++) {
+                alert_queue[j] = alert_queue[j + 1];
+            }
+            alert_count--;
+        } else {
+            i++;
+        }
+    }
+}
+
+void send_query_action(const char *action) {
+    const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
+    const char *base_dir = (runtime_dir && *runtime_dir) ? runtime_dir : "/tmp";
+
+    char socket_path[108];
+    snprintf(socket_path, sizeof(socket_path), "%s/xperms.%d.sock", base_dir, display);
+
+    int sock = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (sock == -1) return;
+
+    struct sockaddr_un addr = {0};
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socket_path);
+
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "{\"command\":\"QUERY_ACTION\",\"action\":\"%s\"}", action);
+
+    sendto(sock, msg, strlen(msg), 0, (struct sockaddr*)&addr, sizeof(addr));
+    close(sock);
+}
+
+/* Escapa " e \ em strings JSON; descarta caracteres de controle. */
+static void json_escape_str(char *dst, size_t dst_sz, const char *src) {
+    size_t j = 0;
+    for (size_t i = 0; src[i] && j + 1 < dst_sz; i++) {
+        if (src[i] == '"' || src[i] == '\\') {
+            if (j + 2 >= dst_sz) break;
+            dst[j++] = '\\';
+            dst[j++] = src[i];
+        } else if ((unsigned char)src[i] >= 0x20) {
+            dst[j++] = src[i];
+        }
+    }
+    dst[j] = '\0';
+}
+
+/* Extracts a "key":"value" string field from a flat JSON object into dst.
+ * Returns 1 if found, 0 otherwise (dst left as empty string). */
+static int json_get_str(const char *msg, const char *key, char *dst, size_t dst_sz) {
+    dst[0] = '\0';
+    char needle[64];
+    snprintf(needle, sizeof(needle), "\"%s\":", key);
+    const char *p = strstr(msg, needle);
+    if (!p) return 0;
+    p += strlen(needle);
+    while (*p == ' ') p++;
+    if (*p != '"') return 0;
+    p++;
+    const char *end = strchr(p, '"');
+    if (!end) return 0;
+    size_t len = (size_t)(end - p);
+    if (len >= dst_sz) len = dst_sz - 1;
+    strncpy(dst, p, len);
+    dst[len] = '\0';
+    return 1;
+}
+
+/* Extracts a "key":<int> numeric field. Returns 1 if found. */
+static int json_get_int(const char *msg, const char *key, int *out) {
+    char needle[64];
+    snprintf(needle, sizeof(needle), "\"%s\":", key);
+    const char *p = strstr(msg, needle);
+    if (!p) return 0;
+    p += strlen(needle);
+    while (*p == ' ') p++;
+    return sscanf(p, "%d", out) == 1;
+}
+
+void send_permission(int action, const char *exe, pid_t pid, int command_type) {
+    const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
+    const char *base_dir = (runtime_dir && *runtime_dir) ? runtime_dir : "/tmp";
+
+    char socket_path[108];
+    snprintf(socket_path, sizeof(socket_path), "%s/xperms.%d.sock", base_dir, display);
+
+    int sock = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (sock == -1) {
+        log_msg("Failed to create permission socket: %s", strerror(errno));
+        return;
+    }
+
+    struct sockaddr_un addr = {0};
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socket_path);
+
+    char safe_exe[1024];
+    json_escape_str(safe_exe, sizeof(safe_exe), exe ? exe : "");
+
+    char msg[1280];
+    const char *cmd_name = "ALLOW";
+
+    switch (command_type) {
+        case COMMAND_HEARTBEAT:  /* heartbeat */
+            snprintf(msg, sizeof(msg), "{\"command\":\"XNOTIFY\",\"pid\":%d}", pid);
+            cmd_name = "HEARTBEAT";
+            break;
+        case COMMAND_ALLOW_ALL:  /* ALLOW_ALL */
+            snprintf(msg, sizeof(msg), "{\"command\":\"ALLOW_ALL\",\"exe\":\"%s\",\"action\":%d}", safe_exe, action);
+            cmd_name = "ALLOW";
+            break;
+        case COMMAND_ALLOW_ACTION:  /* ALLOW_ACTION */
+            snprintf(msg, sizeof(msg), "{\"command\":\"ALLOW_ACTION\",\"action\":%d}", action);
+            cmd_name = "ALLOW ACTION";
+            break;
+        case COMMAND_DENY:  /* DENY */
+            snprintf(msg, sizeof(msg), "{\"command\":\"DENY\",\"action\":%d,\"exe\":\"%s\"}", action, safe_exe);
+            cmd_name = "DENY";
+            break;
+        case COMMAND_DENY_ALL: /* DENY_ALL */
+            snprintf(msg, sizeof(msg), "{\"command\":\"DENY_ALL\",\"exe\":\"%s\"}", safe_exe);
+            cmd_name = "DENY";
+            break;
+        case COMMAND_DENY_ACTION: /* DENY_ACTION */
+            snprintf(msg, sizeof(msg), "{\"command\":\"DENY_ACTION\",\"action\":%d}", action);
+            cmd_name = "DENY ACTION";
+            break;
+        default: /* ALLOW */
+            snprintf(msg, sizeof(msg), "{\"command\":\"ALLOW\",\"action\":%d,\"exe\":\"%s\"}", action, safe_exe);
+            cmd_name = "ALLOW";
+            break;
+    }
+
+    ssize_t sent = sendto(sock, msg, strlen(msg), 0,
+                          (struct sockaddr*)&addr, sizeof(addr));
+
+    close(sock);
+
+    if (sent == -1) {
+        log_msg("Failed to send permission: %s", strerror(errno));
+    } else if (command_type != 1) {
+        log_filtered(2, "Sent: %s %s for %s", cmd_name, action_to_string(action), trim_exe_for_log(exe));
+    }
+}
+
+void handle_message(const char *msg) {
+    int action = 0;
+    pid_t pid = 0;
+    char exe[PATH_MAX] = "?";
+    char args[1024] = {0};
+    char command[64] = "?";
+
+    char *p = strstr(msg, "\"command\":\"");
+    if (p) {
+        p += 11;
+        char *end = strchr(p, '"');
+        if (end) {
+            size_t len = (size_t)(end - p);
+            if (len >= sizeof(command)) len = sizeof(command) - 1;
+            strncpy(command, p, len);
+            command[len] = '\0';
+        }
+    }
+
+    p = strstr(msg, "\"action\":");
+    if (p)
+        sscanf(p + 9, "%d", &action);
+
+    p = strstr(msg, "\"pid\":");
+    if (p)
+        sscanf(p + 6, "%d", &pid);
+
+    p = strstr(msg, "\"exe\":\"");
+    if (p) {
+        p += 7;
+        char *end = strchr(p, '"');
+        if (end) {
+            size_t len = (size_t)(end - p);
+            if (len >= sizeof(exe)) len = sizeof(exe) - 1;
+            strncpy(exe, p, len);
+            exe[len] = '\0';
+        }
+    }
+
+    p = strstr(msg, "\"args\":\"");
+    if (p) {
+        p += 8;
+        char *end = strchr(p, '"');
+        if (end) {
+            size_t len = (size_t)(end - p);
+            if (len >= sizeof(args)) len = sizeof(args) - 1;
+            strncpy(args, p, len);
+            args[len] = '\0';
+        }
+    }
+
+    if (exe[0] == '\0') {
+        strcpy(exe, "?");
+    }
+
+    /* Build combined key exe|args when args are present */
+    if (args[0] != '\0' && exe[0] != '\0' && strcmp(exe, "?") != 0) {
+        size_t exe_len = strlen(exe);
+        size_t args_len = strlen(args);
+        if (exe_len + 1 + args_len < (size_t)(PATH_MAX - 1)) {
+            exe[exe_len] = '|';
+            strncpy(exe + exe_len + 1, args, PATH_MAX - exe_len - 2);
+            exe[PATH_MAX - 1] = '\0';
+        }
+    }
+
+    if (action <= 0 || pid <= 0) 
+        return;
+
+    const char *action_str = action_to_string(action);
+
+    if (strcmp(command, "REPORT") == 0) {
+        if (is_report_ignored(exe)) {
+            // Silencioso - não loga nada
+            return;
+        }
+        log_msg("REPORT: %s is using %s (%d)", trim_exe_for_log(exe), action_str, action);
+        time_t now = time(NULL);
+        if (strcmp(exe, last_report.exe) == 0 && action == last_report.action &&
+            now - last_report.last_time < REPORT_THROTTLE_S)
+            return;
+
+        snprintf(last_report.exe, sizeof(last_report.exe), "%s", exe);
+        last_report.action = action;
+        last_report.last_time = now;
+        return;
+    }
+
+    log_msg("X server requested %s for %s", action_str, trim_exe_for_log(exe));
+
+    /* CLI global overrides: checked before perms.conf; deny wins over allow */
+    if (action > 0 && action <= 16) {
+        uint32_t bit = 1u << (action - 1);
+        if (cli_deny_mask & bit) {
+            log_filtered(2, "CLI override: DENY %s for %s", action_str, trim_exe_for_log(exe));
+            send_permission(action, exe, pid, COMMAND_DENY);
+            return;
+        }
+        if (cli_allow_mask & bit) {
+            log_filtered(2, "CLI override: ALLOW %s for %s", action_str, trim_exe_for_log(exe));
+            send_permission(action, exe, pid, COMMAND_ALLOW);
+            return;
+        }
+    }
+
+    char matched_rule[PATH_MAX] = {0};
+    int pre = get_preconfig_rule(exe, action, matched_rule, sizeof(matched_rule));
+    const char *rule_to_send = (matched_rule[0] != '\0') ? matched_rule : exe;
+    
+    if (pre == 1) {
+        send_permission(action, rule_to_send, pid, COMMAND_ALLOW);
+        return;
+    }
+    if (pre == 2) {
+        send_permission(action, rule_to_send, pid, COMMAND_DENY);
+        return;
+    }
+    
+    if (is_seen(exe, action)) {
+        log_filtered(3, "Duplicate request %s %s (%d) - ignoring", action_str, trim_exe_for_log(exe), pid);
+        return;
+    }
+
+    int paused = 0;
+
+    if (!no_pause_mode) {
+        paused = (kill(pid, SIGSTOP) == 0);
+        if (!paused && errno != ESRCH) {
+            log_msg("Failed to pause PID %d: %s", pid, strerror(errno));
+        }
+    }
+
+    add_seen(exe, action);
+
+    pthread_mutex_lock(&queue_lock);
+    if (alert_count < MAX_ALERTS) {
+        alert_queue[alert_count].pid = pid;
+        alert_queue[alert_count].action = action;
+        strcpy(alert_queue[alert_count].exe, exe);
+        strcpy(alert_queue[alert_count].time_str, get_current_time());
+        alert_queue[alert_count].paused = paused;
+        alert_count++;
+        log_filtered(2, "Alert queued: %s : %s (%d pending)", trim_exe_for_log(exe), action_str, alert_count);
+    } else {
+        log_msg("Alert queue full! Dropping request for %s", trim_exe_for_log(exe));
+    }
+    pthread_mutex_unlock(&queue_lock);
+}
+
+void process_next_alert() {
+    pthread_mutex_lock(&queue_lock);
+    if (alert_count == 0) {
+        pthread_mutex_unlock(&queue_lock);
+        return;
+    }
+
+    struct Alert alert = alert_queue[0];
+
+    for (int i = 0; i < alert_count - 1; i++) {
+        alert_queue[i] = alert_queue[i + 1];
+    }
+    alert_count--;
+    pthread_mutex_unlock(&queue_lock);
+
+    int response;
+    if (always_kill_mode || quiet_mode) {
+        response = always_kill_mode ? -1 : 99;
+    } else {
+        response = show_zenity_dialog(&alert);
+    }
+
+    /* Extract exe without args for non-exact rules */
+    char exe_only[PATH_MAX];
+    strncpy(exe_only, alert.exe, sizeof(exe_only) - 1);
+    exe_only[sizeof(exe_only) - 1] = '\0';
+    char *pipe_sep = strchr(exe_only, '|');
+    if (pipe_sep) *pipe_sep = '\0';
+
+    pthread_mutex_lock(&queue_lock);
+
+    if (response == -1) {
+        log_msg("ALWAYS-KILL mode: killing PID %d (%s)", alert.pid, trim_exe_for_log(exe_only));
+        send_permission(alert.action, exe_only, alert.pid, COMMAND_DENY);
+        kill(alert.pid, SIGKILL);
+        remove_all_alerts_for_pid(alert.pid);
+        remove_seen_for_exe(alert.exe, alert.action);
+        pthread_mutex_unlock(&queue_lock);
+        return;
+    }
+
+    if (quiet_mode)
+        log_msg("QUIET mode: denying this session for %s (PID %d)", trim_exe_for_log(exe_only), alert.pid);
+
+    if (response == 0) {
+        log_filtered(1, "ALLOWED: %s : %s", trim_exe_for_log(exe_only), action_to_string(alert.action));
+        save_rule(exe_only, alert.action, 1);
+        send_permission(alert.action, exe_only, alert.pid, COMMAND_ALLOW);
+    } else if (response == 1) {
+        log_filtered(1, "ALLOWED THIS SESSION: %s : %s", trim_exe_for_log(exe_only), action_to_string(alert.action));
+        send_permission(alert.action, exe_only, alert.pid, COMMAND_ALLOW);
+    } else if (response == 2) {
+        log_filtered(1, "DENIED: %s : %s", trim_exe_for_log(exe_only), action_to_string(alert.action));
+        save_denied_entry(exe_only, alert.action);
+        send_permission(alert.action, exe_only, alert.pid, COMMAND_DENY);
+    } else if (response == 3) {
+        log_filtered(1, "ALL ALLOWED: %s", trim_exe_for_log(exe_only));
+        save_rule(exe_only, -1, -1);
+        send_permission(alert.action, exe_only, alert.pid, COMMAND_ALLOW_ALL);
+        remove_all_alerts_for_pid(alert.pid);
+    } else if (response == 4) {
+        log_filtered(1, "ALLOWED EXACT: %s : %s", trim_exe_for_log(alert.exe), action_to_string(alert.action));
+        save_rule(alert.exe, alert.action, 1);
+        send_permission(alert.action, alert.exe, alert.pid, COMMAND_ALLOW);
+    } else if (response == 5) {
+        log_filtered(1, "ALLOWED EXACT THIS SESSION: %s : %s", trim_exe_for_log(alert.exe), action_to_string(alert.action));
+        send_permission(alert.action, alert.exe, alert.pid, COMMAND_ALLOW);
+    } else if (response == 6) {
+        log_filtered(1, "ALL ALLOWED THIS SESSION: %s", trim_exe_for_log(exe_only));
+        send_permission(alert.action, exe_only, alert.pid, COMMAND_ALLOW_ALL);
+        remove_all_alerts_for_pid(alert.pid);
+    } else if (response == 7) {
+        log_filtered(1, "ALL ALLOWED EXACT: %s", trim_exe_for_log(alert.exe));
+        save_rule(alert.exe, -1, -1);
+        send_permission(alert.action, alert.exe, alert.pid, COMMAND_ALLOW_ALL);
+        remove_all_alerts_for_pid(alert.pid);
+    } else if (response == 8) {
+        log_filtered(1, "ALL ALLOWED EXACT THIS SESSION: %s", trim_exe_for_log(alert.exe));
+        send_permission(alert.action, alert.exe, alert.pid, COMMAND_ALLOW_ALL);
+        remove_all_alerts_for_pid(alert.pid);
+    } else {
+        log_filtered(1, "DENIED THIS SESSION: %s : %s", trim_exe_for_log(exe_only), action_to_string(alert.action));
+        send_permission(alert.action, exe_only, alert.pid, COMMAND_DENY);
+    }
+
+    if (alert.paused && !no_pause_mode)
+        kill(alert.pid, SIGCONT);
+
+    remove_seen_for_exe(alert.exe, alert.action);
+
+    if (kill(alert.pid, 0) != 0 && errno == ESRCH) {
+        log_filtered(2, "PID %d no longer exists, discarding alert", alert.pid);
+        remove_all_alerts_for_pid(alert.pid);
+    }
+
+    pthread_mutex_unlock(&queue_lock);
+}
+
+/* ====================== HEARTBEAT ====================== */
+
+void send_heartbeat() {
+    send_permission(0, "", getpid(), COMMAND_HEARTBEAT);
+}
+
+/* ====================== CONTROL SOCKET (local IPC, e.g. xisconf) ======================
+ *
+ * A separate SOCK_STREAM request/response channel, independent from the
+ * xnotify.<display>.sock / xperms.<display>.sock pair used to talk to the X
+ * server. Each connection sends one flat JSON request line and gets one JSON
+ * response line back. Restricted to the owning user (mode 0600) since some
+ * commands (ADD_RULE) can grant permissions that would otherwise require a
+ * Zenity confirmation.
+ */
+
+static void handle_control_message(const char *req, char *resp, size_t resp_sz) {
+    char cmd[32] = {0};
+    json_get_str(req, "cmd", cmd, sizeof(cmd));
+
+    if (cmd[0] == '\0') {
+        snprintf(resp, resp_sz, "{\"ok\":false,\"error\":\"missing cmd\"}\n");
+        return;
+    }
+
+    if (strcasecmp(cmd, "PING") == 0) {
+        snprintf(resp, resp_sz, "{\"ok\":true,\"pong\":true}\n");
+        return;
+    }
+
+    if (strcasecmp(cmd, "GET_STATUS") == 0) {
+        snprintf(resp, resp_sz,
+            "{\"ok\":true,\"version\":\"%s\",\"display\":%d,"
+            "\"no_pause\":%d,\"quiet\":%d,\"always_kill\":%d,\"log_level\":%d}\n",
+            XISGUARD_VERSION, display, no_pause_mode, quiet_mode, always_kill_mode, log_level);
+        return;
+    }
+
+    if (strcasecmp(cmd, "SET_STATUS") == 0) {
+        int v;
+        if (json_get_int(req, "no_pause", &v))     no_pause_mode = v ? 1 : 0;
+        if (json_get_int(req, "quiet", &v))         quiet_mode = v ? 1 : 0;
+        if (json_get_int(req, "always_kill", &v))   always_kill_mode = v ? 1 : 0;
+        if (json_get_int(req, "log_level", &v) && v >= 0 && v <= 4) log_level = v;
+        save_xnotify_conf();
+        log_msg("Control: SET_STATUS no_pause=%d quiet=%d always_kill=%d log_level=%d",
+                no_pause_mode, quiet_mode, always_kill_mode, log_level);
+        snprintf(resp, resp_sz,
+            "{\"ok\":true,\"no_pause\":%d,\"quiet\":%d,\"always_kill\":%d,\"log_level\":%d}\n",
+            no_pause_mode, quiet_mode, always_kill_mode, log_level);
+        return;
+    }
+
+    if (strcasecmp(cmd, "LIST_RULES") == 0) {
+        size_t off = 0;
+        off += snprintf(resp + off, resp_sz - off, "{\"ok\":true,\"rules\":[");
+        pthread_mutex_lock(&ignored_lock);
+        for (int i = 0; i < ignored_count && off < resp_sz; i++) {
+            char pat_esc[PATH_MAX * 2];
+            json_escape_str(pat_esc, sizeof(pat_esc), ignored_cmds[i].exe_pattern);
+            const char *act = ignored_cmds[i].action[0] ? ignored_cmds[i].action : "ALL";
+            off += snprintf(resp + off, resp_sz - off,
+                "%s{\"type\":\"%s\",\"action\":\"%s\",\"pattern\":\"%s\"}",
+                i == 0 ? "" : ",",
+                ignored_cmds[i].rule_type == 0 ? "ALLOW" : "DENY",
+                act, pat_esc);
+        }
+        pthread_mutex_unlock(&ignored_lock);
+        if (off < resp_sz) off += snprintf(resp + off, resp_sz - off, "]}\n");
+        return;
+    }
+
+    if (strcasecmp(cmd, "ADD_RULE") == 0) {
+        char action_str[64] = {0}, pattern[PATH_MAX] = {0}, type_str[16] = {0};
+        json_get_str(req, "action", action_str, sizeof(action_str));
+        json_get_str(req, "pattern", pattern, sizeof(pattern));
+        json_get_str(req, "type", type_str, sizeof(type_str));
+
+        if (pattern[0] == '\0' || type_str[0] == '\0') {
+            snprintf(resp, resp_sz, "{\"ok\":false,\"error\":\"missing pattern or type\"}\n");
+            return;
+        }
+        int action_id = action_str[0] ? string_to_action(action_str) : -1;
+        if (action_id == 0) {
+            snprintf(resp, resp_sz, "{\"ok\":false,\"error\":\"unknown action\"}\n");
+            return;
+        }
+        int is_allow = (strcasecmp(type_str, "ALLOW") == 0);
+        save_rule(pattern, action_id, is_allow);
+        send_all_permissions_to_xserver();
+        log_msg("Control: ADD_RULE %s %s %s", is_allow ? "ALLOW" : "DENY",
+                action_to_string(action_id), trim_exe_for_log(pattern));
+        snprintf(resp, resp_sz, "{\"ok\":true}\n");
+        return;
+    }
+
+    if (strcasecmp(cmd, "REMOVE_RULE") == 0) {
+        char action_str[64] = {0}, pattern[PATH_MAX] = {0}, type_str[16] = {0};
+        json_get_str(req, "action", action_str, sizeof(action_str));
+        json_get_str(req, "pattern", pattern, sizeof(pattern));
+        json_get_str(req, "type", type_str, sizeof(type_str));
+
+        if (pattern[0] == '\0' || type_str[0] == '\0') {
+            snprintf(resp, resp_sz, "{\"ok\":false,\"error\":\"missing pattern or type\"}\n");
+            return;
+        }
+        int rule_type = (strcasecmp(type_str, "DENY") == 0) ? 1 : 0;
+        int removed = remove_rule(pattern, action_str, rule_type);
+        snprintf(resp, resp_sz, "{\"ok\":%s}\n", removed ? "true" : "false");
+        return;
+    }
+
+    if (strcasecmp(cmd, "RELOAD") == 0) {
+        load_user_config();
+        load_ignore_reports();
+        send_all_permissions_to_xserver();
+        snprintf(resp, resp_sz, "{\"ok\":true}\n");
+        return;
+    }
+
+    snprintf(resp, resp_sz, "{\"ok\":false,\"error\":\"unknown command\"}\n");
+}
+
+void* control_loop(void *arg) {
+    (void)arg;
+    log_msg("Control thread started - listening on %s", CTL_SOCKET_PATH_BUF);
+
+    struct pollfd pfd = { .fd = ctl_fd, .events = POLLIN };
+
+    while (!should_exit) {
+        int r = poll(&pfd, 1, 500);
+        if (r <= 0 || !(pfd.revents & POLLIN))
+            continue;
+
+        int conn = accept(ctl_fd, NULL, NULL);
+        if (conn < 0)
+            continue;
+
+        static char req[CTL_BUF_SIZE];
+        static char resp[CTL_BUF_SIZE];
+        ssize_t n = read(conn, req, sizeof(req) - 1);
+        if (n > 0) {
+            req[n] = '\0';
+            handle_control_message(req, resp, sizeof(resp));
+            (void)!write(conn, resp, strlen(resp));
+        }
+        close(conn);
+    }
+    return NULL;
+}
+
+/* ====================== THREADS ====================== */
+
+void* alert_processor_loop(void *arg) {
+    (void)arg;
+    while (!should_exit) {
+        if (alert_count > 0)
+            process_next_alert();
+        usleep(150000);
+    }
+    return NULL;
+}
+
+void* file_monitor_loop(void *arg) {
+    (void)arg;
+    log_msg("File monitor thread started");
+    while (!should_exit) {
+        file_has_changed();
+        check_xnotify_conf_changed();
+        sleep(1);
+    }
+    return NULL;
+}
+
+/* ====================== LOCK & CLEANUP ====================== */
+
+int acquire_lock() {
+    lock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (lock_fd < 0) {
+        log_msg("Failed to create lock socket: %s", strerror(errno));
+        return 0;
+    }
+
+    struct sockaddr_un addr = {0};
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", LOCK_SOCKET_PATH_BUF);
+    
+    unlink(LOCK_SOCKET_PATH_BUF);
+
+    if (bind(lock_fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+        if (errno == EADDRINUSE)
+            log_msg("XisGuard is already running. Exiting.");
+        else
+            log_msg("Failed to bind lock socket: %s", strerror(errno));
+        close(lock_fd);
+        return 0;
+    }
+    
+    chmod(LOCK_SOCKET_PATH_BUF, 0666);
+    listen(lock_fd, 1);
+    return 1;
+}
+
+void release_lock() {
+    if (lock_fd >= 0) {
+        close(lock_fd);
+        unlink(LOCK_SOCKET_PATH_BUF);
+    }
+}
+
+void cleanup(int sig) {
+    log_msg("Shutting down (signal %d)...", sig);
+    should_exit = 1;
+    
+    pthread_join(file_monitor_thread, NULL);
+    pthread_join(processor_thread, NULL);
+    pthread_join(control_thread, NULL);
+
+    if (server_fd >= 0) {
+        close(server_fd);
+        unlink(SOCKET_PATH_BUF);
+    }
+
+    if (ctl_fd >= 0) {
+        close(ctl_fd);
+        unlink(CTL_SOCKET_PATH_BUF);
+    }
+
+    release_lock();
+    exit(0);
+}
+
+/* ====================== XNOTIFY EXTENSION CHECK ====================== */
+
+static int check_xnotify_extension(void) {
+    char display_str[32];
+    snprintf(display_str, sizeof(display_str), ":%d", display);
+
+    Display *dpy = XOpenDisplay(display_str);
+    if (!dpy) {
+        log_filtered(2, "Could not open display %s to check Xnotify extension", display_str);
+        return 0;
+    }
+
+    int opcode, event_base, error_base;
+    int found = XQueryExtension(dpy, "XNOTIFY", &opcode, &event_base, &error_base);
+    XCloseDisplay(dpy);
+
+    if (found)
+        log_msg("Xnotify extension detected on display %s (opcode %d)", display_str, opcode);
+    else
+        log_msg("Warning: Xnotify extension not found on display %s - continuing via socket only", display_str);
+
+    return found;
+}
+
+/* ====================== MAIN ====================== */
+
+int main(int argc, char *argv[]) {
+    signal(SIGINT, cleanup);
+    signal(SIGTERM, cleanup);
+    signal(SIGPIPE, SIG_IGN);
+
+    /* --version / --help don't need anything else — handle them first */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-V") == 0) {
+            printf("xisguard %s\n", XISGUARD_VERSION);
+            return 0;
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("Usage: %s [options]\n", argv[0]);
+            printf("Options:\n");
+            printf("  --no-pause / --notify-only     Do not send SIGSTOP/SIGCONT\n");
+            printf("  --quiet / --no-zenity          No Zenity dialogs; deny all unauthorized processes for the current session\n");
+            printf("  --always-kill                  Kill (SIGKILL) all unauthorized processes immediately\n");
+            printf("  --conf <dir> or --conf=<dir>   Base config directory (default: ~/.config/xisguard)\n");
+            printf("  --log-level N                  Verbosity level (0-4)\n");
+            printf("  --allow ACTION                 Always allow ACTION for any program (overrides perms.conf)\n");
+            printf("  --deny  ACTION                 Always deny  ACTION for any program (overrides perms.conf)\n");
+            printf("                                 Can be repeated. ACTION: ATTACH SELECTION COMPOSITE SCREEN\n");
+            printf("                                   RECORD CURSOR INPUT_GRAB INPUT_INJECT HOTKEY INPUT\n");
+            printf("                                   MANAGE GRAB_OVERRIDE WARP FOCUS RANDR OVERLAY ALL\n");
+            printf("  --version / -V                 Print version and exit\n");
+            printf("  --help / -h                    Show this help\n");
+            return 0;
+        }
+    }
+
+    /* Quick scan: resolve --conf so we can set up file paths before loading xnotify.conf */
+    for (int i = 1; i < argc; i++) {
+        if (strncmp(argv[i], "--conf=", 7) == 0) {
+            strncpy(config_dir, argv[i] + 7, sizeof(config_dir) - 1);
+            config_dir[sizeof(config_dir)-1] = '\0';
+        } else if (strcmp(argv[i], "--conf") == 0 && i + 1 < argc) {
+            strncpy(config_dir, argv[i + 1], sizeof(config_dir) - 1);
+            config_dir[sizeof(config_dir)-1] = '\0';
+        }
+    }
+
+    if (config_dir[0] == '\0') {
+        const char *home = getenv("HOME");
+        if (home && *home)
+            snprintf(config_dir, sizeof(config_dir), "%s/.config/xisguard", home);
+        else
+            strcpy(config_dir, "/tmp/xisguard");
+    }
+
+    snprintf(perms_file, sizeof(perms_file), "%s/perms.conf", config_dir);
+    snprintf(ignore_file, sizeof(ignore_file), "%s/ignore.conf", config_dir);
+    snprintf(xnotify_conf_file, sizeof(xnotify_conf_file), "%s/xnotify.conf", config_dir);
+    mkdir(config_dir, 0755);
+
+    /* Load saved runtime flags; CLI args below will override them */
+    load_xnotify_conf();
+
+    /* Full CLI parse — overrides anything loaded from xnotify.conf */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--no-pause") == 0 ||
+            strcmp(argv[i], "--notify-only") == 0) {
+            no_pause_mode = 1;
+            log_msg("NOTIFY-ONLY mode activated (no process pausing)");
+        } else if (strcmp(argv[i], "--quiet") == 0 ||
+                 strcmp(argv[i], "--no-zenity") == 0) {
+            quiet_mode = 1;
+            log_msg("QUIET mode activated (no Zenity dialogs)");
+        } else if (strcmp(argv[i], "--always-kill") == 0) {
+            always_kill_mode = 1;
+            log_msg("ALWAYS-KILL mode activated (unknown processes will be killed)");
+        } else if (strcmp(argv[i], "--allow") == 0 && i + 1 < argc) {
+            int act = string_to_action(argv[++i]);
+            if (act == -1) {
+                cli_allow_mask = 0xFFFFu;
+                log_msg("CLI override: ALLOW ALL actions");
+            } else if (act > 0 && act <= 16) {
+                cli_allow_mask |= (1u << (act - 1));
+                log_msg("CLI override: ALLOW %s", argv[i]);
+            } else {
+                log_msg("Warning: unknown action '%s' for --allow", argv[i]);
+            }
+        } else if (strcmp(argv[i], "--deny") == 0 && i + 1 < argc) {
+            int act = string_to_action(argv[++i]);
+            if (act == -1) {
+                cli_deny_mask = 0xFFFFu;
+                log_msg("CLI override: DENY ALL actions");
+            } else if (act > 0 && act <= 16) {
+                cli_deny_mask |= (1u << (act - 1));
+                log_msg("CLI override: DENY %s", argv[i]);
+            } else {
+                log_msg("Warning: unknown action '%s' for --deny", argv[i]);
+            }
+        } else if (strncmp(argv[i], "--conf=", 7) == 0 ||
+                   (strcmp(argv[i], "--conf") == 0 && i + 1 < argc && ++i)) {
+            /* already handled above */
+        } else if (strcmp(argv[i], "--log-level") == 0 && i + 1 < argc) {
+            int lvl = atoi(argv[i+1]);
+            if (lvl >= 0 && lvl <= 4) log_level = lvl;
+            i++;
+        } else if (strncmp(argv[i], "--log-level=", 12) == 0) {
+            int lvl = atoi(argv[i] + 12);
+            if (lvl >= 0 && lvl <= 4) log_level = lvl;
+        }
+    }
+
+    /* Persist the final runtime flags for the next invocation */
+    save_xnotify_conf();
+
+    const char *display_env = getenv("DISPLAY");
+    if (display_env && sscanf(display_env, ":%d", &display) == 1)
+        log_msg("Connecting to display %d", display);
+    else {
+        log_msg("No display found. Exiting.");
+        return 0;
+    }
+
+    if(!check_xnotify_extension()){
+        log_msg("No XNOTIFY Extension found on display %d. Exiting.", display);
+        return 0;
+    }
+
+    const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
+    const char *base_dir = (runtime_dir && *runtime_dir) ? runtime_dir : "/tmp";
+    snprintf(SOCKET_PATH_BUF, sizeof(SOCKET_PATH_BUF), "%s/xnotify.%d.sock", base_dir, display);
+    snprintf(LOCK_SOCKET_PATH_BUF, sizeof(LOCK_SOCKET_PATH_BUF), "%s/xnotify.%d.lock.sock", base_dir, display);
+    snprintf(CTL_SOCKET_PATH_BUF, sizeof(CTL_SOCKET_PATH_BUF), "%s/xisguard-ctl.%d.sock", base_dir, display);
+
+    log_msg("XisGuard starting - user config: %s", perms_file);
+
+    if (!acquire_lock())
+        return 1;
+
+    load_user_config();
+    load_ignore_reports();
+    send_all_permissions_to_xserver();
+    send_heartbeat();
+
+    /* === Server socket setup === */
+    server_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (server_fd == -1) {
+        log_msg("Failed to create server socket: %s", strerror(errno));
+        release_lock();
+        return 1;
+    }
+
+    fcntl(server_fd, F_SETFL, O_NONBLOCK);
+
+    struct sockaddr_un addr = {0};
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", SOCKET_PATH_BUF);
+
+    unlink(SOCKET_PATH_BUF);
+    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
+        log_msg("Failed to bind server socket: %s", strerror(errno));
+        close(server_fd);
+        release_lock();
+        return 1;
+    }
+
+    chmod(SOCKET_PATH_BUF, 0666);
+
+    int rcvbuf = 4 * 1024 * 1024;  // 4 MB
+    setsockopt(server_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
+    log_msg("XisGuard ready - listening on %s", SOCKET_PATH_BUF);
+
+    /* === Control socket setup (local IPC, e.g. xisconf) === */
+    ctl_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (ctl_fd == -1) {
+        log_msg("Failed to create control socket: %s", strerror(errno));
+        close(server_fd);
+        release_lock();
+        return 1;
+    }
+
+    struct sockaddr_un ctl_addr = {0};
+    ctl_addr.sun_family = AF_UNIX;
+    snprintf(ctl_addr.sun_path, sizeof(ctl_addr.sun_path), "%s", CTL_SOCKET_PATH_BUF);
+
+    unlink(CTL_SOCKET_PATH_BUF);
+    if (bind(ctl_fd, (struct sockaddr*)&ctl_addr, sizeof(ctl_addr)) == -1) {
+        log_msg("Failed to bind control socket: %s", strerror(errno));
+        close(ctl_fd);
+        close(server_fd);
+        release_lock();
+        return 1;
+    }
+
+    /* Owner-only: this channel can grant permissions without a Zenity prompt. */
+    chmod(CTL_SOCKET_PATH_BUF, 0600);
+    listen(ctl_fd, 4);
+
+    log_msg("XisGuard control socket ready - listening on %s", CTL_SOCKET_PATH_BUF);
+
+    pthread_create(&file_monitor_thread, NULL, file_monitor_loop, NULL);
+    pthread_create(&processor_thread, NULL, alert_processor_loop, NULL);
+    pthread_create(&control_thread, NULL, control_loop, NULL);
+
+    /* Main loop */
+    struct pollfd pfd = {
+        .fd = server_fd,
+        .events = POLLIN,
+    };
+
+    while (!should_exit) {
+        static time_t last_hb = 0;
+        if (time(NULL) - last_hb >= 2) {
+            send_heartbeat();
+            last_hb = time(NULL);
+        }
+
+        int r = poll(&pfd, 1, 400);
+        if (r > 0 && (pfd.revents & POLLIN)) {
+            char buffer[BUF_SIZE] = {0};
+            ssize_t n = recv(server_fd, buffer, sizeof(buffer)-1, 0);
+            if (n > 0) {
+                buffer[n] = '\0';
+                handle_message(buffer);
+            }
+        }
+    }
+
+    cleanup(0);
+    return 0;
+}
