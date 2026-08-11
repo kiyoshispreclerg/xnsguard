@@ -797,9 +797,9 @@ def _xisback_send(cmd):
 
 def xisback_list():
     """Returns a list of {"output", "desktop", "mode", "interval",
-    "shuffle", "path"} dicts, one per active layer, or None if the daemon
-    couldn't be reached at all (as opposed to an empty list, which just
-    means no layers are set)."""
+    "shuffle", "fade_ms", "path"} dicts, one per active layer, or None if
+    the daemon couldn't be reached at all (as opposed to an empty list,
+    which just means no layers are set)."""
     try:
         resp = _xisback_send("LIST")
     except OSError:
@@ -807,8 +807,8 @@ def xisback_list():
     layers = []
     for line in resp.splitlines():
         parts = line.split("\t")
-        if len(parts) == 6:
-            layers.append(dict(zip(("output", "desktop", "mode", "interval", "shuffle", "path"), parts)))
+        if len(parts) == 7:
+            layers.append(dict(zip(("output", "desktop", "mode", "interval", "shuffle", "fade_ms", "path"), parts)))
     return layers
 
 
@@ -1556,9 +1556,9 @@ class MainWindow(QtWidgets.QMainWindow):
         grp_layers = QtWidgets.QGroupBox("Active layers")
         lv = QtWidgets.QVBoxLayout(grp_layers)
 
-        self.tbl_wallpaper = QtWidgets.QTableWidget(0, 6)
+        self.tbl_wallpaper = QtWidgets.QTableWidget(0, 7)
         self.tbl_wallpaper.setHorizontalHeaderLabels(
-            ["Output", "Desktop", "Mode", "Interval (s)", "Shuffle", "Path"])
+            ["Output", "Desktop", "Mode", "Interval (s)", "Shuffle", "Fade (s)", "Path"])
         self.tbl_wallpaper.horizontalHeader().setStretchLastSection(True)
         no_edit = (QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers if _QT6
                    else QtWidgets.QAbstractItemView.NoEditTriggers)
@@ -1609,6 +1609,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_wp_shuffle = QtWidgets.QCheckBox("Random order (instead of alphabetical)")
         form.addRow("Slideshow shuffle:", self.chk_wp_shuffle)
 
+        self.spin_wp_fade = QtWidgets.QDoubleSpinBox()
+        self.spin_wp_fade.setRange(0.0, 5.0)
+        self.spin_wp_fade.setSingleStep(0.1)
+        self.spin_wp_fade.setDecimals(1)
+        self.spin_wp_fade.setValue(1.0)
+        self.spin_wp_fade.setSuffix(" s")
+        self.spin_wp_fade.setSpecialValueText("Instant (no fade)")
+        form.addRow("Crossfade duration:", self.spin_wp_fade)
+
         path_row = QtWidgets.QHBoxLayout()
         self.edit_wp_path = QtWidgets.QLineEdit()
         path_row.addWidget(self.edit_wp_path, 1)
@@ -1622,8 +1631,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         path_note = QtWidgets.QLabel(
             "A folder is treated as a slideshow (every image file inside "
-            "it, alphabetically, no crossfade); the interval above only "
-            "applies in that case.")
+            "it, in alphabetical or shuffled order); the interval above "
+            "only applies in that case.")
         path_note.setWordWrap(True)
         form.addRow(path_note)
 
@@ -1677,7 +1686,8 @@ class MainWindow(QtWidgets.QMainWindow):
         mode = self.tbl_wallpaper.item(row, 2).text()
         interval = self.tbl_wallpaper.item(row, 3).text()
         shuffle = self.tbl_wallpaper.item(row, 4).text()
-        path = self.tbl_wallpaper.item(row, 5).text()
+        fade = self.tbl_wallpaper.item(row, 5).text()
+        path = self.tbl_wallpaper.item(row, 6).text()
 
         idx = self.cmb_wp_output.findData(output)
         self.cmb_wp_output.setCurrentIndex(idx if idx >= 0 else 0)
@@ -1690,6 +1700,10 @@ class MainWindow(QtWidgets.QMainWindow):
         except ValueError:
             pass
         self.chk_wp_shuffle.setChecked(shuffle == "yes")
+        try:
+            self.spin_wp_fade.setValue(float(fade))
+        except ValueError:
+            pass
         self.edit_wp_path.setText(path)
 
     def _wallpaper_send(self, cmd_line):
@@ -1725,7 +1739,8 @@ class MainWindow(QtWidgets.QMainWindow):
         mode = self.cmb_wp_mode.currentText()
         interval = self.spin_wp_interval.value()
         shuffle = 1 if self.chk_wp_shuffle.isChecked() else 0
-        self._wallpaper_send(f"SET\t{output}\t{desktop}\t{mode}\t{interval}\t{shuffle}\t{path}")
+        fade_ms = round(self.spin_wp_fade.value() * 1000)
+        self._wallpaper_send(f"SET\t{output}\t{desktop}\t{mode}\t{interval}\t{shuffle}\t{fade_ms}\t{path}")
         self._refresh_wallpaper()
 
     def _on_wallpaper_clear_selected(self):
@@ -1753,8 +1768,9 @@ class MainWindow(QtWidgets.QMainWindow):
         mode = self.cmb_wp_mode.currentText()
         interval = self.spin_wp_interval.value()
         shuffle = 1 if self.chk_wp_shuffle.isChecked() else 0
+        fade_ms = round(self.spin_wp_fade.value() * 1000)
         self._wallpaper_send("CLEARALL")
-        self._wallpaper_send(f"SET\t*\t*\t{mode}\t{interval}\t{shuffle}\t{path}")
+        self._wallpaper_send(f"SET\t*\t*\t{mode}\t{interval}\t{shuffle}\t{fade_ms}\t{path}")
         self._refresh_wallpaper()
 
     def _refresh_wallpaper(self):
@@ -1785,8 +1801,13 @@ class MainWindow(QtWidgets.QMainWindow):
         for layer in layers:
             row = self.tbl_wallpaper.rowCount()
             self.tbl_wallpaper.insertRow(row)
-            for col, key in enumerate(("output", "desktop", "mode", "interval", "shuffle", "path")):
-                value = ("yes" if layer[key] == "1" else "no") if key == "shuffle" else layer[key]
+            for col, key in enumerate(("output", "desktop", "mode", "interval", "shuffle", "fade_ms", "path")):
+                if key == "shuffle":
+                    value = "yes" if layer[key] == "1" else "no"
+                elif key == "fade_ms":
+                    value = f"{int(layer[key]) / 1000:g}"
+                else:
+                    value = layer[key]
                 self.tbl_wallpaper.setItem(row, col, QtWidgets.QTableWidgetItem(value))
 
     # ---------------------------------------------------------------- Other tab
