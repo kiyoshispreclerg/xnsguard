@@ -55,6 +55,7 @@
 #include <malloc.h>
 #include <math.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -69,8 +70,22 @@
 #define XISBACK_VERSION "0.3.0"
 #define MAX_LAYERS 32
 #define LINE_MAX_LEN (PATH_MAX + 256)
+#define FADE_MS_MIN 0
+#define FADE_MS_MAX 5000
+#define FADE_TICK_USEC 33000 /* ~30fps while a crossfade is in flight */
 
 enum mode { MODE_FILL, MODE_STRETCH };
+
+static int clamp_fade_ms(int ms)
+{
+    if (ms < FADE_MS_MIN) {
+        return FADE_MS_MIN;
+    }
+    if (ms > FADE_MS_MAX) {
+        return FADE_MS_MAX;
+    }
+    return ms;
+}
 
 typedef struct {
     int in_use;
@@ -79,11 +94,21 @@ typedef struct {
     enum mode mode;
     int interval; /* seconds between slideshow switches; 0 = never auto-advance */
     int shuffle; /* 0 = alphabetical order, 1 = random order (reshuffled each wrap) */
+    int fade_ms; /* crossfade duration on image switch, ms; 0 = instant swap */
     char source[PATH_MAX]; /* image file or directory */
 
     Window win;
     Pixmap cur_pixmap;
     int x, y, width, height;
+
+    /* in-flight crossfade transition (only meaningful while fading != 0):
+     * fade_win sits on top of win, showing next_pixmap at increasing
+     * opacity; the compositor does the actual blending. Once the fade
+     * completes, fade_win/next_pixmap are promoted into win/cur_pixmap. */
+    int fading;
+    Window fade_win;
+    Pixmap fade_pixmap;
+    struct timespec fade_start;
 
     char **images;
     int n_images;
@@ -102,6 +127,7 @@ static int g_rr_event_base;
 static volatile sig_atomic_t g_quit = 0;
 static Layer g_layers[MAX_LAYERS];
 static char g_configpath[PATH_MAX];
+static Atom g_atom_opacity;
 
 /* ------------------------------------------------------------------ */
 /* command line / wire protocol                                       */
@@ -118,6 +144,7 @@ typedef struct {
     enum mode mode;
     int interval;
     int shuffle;
+    int fade_ms;
     char source[PATH_MAX];
 } Command;
 
@@ -131,6 +158,7 @@ static void usage(const char *prog)
             "  --mode fill|stretch scaling mode (default fill)\n"
             "  --interval SECONDS  slideshow interval, folders only (default 300)\n"
             "  --shuffle           slideshow in random order (default: alphabetical)\n"
+            "  --fade SECONDS      crossfade duration on image switch, 0-5 (default 1)\n"
             "  --clear             remove the given (output,desktop) layer\n"
             "  --clear-all         remove all layers\n"
             "  --list              list active layers\n"
@@ -153,6 +181,7 @@ static int parse_argv(int argc, char **argv, Command *cmd)
     snprintf(cmd->mode_str, sizeof(cmd->mode_str), "fill");
     cmd->mode = MODE_FILL;
     cmd->interval = 300;
+    cmd->fade_ms = 1000;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--output") && i + 1 < argc) {
@@ -169,6 +198,8 @@ static int parse_argv(int argc, char **argv, Command *cmd)
             cmd->interval = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--shuffle")) {
             cmd->shuffle = 1;
+        } else if (!strcmp(argv[i], "--fade") && i + 1 < argc) {
+            cmd->fade_ms = clamp_fade_ms((int)(atof(argv[++i]) * 1000.0 + 0.5));
         } else if (!strcmp(argv[i], "--version")) {
             printf("xisback %s\n", XISBACK_VERSION);
             exit(0);
@@ -199,7 +230,7 @@ static void build_line(const Command *c, char *buf, size_t bufsz)
 {
     switch (c->type) {
     case CMD_SET:
-        snprintf(buf, bufsz, "SET\t%s\t%s\t%s\t%d\t%d\t%s\n", c->output, c->desktop_str, c->mode_str, c->interval, c->shuffle, c->source);
+        snprintf(buf, bufsz, "SET\t%s\t%s\t%s\t%d\t%d\t%d\t%s\n", c->output, c->desktop_str, c->mode_str, c->interval, c->shuffle, c->fade_ms, c->source);
         break;
     case CMD_CLEAR:
         snprintf(buf, bufsz, "CLEAR\t%s\t%s\n", c->output, c->desktop_str);
@@ -252,6 +283,14 @@ static int alloc_layer(void)
 
 static void destroy_layer(Layer *l)
 {
+    if (l->fading) {
+        if (l->fade_win != None) {
+            XDestroyWindow(g_dpy, l->fade_win);
+        }
+        if (l->fade_pixmap != None) {
+            XFreePixmap(g_dpy, l->fade_pixmap);
+        }
+    }
     if (l->win != None) {
         XDestroyWindow(g_dpy, l->win);
     }
@@ -310,31 +349,52 @@ static void layer_geometry(Layer *l, int *x, int *y, int *w, int *h)
     }
 }
 
+static Window create_layer_window(Layer *l, int x, int y, int w, int h)
+{
+    Window win = XCreateSimpleWindow(g_dpy, g_root, x, y, (unsigned)w, (unsigned)h, 0, 0, BlackPixel(g_dpy, g_screen));
+
+    char title[128];
+    snprintf(title, sizeof(title), "xisback:%s:%d", l->output, l->desktop);
+    XStoreName(g_dpy, win, title);
+
+    XClassHint ch;
+    ch.res_name = (char *)"xisback";
+    ch.res_class = (char *)"xisback";
+    XSetClassHint(g_dpy, win, &ch);
+
+    Atom wmWindowType = XInternAtom(g_dpy, "_NET_WM_WINDOW_TYPE", False);
+    Atom wmWindowTypeDesktop = XInternAtom(g_dpy, "_NET_WM_WINDOW_TYPE_DESKTOP", False);
+    XChangeProperty(g_dpy, win, wmWindowType, XA_ATOM, 32, PropModeReplace, (unsigned char *)&wmWindowTypeDesktop, 1);
+
+    Atom wmDesktop = XInternAtom(g_dpy, "_NET_WM_DESKTOP", False);
+    long desktopVal = (l->desktop < 0) ? 0xFFFFFFFFL : (long)l->desktop;
+    XChangeProperty(g_dpy, win, wmDesktop, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&desktopVal, 1);
+
+    return win;
+}
+
+/* _NET_WM_WINDOW_OPACITY (the xcompmgr/compton/picom/KWin convention): a
+ * CARDINAL fraction of 0xFFFFFFFF, so the compositor cross-fades the window
+ * on the GPU -- we never touch pixel data ourselves for the animation. */
+static void set_window_opacity(Window win, double opacity)
+{
+    if (opacity < 0.0) {
+        opacity = 0.0;
+    }
+    if (opacity > 1.0) {
+        opacity = 1.0;
+    }
+    uint32_t val = (uint32_t)(opacity * (double)UINT32_MAX);
+    XChangeProperty(g_dpy, win, g_atom_opacity, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&val, 1);
+}
+
 static void layer_ensure_window(Layer *l)
 {
     int x, y, w, h;
     layer_geometry(l, &x, &y, &w, &h);
 
     if (l->win == None) {
-        l->win = XCreateSimpleWindow(g_dpy, g_root, x, y, (unsigned)w, (unsigned)h, 0, 0, BlackPixel(g_dpy, g_screen));
-
-        char title[128];
-        snprintf(title, sizeof(title), "xisback:%s:%d", l->output, l->desktop);
-        XStoreName(g_dpy, l->win, title);
-
-        XClassHint ch;
-        ch.res_name = (char *)"xisback";
-        ch.res_class = (char *)"xisback";
-        XSetClassHint(g_dpy, l->win, &ch);
-
-        Atom wmWindowType = XInternAtom(g_dpy, "_NET_WM_WINDOW_TYPE", False);
-        Atom wmWindowTypeDesktop = XInternAtom(g_dpy, "_NET_WM_WINDOW_TYPE_DESKTOP", False);
-        XChangeProperty(g_dpy, l->win, wmWindowType, XA_ATOM, 32, PropModeReplace, (unsigned char *)&wmWindowTypeDesktop, 1);
-
-        Atom wmDesktop = XInternAtom(g_dpy, "_NET_WM_DESKTOP", False);
-        long desktopVal = (l->desktop < 0) ? 0xFFFFFFFFL : (long)l->desktop;
-        XChangeProperty(g_dpy, l->win, wmDesktop, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&desktopVal, 1);
-
+        l->win = create_layer_window(l, x, y, w, h);
         XMapWindow(g_dpy, l->win);
         XLowerWindow(g_dpy, l->win);
         l->x = x;
@@ -462,7 +522,37 @@ static Pixmap render_pixmap(int w, int h, const char *path, enum mode mode)
     return pmap;
 }
 
-static void layer_render_current(Layer *l)
+/* Drops an in-flight crossfade by promoting fade_win/fade_pixmap into
+ * win/cur_pixmap and destroying whatever they replace -- used both when a
+ * fade completes naturally and when it needs to be cut short (a new switch
+ * arrives, or the layer is being resized/destroyed). */
+static void layer_finish_fade(Layer *l)
+{
+    if (!l->fading) {
+        return;
+    }
+    if (l->win != None) {
+        XDestroyWindow(g_dpy, l->win);
+    }
+    if (l->cur_pixmap != None) {
+        XFreePixmap(g_dpy, l->cur_pixmap);
+    }
+    l->win = l->fade_win;
+    l->cur_pixmap = l->fade_pixmap;
+    l->fade_win = None;
+    l->fade_pixmap = None;
+    l->fading = 0;
+}
+
+/* Renders the current slide into the layer's window. With use_fade and a
+ * configured fade_ms, the new image is drawn into a second window stacked
+ * above the current one and cross-faded in via _NET_WM_WINDOW_OPACITY
+ * (animated from layer_fade_tick()) instead of swapping instantly -- the
+ * compositor does the actual blending, so this costs us nothing beyond one
+ * extra window and a property change per frame. use_fade is turned off for
+ * geometry-driven re-renders (e.g. an output resize), where an animated
+ * transition doesn't make sense. */
+static void layer_render(Layer *l, int use_fade)
 {
     if (l->n_images == 0) {
         return;
@@ -471,12 +561,53 @@ static void layer_render_current(Layer *l)
     if (next == None) {
         return;
     }
-    XSetWindowBackgroundPixmap(g_dpy, l->win, next);
-    XClearWindow(g_dpy, l->win);
-    if (l->cur_pixmap != None) {
-        XFreePixmap(g_dpy, l->cur_pixmap);
+
+    if (l->fading) {
+        layer_finish_fade(l);
     }
-    l->cur_pixmap = next;
+
+    if (!use_fade || l->fade_ms <= 0) {
+        XSetWindowBackgroundPixmap(g_dpy, l->win, next);
+        XClearWindow(g_dpy, l->win);
+        if (l->cur_pixmap != None) {
+            XFreePixmap(g_dpy, l->cur_pixmap);
+        }
+        l->cur_pixmap = next;
+        return;
+    }
+
+    l->fade_win = create_layer_window(l, l->x, l->y, l->width, l->height);
+    XSetWindowBackgroundPixmap(g_dpy, l->fade_win, next);
+    XClearWindow(g_dpy, l->fade_win);
+    set_window_opacity(l->fade_win, 0.0);
+    XMapWindow(g_dpy, l->fade_win);
+    XRaiseWindow(g_dpy, l->fade_win);
+    l->fade_pixmap = next;
+    l->fading = 1;
+    clock_gettime(CLOCK_MONOTONIC, &l->fade_start);
+}
+
+static void layer_render_current(Layer *l)
+{
+    layer_render(l, 1);
+}
+
+/* Advances any in-flight crossfade by one animation step. Returns non-zero
+ * while still fading (caller keeps ticking at FADE_TICK_USEC), 0 once the
+ * transition has completed or there was nothing to do. */
+static int layer_fade_tick(Layer *l, const struct timespec *now)
+{
+    if (!l->fading) {
+        return 0;
+    }
+    double elapsed_ms = (double)(now->tv_sec - l->fade_start.tv_sec) * 1000.0 + (double)(now->tv_nsec - l->fade_start.tv_nsec) / 1e6;
+    double progress = elapsed_ms / (double)l->fade_ms;
+    if (progress >= 1.0) {
+        layer_finish_fade(l);
+        return 0;
+    }
+    set_window_opacity(l->fade_win, progress);
+    return 1;
 }
 
 static void layer_advance(Layer *l, time_t now)
@@ -506,7 +637,7 @@ static void layer_advance(Layer *l, time_t now)
  * load_config() at startup, so restoring last session's layers goes through
  * the exact same path a live client would use. On failure returns -1 and
  * writes a human-readable reason into errbuf. */
-static int layer_apply_set(const char *output, int desktop, enum mode mode, int interval, int shuffle, const char *path, char *errbuf, size_t errbufsz)
+static int layer_apply_set(const char *output, int desktop, enum mode mode, int interval, int shuffle, int fade_ms, const char *path, char *errbuf, size_t errbufsz)
 {
     int idx = find_layer(output, desktop);
     if (idx < 0) {
@@ -523,6 +654,7 @@ static int layer_apply_set(const char *output, int desktop, enum mode mode, int 
     l->mode = mode;
     l->interval = interval;
     l->shuffle = shuffle;
+    l->fade_ms = clamp_fade_ms(fade_ms);
     snprintf(l->source, sizeof(l->source), "%s", path);
     l->in_use = 1;
 
@@ -560,7 +692,7 @@ static void save_config(void)
         } else {
             snprintf(dstr, sizeof(dstr), "%d", l->desktop);
         }
-        fprintf(f, "%s\t%s\t%s\t%d\t%d\t%s\n", l->output, dstr, l->mode == MODE_STRETCH ? "stretch" : "fill", l->interval, l->shuffle, l->source);
+        fprintf(f, "%s\t%s\t%s\t%d\t%d\t%d\t%s\n", l->output, dstr, l->mode == MODE_STRETCH ? "stretch" : "fill", l->interval, l->shuffle, l->fade_ms, l->source);
     }
     fclose(f);
     if (rename(tmp, g_configpath) != 0) {
@@ -584,23 +716,23 @@ static void load_config(void)
             continue;
         }
 
-        char *fields[6];
+        char *fields[7];
         int nf = 0;
         char *p = line;
         fields[nf++] = p;
-        while (nf < 6 && (p = strchr(p, '\t'))) {
+        while (nf < 7 && (p = strchr(p, '\t'))) {
             *p = 0;
             p++;
             fields[nf++] = p;
         }
-        if (nf < 6) {
+        if (nf < 7) {
             fprintf(stderr, "xisback: config: skipping malformed line: '%s'\n", line);
             continue;
         }
 
         enum mode mode = (strcmp(fields[2], "stretch") == 0) ? MODE_STRETCH : MODE_FILL;
         char errbuf[256];
-        if (layer_apply_set(fields[0], parse_desktop(fields[1]), mode, atoi(fields[3]), atoi(fields[4]), fields[5], errbuf, sizeof(errbuf)) != 0) {
+        if (layer_apply_set(fields[0], parse_desktop(fields[1]), mode, atoi(fields[3]), atoi(fields[4]), atoi(fields[5]), fields[6], errbuf, sizeof(errbuf)) != 0) {
             fprintf(stderr, "xisback: config: %s\n", errbuf);
         }
     }
@@ -618,11 +750,11 @@ static void handle_line(char *line, FILE *out)
         line[--len] = 0;
     }
 
-    char *fields[8];
+    char *fields[9];
     int nf = 0;
     char *p = line;
     fields[nf++] = p;
-    while (nf < 8 && (p = strchr(p, '\t'))) {
+    while (nf < 9 && (p = strchr(p, '\t'))) {
         *p = 0;
         p++;
         fields[nf++] = p;
@@ -649,7 +781,7 @@ static void handle_line(char *line, FILE *out)
             } else {
                 snprintf(dstr, sizeof(dstr), "%d", l->desktop);
             }
-            fprintf(out, "%s\t%s\t%s\t%d\t%d\t%s\n", l->output, dstr, l->mode == MODE_STRETCH ? "stretch" : "fill", l->interval, l->shuffle, l->source);
+            fprintf(out, "%s\t%s\t%s\t%d\t%d\t%d\t%s\n", l->output, dstr, l->mode == MODE_STRETCH ? "stretch" : "fill", l->interval, l->shuffle, l->fade_ms, l->source);
         }
         return;
     }
@@ -679,8 +811,8 @@ static void handle_line(char *line, FILE *out)
         return;
     }
     if (strcmp(fields[0], "SET") == 0) {
-        if (nf < 7) {
-            fprintf(out, "ERR usage: SET output desktop mode interval shuffle path\n");
+        if (nf < 8) {
+            fprintf(out, "ERR usage: SET output desktop mode interval shuffle fade_ms path\n");
             return;
         }
         const char *output = fields[1];
@@ -688,10 +820,11 @@ static void handle_line(char *line, FILE *out)
         enum mode mode = (strcmp(fields[3], "stretch") == 0) ? MODE_STRETCH : MODE_FILL;
         int interval = atoi(fields[4]);
         int shuffle = atoi(fields[5]);
-        const char *path = fields[6];
+        int fade_ms = atoi(fields[6]);
+        const char *path = fields[7];
 
         char errbuf[256];
-        if (layer_apply_set(output, desktop, mode, interval, shuffle, path, errbuf, sizeof(errbuf)) != 0) {
+        if (layer_apply_set(output, desktop, mode, interval, shuffle, fade_ms, path, errbuf, sizeof(errbuf)) != 0) {
             fprintf(out, "ERR %s\n", errbuf);
             return;
         }
@@ -795,6 +928,8 @@ static int run_as_daemon(const char *sockpath, const char *configpath, const Com
      * memory between switches for no benefit here. Keep footprint minimal. */
     imlib_set_cache_size(0);
 
+    g_atom_opacity = XInternAtom(g_dpy, "_NET_WM_WINDOW_OPACITY", False);
+
     int rr_error_base;
     if (!XRRQueryExtension(g_dpy, &g_rr_event_base, &rr_error_base)) {
         fprintf(stderr, "xisback: RandR extension unavailable, named outputs won't work\n");
@@ -838,16 +973,24 @@ static int run_as_daemon(const char *sockpath, const char *configpath, const Com
 
         time_t now = time(NULL);
         time_t soonest = 0;
+        int any_fading = 0;
         for (int i = 0; i < MAX_LAYERS; i++) {
-            if (g_layers[i].in_use && g_layers[i].next_switch > 0) {
-                if (soonest == 0 || g_layers[i].next_switch < soonest) {
+            if (g_layers[i].in_use) {
+                if (g_layers[i].next_switch > 0 && (soonest == 0 || g_layers[i].next_switch < soonest)) {
                     soonest = g_layers[i].next_switch;
+                }
+                if (g_layers[i].fading) {
+                    any_fading = 1;
                 }
             }
         }
         struct timeval tv;
         struct timeval *tvp = NULL;
-        if (soonest > 0) {
+        if (any_fading) {
+            tv.tv_sec = 0;
+            tv.tv_usec = FADE_TICK_USEC;
+            tvp = &tv;
+        } else if (soonest > 0) {
             long delta = (long)(soonest - now);
             if (delta < 0) {
                 delta = 0;
@@ -894,14 +1037,37 @@ static int run_as_daemon(const char *sockpath, const char *configpath, const Com
                     XRRUpdateConfiguration(&ev);
                     for (int i = 0; i < MAX_LAYERS; i++) {
                         if (g_layers[i].in_use) {
+                            /* Snap any in-flight crossfade to its final state
+                             * first: an animated transition doesn't make
+                             * sense for a geometry change forced by a
+                             * monitor reconfiguration. */
+                            layer_finish_fade(&g_layers[i]);
                             layer_ensure_window(&g_layers[i]);
-                            layer_render_current(&g_layers[i]);
+                            layer_render(&g_layers[i], 0);
                         }
                     }
                     malloc_trim(0);
                     XFlush(g_dpy);
                 }
             }
+        }
+
+        int still_fading = 0;
+        for (int i = 0; i < MAX_LAYERS; i++) {
+            if (g_layers[i].in_use && g_layers[i].fading) {
+                still_fading = 1;
+                break;
+            }
+        }
+        if (still_fading) {
+            struct timespec tick_now;
+            clock_gettime(CLOCK_MONOTONIC, &tick_now);
+            for (int i = 0; i < MAX_LAYERS; i++) {
+                if (g_layers[i].in_use) {
+                    layer_fade_tick(&g_layers[i], &tick_now);
+                }
+            }
+            XFlush(g_dpy);
         }
 
         now = time(NULL);
