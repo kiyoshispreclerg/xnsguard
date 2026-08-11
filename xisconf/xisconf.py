@@ -15,18 +15,29 @@ Tabs:
   Wallpaper       -- per-(output, desktop) wallpaper layers managed by
                      the xisback session daemon, talked to over its
                      Unix-socket protocol (see xisback/PROTOCOL.md).
-  Other           -- DPMS and screensaver (xset), and XiS's 3rd
-                     extra flag (DisablePrimarySelection, via xprop).
+  Other           -- DPMS and screensaver (xset), XiS's 3rd extra
+                     flag (DisablePrimarySelection, via xprop), and the
+                     number of virtual desktops (via wmctrl, EWMH).
+  Permissions     -- XNOTIFY runtime mode and ALLOW/DENY rules, talked
+                     to over the xisguard control socket (see
+                     xisguard/XISGUARD.md, "Socket de controle").
   About           -- info about the connected X server and its active
                      extensions (xdpyinfo).
 
 Every tab keeps a snapshot ("baseline") of the last detected/applied
 state, and the Apply button only emits commands for what actually
 changed since then. Tabs with pending changes are highlighted
-(bold+italic) until the next detect/apply. The Wallpaper tab is the
-exception: SET/CLEAR act immediately on the xisback daemon (there's
-no staged/batched state to diff there), though it still logs every
-command and honors the simulation checkbox like everything else.
+(bold+italic) until the next detect/apply. The Wallpaper and
+Permissions tabs are the exception: their actions (SET/CLEAR layers;
+ADD_RULE/REMOVE_RULE/RELOAD) act immediately on their respective
+daemons (there's no staged/batched state to diff there), though they
+still log every command and honor the simulation checkbox like
+everything else. The "Runtime mode" group of the Permissions tab is
+itself staged/diffed like the other tabs, since it's just SET_STATUS
+on xisguard, not a rule change.
+
+The bottom log is collapsed into a thin status bar by default (showing
+the last logged line); click it to expand/collapse the full log.
 
 Uses no direct C/lib bindings: everything goes through subprocess, in the
 same spirit as xnsguard-gui. Compatible with PyQt6 (if available) or PyQt5.
@@ -36,7 +47,9 @@ import sys
 import os
 import re
 import copy
+import json
 import shlex
+import shutil
 import socket
 import subprocess
 import time
@@ -812,6 +825,85 @@ def detect_desktop_count():
     return int(m.group(1)) if m else 1
 
 
+def build_desktop_count_command(count):
+    return ["wmctrl", "-n", str(count)]
+
+
+# ══════════════════════════════ Permissions (xisguard) ══════════════════════════════
+#
+# xisguard is the XNOTIFY permission daemon (see xisguard/XISGUARD.md). This
+# tab talks to its *control* socket -- a separate SOCK_STREAM channel from
+# the xnotify.sock/xperms.sock pair it uses with the XServer -- at
+# $XDG_RUNTIME_DIR/xisguard-ctl.<display>.sock. Protocol: one connection =
+# one JSON request line -> one JSON response line, connection closed by the
+# server. Unlike xisback, xisconf never auto-starts xisguard: it's a
+# permission gate, so silently launching it behind the user's back would be
+# surprising for a security-relevant daemon.
+
+XNOTIFY_ACTIONS = [
+    ("ALL", "All actions"),
+    ("ATTACH", "Use shared memory"),
+    ("SELECTION", "Access clipboard"),
+    ("COMPOSITE", "Access other windows"),
+    ("SCREEN", "Capture and draw to the screen"),
+    ("RECORD", "Record events - like keystrokes"),
+    ("CURSOR", "Access cursor (mouse) image and position"),
+    ("INPUT_GRAB", "Grab mouse or keyboard"),
+    ("INPUT_INJECT", "Insert keystrokes"),
+    ("HOTKEY", "Register global hotkeys"),
+    ("INPUT", "Capture input - even when unfocused"),
+    ("MANAGE", "List and get properties of other windows"),
+    ("GRAB_OVERRIDE", "Allow to steal a grab (for screensavers)"),
+    ("WARP", "Move the mouse cursor"),
+    ("FOCUS", "Steal input focus"),
+    ("RANDR", "Change display configuration"),
+    ("OVERLAY", "Create overlay (transparent) window"),
+]
+
+
+def _xisguard_ctl_socket_path():
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+    m = re.match(r'^:(\d+)', os.environ.get("DISPLAY", ":0"))
+    display = int(m.group(1)) if m else 0
+    return os.path.join(runtime_dir, f"xisguard-ctl.{display}.sock")
+
+
+def _xisguard_ctl_send(req):
+    """Sends ONE JSON request line to the xisguard control socket and
+    returns the parsed JSON response (or raises OSError/ValueError if the
+    daemon isn't reachable or replied with garbage)."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(3.0)
+    try:
+        s.connect(_xisguard_ctl_socket_path())
+        s.sendall((json.dumps(req) + "\n").encode())
+        s.shutdown(socket.SHUT_WR)
+        data = b"".join(iter(lambda: s.recv(65536), b""))
+    finally:
+        s.close()
+    return json.loads(data.decode())
+
+
+def detect_xisguard_status():
+    """GET_STATUS -> {"version","display","no_pause","quiet",
+    "always_kill","log_level"}, or None if xisguard isn't reachable."""
+    try:
+        resp = _xisguard_ctl_send({"cmd": "GET_STATUS"})
+    except (OSError, ValueError):
+        return None
+    return resp if resp.get("ok") else None
+
+
+def list_xisguard_rules():
+    """LIST_RULES -> [{"type","action","pattern"}, ...], or None if
+    xisguard isn't reachable."""
+    try:
+        resp = _xisguard_ctl_send({"cmd": "LIST_RULES"})
+    except (OSError, ValueError):
+        return None
+    return resp.get("rules", []) if resp.get("ok") else None
+
+
 # ══════════════════════════════ About: server info (xdpyinfo) ══════════════════════════════
 
 def detect_server_info():
@@ -1029,6 +1121,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.power_state: dict = {}
         self.baseline_power_state: dict = {}
 
+        # --- desktops (workspace count) ---
+        self.wmctrl_available = shutil.which("wmctrl") is not None
+        self.desktop_count = 1
+        self.baseline_desktop_count = 1
+
+        # --- permissions (xisguard) ---
+        self.xisguard_online = False
+        self.xisguard_status: dict = {}
+        self.baseline_xisguard_status: dict = {}
+        self.xisguard_rules: list = []
+
+        # --- log status bar ---
+        self._last_log_line = None
+
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         root = QtWidgets.QVBoxLayout(central)
@@ -1056,13 +1162,24 @@ class MainWindow(QtWidgets.QMainWindow):
             self._build_pointer_keyboard_tab(), "Pointer/Keyboard")
         self.tabs.addTab(self._build_wallpaper_tab(), "Wallpaper")
         self._tab_index_other = self.tabs.addTab(self._build_other_tab(), "Other")
+        self._tab_index_permissions = self.tabs.addTab(
+            self._build_permissions_tab(), "Permissions")
         self.tabs.addTab(self._build_about_tab(), "About")
 
-        # ---- log (global) ----
+        # ---- log (global): collapsed into a status bar by default ----
+        self.btn_log_toggle = QtWidgets.QPushButton()
+        self.btn_log_toggle.setCheckable(True)
+        self.btn_log_toggle.setFlat(True)
+        self.btn_log_toggle.setStyleSheet("text-align: left; padding: 2px;")
+        self.btn_log_toggle.toggled.connect(self._toggle_log)
+        root.addWidget(self.btn_log_toggle)
+
         self.log = QtWidgets.QPlainTextEdit()
         self.log.setReadOnly(True)
-        self.log.setMaximumHeight(120)
+        self.log.setMaximumHeight(160)
+        self.log.setVisible(False)
         root.addWidget(self.log)
+        self._set_log_bar_text()
 
         self.btn_detect.clicked.connect(self.refresh)
         self.btn_apply.clicked.connect(self.apply)
@@ -1719,6 +1836,33 @@ class MainWindow(QtWidgets.QMainWindow):
 
         layout.addWidget(grp)
 
+        grp_desktops = QtWidgets.QGroupBox("Virtual desktops")
+        form_desktops = QtWidgets.QFormLayout(grp_desktops)
+
+        self.spin_desktop_count = QtWidgets.QSpinBox()
+        self.spin_desktop_count.setRange(1, 64)
+        self.spin_desktop_count.valueChanged.connect(self._set_desktop_count)
+        form_desktops.addRow("Number of desktops:", self.spin_desktop_count)
+
+        self.lbl_desktop_note = QtWidgets.QLabel()
+        self.lbl_desktop_note.setWordWrap(True)
+        if self.wmctrl_available:
+            self.lbl_desktop_note.setText(
+                "Applied via `wmctrl -n N` (EWMH _NET_NUMBER_OF_DESKTOPS "
+                "request). Depends on the window manager honoring it -- "
+                "some WMs (e.g. i3, sway) manage workspaces their own way "
+                "and ignore this.")
+        else:
+            self.lbl_desktop_note.setText(
+                "wmctrl not found in PATH -- install it to change the "
+                "desktop count from here (the field above is read-only "
+                "until then).")
+            self.lbl_desktop_note.setStyleSheet(f"color: {SELECT_BORDER};")
+            self.spin_desktop_count.setEnabled(False)
+        form_desktops.addRow(self.lbl_desktop_note)
+
+        layout.addWidget(grp_desktops)
+
         grp2 = QtWidgets.QGroupBox("Screensaver")
         form2 = QtWidgets.QFormLayout(grp2)
 
@@ -1759,8 +1903,265 @@ class MainWindow(QtWidgets.QMainWindow):
             self.spin_saver_timeout.setValue(s.get("saver_timeout", 0))
             self.spin_saver_cycle.setValue(s.get("saver_cycle", 600))
             self.chk_prefer_blanking.setChecked(s.get("prefer_blanking", True))
+            self.spin_desktop_count.setValue(self.desktop_count)
         finally:
             self._updating_panel = False
+
+    def _set_desktop_count(self, value):
+        if self._updating_panel:
+            return
+        self.desktop_count = value
+        self._update_dirty_indicators()
+
+    def _refresh_desktop_count(self):
+        self.desktop_count = detect_desktop_count()
+        self.baseline_desktop_count = self.desktop_count
+
+    # ---------------------------------------------------------------- Permissions tab (xisguard)
+
+    def _build_permissions_tab(self):
+        outer_tab = QtWidgets.QWidget()
+        outer_layout = QtWidgets.QVBoxLayout(outer_tab)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        outer_layout.addWidget(scroll)
+
+        tab = QtWidgets.QWidget()
+        scroll.setWidget(tab)
+        layout = QtWidgets.QVBoxLayout(tab)
+
+        self.lbl_xisguard_status = QtWidgets.QLabel("-")
+        self.lbl_xisguard_status.setWordWrap(True)
+        layout.addWidget(self.lbl_xisguard_status)
+
+        grp_mode = QtWidgets.QGroupBox("Runtime mode")
+        form_mode = QtWidgets.QFormLayout(grp_mode)
+
+        self.chk_xg_notify_only = QtWidgets.QCheckBox(
+            "Notify only (don't SIGSTOP offending processes)")
+        self.chk_xg_notify_only.toggled.connect(
+            lambda v: self._set_xisguard("no_pause", 1 if v else 0))
+        form_mode.addRow(self.chk_xg_notify_only)
+
+        self.chk_xg_quiet = QtWidgets.QCheckBox(
+            "Quiet (no Zenity dialogs; unmatched requests are just denied)")
+        self.chk_xg_quiet.toggled.connect(
+            lambda v: self._set_xisguard("quiet", 1 if v else 0))
+        form_mode.addRow(self.chk_xg_quiet)
+
+        self.chk_xg_always_kill = QtWidgets.QCheckBox(
+            "Always kill the offending process (instead of pause/deny)")
+        self.chk_xg_always_kill.toggled.connect(
+            lambda v: self._set_xisguard("always_kill", 1 if v else 0))
+        form_mode.addRow(self.chk_xg_always_kill)
+
+        self.spin_xg_log_level = QtWidgets.QSpinBox()
+        self.spin_xg_log_level.setRange(0, 4)
+        self.spin_xg_log_level.valueChanged.connect(
+            lambda v: self._set_xisguard("log_level", v))
+        form_mode.addRow("Log level:", self.spin_xg_log_level)
+
+        layout.addWidget(grp_mode)
+
+        self._xisguard_mode_widgets = [
+            self.chk_xg_notify_only, self.chk_xg_quiet,
+            self.chk_xg_always_kill, self.spin_xg_log_level,
+        ]
+
+        grp_rules = QtWidgets.QGroupBox("Rules (perms.conf)")
+        rv = QtWidgets.QVBoxLayout(grp_rules)
+
+        self.tbl_xg_rules = QtWidgets.QTableWidget(0, 3)
+        self.tbl_xg_rules.setHorizontalHeaderLabels(["Type", "Action", "Pattern"])
+        self.tbl_xg_rules.horizontalHeader().setStretchLastSection(True)
+        no_edit = (QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers if _QT6
+                   else QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.tbl_xg_rules.setEditTriggers(no_edit)
+        select_rows = (QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows if _QT6
+                       else QtWidgets.QAbstractItemView.SelectRows)
+        self.tbl_xg_rules.setSelectionBehavior(select_rows)
+        self.tbl_xg_rules.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.SingleSelection if _QT6
+            else QtWidgets.QAbstractItemView.SingleSelection)
+        rv.addWidget(self.tbl_xg_rules)
+
+        row_btns = QtWidgets.QHBoxLayout()
+        btn_add = QtWidgets.QPushButton("Add rule...")
+        btn_add.clicked.connect(self._on_xg_add_rule)
+        row_btns.addWidget(btn_add)
+        btn_remove = QtWidgets.QPushButton("Remove selected")
+        btn_remove.clicked.connect(self._on_xg_remove_rule)
+        row_btns.addWidget(btn_remove)
+        btn_reload = QtWidgets.QPushButton("Reload from disk")
+        btn_reload.clicked.connect(self._on_xg_reload)
+        row_btns.addWidget(btn_reload)
+        btn_refresh = QtWidgets.QPushButton("Refresh")
+        btn_refresh.clicked.connect(self._refresh_permissions)
+        row_btns.addWidget(btn_refresh)
+        row_btns.addStretch(1)
+        rv.addLayout(row_btns)
+
+        layout.addWidget(grp_rules, 1)
+
+        note = QtWidgets.QLabel(
+            "Rule changes (Add/Remove/Reload) act immediately on xisguard, "
+            "same as the Wallpaper tab -- they aren't part of the staged "
+            "Apply. Removing a rule doesn't retract access already granted "
+            "to a client in the current session, only future decisions.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        layout.addStretch(1)
+        return outer_tab
+
+    def _set_xisguard(self, key, value):
+        if self._updating_panel:
+            return
+        self.xisguard_status[key] = value
+        self._update_dirty_indicators()
+
+    def _sync_xisguard_panel(self):
+        self._updating_panel = True
+        try:
+            s = self.xisguard_status
+            self.chk_xg_notify_only.setChecked(bool(s.get("no_pause", 0)))
+            self.chk_xg_quiet.setChecked(bool(s.get("quiet", 0)))
+            self.chk_xg_always_kill.setChecked(bool(s.get("always_kill", 0)))
+            self.spin_xg_log_level.setValue(s.get("log_level", 0))
+            for w in self._xisguard_mode_widgets:
+                w.setEnabled(self.xisguard_online)
+        finally:
+            self._updating_panel = False
+
+    def _refresh_permissions(self):
+        status = detect_xisguard_status()
+        self.xisguard_online = status is not None
+        if status:
+            self.xisguard_status = {k: status[k] for k in
+                                    ("no_pause", "quiet", "always_kill", "log_level")}
+            self.baseline_xisguard_status = dict(self.xisguard_status)
+            self.lbl_xisguard_status.setText(
+                f"xisguard {status['version']} connected on display :{status['display']}.")
+            self._log("xisguard status detected via control socket.")
+        else:
+            self.xisguard_status = {}
+            self.baseline_xisguard_status = {}
+            self.lbl_xisguard_status.setText(
+                "xisguard not reachable (daemon not running, or its control "
+                "socket isn't up yet). Start it manually to manage "
+                "permissions from here.")
+        self._sync_xisguard_panel()
+        self._refresh_xisguard_rules()
+
+    def _refresh_xisguard_rules(self):
+        rules = list_xisguard_rules() if self.xisguard_online else None
+        self.xisguard_rules = rules or []
+        self.tbl_xg_rules.setRowCount(0)
+        for rule in self.xisguard_rules:
+            row = self.tbl_xg_rules.rowCount()
+            self.tbl_xg_rules.insertRow(row)
+            for col, key in enumerate(("type", "action", "pattern")):
+                self.tbl_xg_rules.setItem(row, col, QtWidgets.QTableWidgetItem(rule[key]))
+
+    def _permissions_send(self, req):
+        """Logs `req` (always) and sends it over the xisguard control
+        socket unless simulation mode is on -- mirrors _wallpaper_send."""
+        args = {k: v for k, v in req.items() if k != "cmd"}
+        self._log(f"$ xisguard-ctl {req['cmd']} {args}" if args else f"$ xisguard-ctl {req['cmd']}")
+        if self.chk_dry_run.isChecked():
+            self._log("(simulation mode: nothing was executed)")
+            return None
+        try:
+            resp = _xisguard_ctl_send(req)
+        except OSError as e:
+            self._log(f"ERROR talking to xisguard: {e}")
+            QtWidgets.QMessageBox.critical(self, "xisguard error", str(e))
+            return None
+        except ValueError as e:
+            self._log(f"ERROR parsing xisguard response: {e}")
+            return None
+        if not resp.get("ok"):
+            self._log(f"xisguard: {resp}")
+            QtWidgets.QMessageBox.critical(
+                self, "xisguard error", str(resp.get("error", resp)))
+        else:
+            self._log(f"xisguard: {resp}")
+        return resp
+
+    def _on_xg_add_rule(self):
+        if not self.xisguard_online:
+            QtWidgets.QMessageBox.warning(
+                self, "xisguard not reachable", "Refresh once xisguard is running.")
+            return
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Add rule")
+        form = QtWidgets.QFormLayout(dlg)
+
+        cmb_action = QtWidgets.QComboBox()
+        for action, desc in XNOTIFY_ACTIONS:
+            cmb_action.addItem(f"{action} -- {desc}", action)
+        form.addRow("Action:", cmb_action)
+
+        cmb_type = QtWidgets.QComboBox()
+        cmb_type.addItems(["ALLOW", "DENY"])
+        form.addRow("Type:", cmb_type)
+
+        edit_pattern = QtWidgets.QLineEdit()
+        edit_pattern.setPlaceholderText("/usr/bin/foo, or /usr/bin/foo|--args, or *")
+        form.addRow("Pattern:", edit_pattern)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+            if _QT6 else QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        form.addRow(buttons)
+
+        if _qexec(dlg) != (QtWidgets.QDialog.DialogCode.Accepted if _QT6 else QtWidgets.QDialog.Accepted):
+            return
+        pattern = edit_pattern.text().strip()
+        if not pattern:
+            QtWidgets.QMessageBox.warning(self, "Missing pattern", "Enter an exe pattern first.")
+            return
+        self._permissions_send({
+            "cmd": "ADD_RULE", "action": cmb_action.currentData(),
+            "pattern": pattern, "type": cmb_type.currentText(),
+        })
+        self._refresh_xisguard_rules()
+
+    def _on_xg_remove_rule(self):
+        rows = self.tbl_xg_rules.selectionModel().selectedRows()
+        if not rows:
+            QtWidgets.QMessageBox.information(
+                self, "No selection", "Select a rule in the table first.")
+            return
+        row = rows[0].row()
+        rule_type = self.tbl_xg_rules.item(row, 0).text()
+        action = self.tbl_xg_rules.item(row, 1).text()
+        pattern = self.tbl_xg_rules.item(row, 2).text()
+        confirm = QtWidgets.QMessageBox.question(
+            self, "Remove rule",
+            f"Remove {rule_type} {action} \"{pattern}\"?")
+        yes = QtWidgets.QMessageBox.StandardButton.Yes if _QT6 else QtWidgets.QMessageBox.Yes
+        if confirm != yes:
+            return
+        self._permissions_send({
+            "cmd": "REMOVE_RULE", "action": action, "pattern": pattern, "type": rule_type,
+        })
+        self._refresh_xisguard_rules()
+
+    def _on_xg_reload(self):
+        self._permissions_send({"cmd": "RELOAD"})
+        self._refresh_xisguard_rules()
+
+    def _xisguard_status_diff(self):
+        if not self.xisguard_online:
+            return None
+        fields = {k: v for k, v in self.xisguard_status.items()
+                  if self.baseline_xisguard_status.get(k) != v}
+        return fields or None
 
     # ---------------------------------------------------------------- About tab
 
@@ -1774,10 +2175,10 @@ class MainWindow(QtWidgets.QMainWindow):
             "<b>xisconf</b> — visual runtime configurator Xis, "
             "a XLibre soft fork.<br>Screens (xrandr), pointer/"
             "touchpad/keyboard, wallpaper (via the xisback session "
-            "daemon), and other settings (DPMS, screensaver, XiS "
-            "special options), via xinput/xprop/xset — all read and "
-            "applied with the same commands you'd run by hand in a "
-            "terminal.")
+            "daemon), other settings (DPMS, screensaver, virtual "
+            "desktops, XiS special options), and XNOTIFY permissions "
+            "(via the xisguard control socket) — all read and applied "
+            "with the same commands you'd run by hand in a terminal.")
         lbl.setWordWrap(True)
         aform.addWidget(lbl)
         layout.addWidget(grp_app)
@@ -1830,8 +2231,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_options()
         self._refresh_pointer()
         self._refresh_keyboard()
+        self._refresh_desktop_count()
         self._refresh_power()
         self._refresh_wallpaper()
+        self._refresh_permissions()
         self._refresh_about()
         self._update_dirty_indicators()
 
@@ -1863,7 +2266,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return True
         if self.power_state != self.baseline_power_state:
             return True
+        if self.desktop_count != self.baseline_desktop_count:
+            return True
         return False
+
+    def _permissions_dirty(self):
+        return self._xisguard_status_diff() is not None
 
     def _update_dirty_indicators(self):
         dirty_idx = []
@@ -1873,6 +2281,8 @@ class MainWindow(QtWidgets.QMainWindow):
             dirty_idx.append(self._tab_index_pointer_kbd)
         if self._other_dirty():
             dirty_idx.append(self._tab_index_other)
+        if self._permissions_dirty():
+            dirty_idx.append(self._tab_index_permissions)
         rules = "\n".join(
             f"QTabBar::tab:nth-child({idx + 1}) {{ font: italic bold; color: %s; }}" % SELECT_BORDER
             for idx in dirty_idx)
@@ -2262,10 +2672,14 @@ class MainWindow(QtWidgets.QMainWindow):
         pointer_cmds = self._build_changed_pointer_commands()
         keyboard_cmds = build_keyboard_commands(self.keyboard_state, self.baseline_keyboard_state)
         power_cmds = build_power_commands(self.power_state, self.baseline_power_state)
+        desktop_cmds = []
+        if self.desktop_count != self.baseline_desktop_count:
+            desktop_cmds.append(("Number of desktops", build_desktop_count_command(self.desktop_count)))
+        xisguard_status_change = self._xisguard_status_diff()
 
-        all_prop_cmds = prop_cmds + pointer_cmds + keyboard_cmds + power_cmds
+        all_prop_cmds = prop_cmds + pointer_cmds + keyboard_cmds + power_cmds + desktop_cmds
 
-        if not screen_args and not all_prop_cmds:
+        if not screen_args and not all_prop_cmds and not xisguard_status_change:
             self._log("Nothing to apply (no pending changes).")
             return
 
@@ -2288,11 +2702,18 @@ class MainWindow(QtWidgets.QMainWindow):
         for desc, argv in all_prop_cmds:
             self._log(f"$ {shlex.join(argv)}")
             if not dry:
-                result = subprocess.run(argv, capture_output=True, text=True)
+                try:
+                    result = subprocess.run(argv, capture_output=True, text=True)
+                except FileNotFoundError:
+                    self._log(f"ERROR applying {desc}: {argv[0]} not found in PATH.")
+                    continue
                 if result.returncode != 0:
                     self._log(f"ERROR applying {desc}: {result.stderr.strip()}")
                 else:
                     self._log(f"{desc}: applied.")
+
+        if xisguard_status_change:
+            self._permissions_send({"cmd": "SET_STATUS", **xisguard_status_change})
 
         if dry:
             self._log("(simulation mode: nothing was executed)")
@@ -2301,6 +2722,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _log(self, text):
         self.log.appendPlainText(text)
+        self._last_log_line = text
+        self._set_log_bar_text()
+
+    def _set_log_bar_text(self):
+        if self.btn_log_toggle.isChecked():
+            self.btn_log_toggle.setText("▾ Command log (click to hide)")
+            return
+        last = self._last_log_line or "no commands logged yet"
+        preview = last if len(last) <= 90 else last[:87] + "..."
+        self.btn_log_toggle.setText(f"▸ {preview}")
+
+    def _toggle_log(self, checked):
+        self.log.setVisible(checked)
+        self._set_log_bar_text()
 
 
 # ══════════════════════════════ entry point ══════════════════════════════
