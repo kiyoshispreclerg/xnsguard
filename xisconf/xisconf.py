@@ -1100,6 +1100,59 @@ class OutputItem(QtWidgets.QGraphicsObject):
         )
 
 
+class WallpaperZoneItem(QtWidgets.QGraphicsObject):
+    """Static (non-draggable) rectangle for the Wallpaper tab's canvas: one
+    output's footprint (or the union of all outputs, for a "*" global
+    layer), showing that zone's layer info as text instead of monitor
+    info. `layer` is the raw xisback_list() dict this zone represents, or
+    None for an output with no layer targeting it (not clickable)."""
+    clicked = QtCore.pyqtSignal(object)
+
+    def __init__(self, rect: QtCore.QRectF, lines, layer=None):
+        super().__init__()
+        self._rect = rect
+        self.lines = lines
+        self.layer = layer
+        self.selected = False
+        if layer is not None:
+            self.setFlag(_selectable(), True)
+
+    def boundingRect(self):
+        return self._rect
+
+    def paint(self, painter, option, widget=None):
+        painter.setRenderHint(_antialias())
+        fill = QtGui.QColor(FILL_PRIMARY if self.layer is not None else FILL_NORMAL)
+        painter.setBrush(QtGui.QBrush(fill))
+
+        if self.selected:
+            pen = QtGui.QPen(QtGui.QColor(SELECT_BORDER), 3)
+        else:
+            pen = QtGui.QPen(QtGui.QColor(NORMAL_BORDER), 2)
+        painter.setPen(pen)
+        painter.drawRoundedRect(self._rect.adjusted(1, 1, -1, -1), 8, 8)
+
+        main_px = max(11, min(self._rect.width(), self._rect.height()) * 0.11)
+        font = QtGui.QFont()
+        font.setPixelSize(int(main_px))
+        font.setBold(True)
+        fm = QtGui.QFontMetrics(font)
+        total_h = fm.height() * len(self.lines)
+        y = self._rect.center().y() - total_h / 2
+
+        painter.setFont(font)
+        painter.setPen(QtGui.QColor(NORMAL_BORDER))
+        for line in self.lines:
+            line_rect = QtCore.QRectF(self._rect.left(), y, self._rect.width(), fm.height())
+            painter.drawText(line_rect, _align_center(), line)
+            y += fm.height()
+
+    def mousePressEvent(self, event):
+        if self.layer is not None:
+            self.clicked.emit(self.layer)
+        super().mousePressEvent(event)
+
+
 # ══════════════════════════════ Main window ══════════════════════════════
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -1134,6 +1187,11 @@ class MainWindow(QtWidgets.QMainWindow):
         # --- power/screen ---
         self.power_state: dict = {}
         self.baseline_power_state: dict = {}
+
+        # --- wallpaper canvas ---
+        self.wallpaper_layers: list = []
+        self.selected_wp_layer: Optional[dict] = None
+        self.wp_items: list = []
 
         # --- desktops (workspace count) ---
         self.wmctrl_available = shutil.which("wmctrl") is not None
@@ -1179,6 +1237,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._tab_index_permissions = self.tabs.addTab(
             self._build_permissions_tab(), "Permissions")
         self.tabs.addTab(self._build_about_tab(), "About")
+        # Hidden tab pages report a stale/zero geometry until they first
+        # become current, so fitInView() on their canvas (Screens,
+        # Wallpaper) produces a wrong scale if it ran while that tab
+        # wasn't visible yet (e.g. at startup, on any tab other than the
+        # initial one). Re-fit whenever a tab is switched to, once the
+        # switch's layout pass has settled.
+        self.tabs.currentChanged.connect(
+            lambda _index: QtCore.QTimer.singleShot(0, self._fit_all_views))
 
         # ---- log (global): collapsed into a status bar by default ----
         self.btn_log_toggle = QtWidgets.QPushButton()
@@ -1571,24 +1637,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_wallpaper_status.setWordWrap(True)
         layout.addWidget(self.lbl_wallpaper_status)
 
-        grp_layers = QtWidgets.QGroupBox("Active layers")
+        grp_layers = QtWidgets.QGroupBox()
         lv = QtWidgets.QVBoxLayout(grp_layers)
 
-        self.tbl_wallpaper = QtWidgets.QTableWidget(0, 7)
-        self.tbl_wallpaper.setHorizontalHeaderLabels(
-            ["Output", "Desktop", "Mode", "Interval (s)", "Shuffle", "Fade (s)", "Path"])
-        self.tbl_wallpaper.horizontalHeader().setStretchLastSection(True)
-        no_edit = (QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers if _QT6
-                   else QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.tbl_wallpaper.setEditTriggers(no_edit)
-        select_rows = (QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows if _QT6
-                       else QtWidgets.QAbstractItemView.SelectRows)
-        self.tbl_wallpaper.setSelectionBehavior(select_rows)
-        self.tbl_wallpaper.setSelectionMode(
-            QtWidgets.QAbstractItemView.SelectionMode.SingleSelection if _QT6
-            else QtWidgets.QAbstractItemView.SingleSelection)
-        self.tbl_wallpaper.itemSelectionChanged.connect(self._on_wallpaper_row_selected)
-        lv.addWidget(self.tbl_wallpaper)
+        # Static (non-draggable) version of the Screens tab's canvas: one
+        # box per output, showing that output's wallpaper layer info as
+        # text instead of monitor info. Click a box to load its layer into
+        # "Set / replace a layer" below, same as clicking a table row used
+        # to. A single output-spanning box appears instead of the
+        # per-output ones when a "*" (global) layer is active.
+        self.wp_scene = QtWidgets.QGraphicsScene()
+        self.wp_view = QtWidgets.QGraphicsView(self.wp_scene)
+        self.wp_view.setBackgroundBrush(QtGui.QColor("#232629"))
+        self.wp_view.setMinimumHeight(140)
+        lv.addWidget(self.wp_view, 1)
 
         row_btns = QtWidgets.QHBoxLayout()
         btn_next = QtWidgets.QPushButton("Next slide")
@@ -1678,24 +1740,35 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(grp_set)
 
         grp_actions = QtWidgets.QGroupBox("Click actions")
-        aform = QtWidgets.QFormLayout(grp_actions)
+        outer_actions = QtWidgets.QVBoxLayout(grp_actions)
+
+        # 2 pairs of label:field columns -- 2 rows instead of 4.
+        grid_actions = QtWidgets.QGridLayout()
 
         self.edit_action_left = QtWidgets.QLineEdit()
         self.edit_action_left.setPlaceholderText("e.g. xisback --next")
-        aform.addRow("Left click:", self.edit_action_left)
+        grid_actions.addWidget(QtWidgets.QLabel("Left click:"), 0, 0)
+        grid_actions.addWidget(self.edit_action_left, 0, 1)
 
         self.edit_action_right = QtWidgets.QLineEdit()
-        aform.addRow("Right click:", self.edit_action_right)
+        grid_actions.addWidget(QtWidgets.QLabel("Right click:"), 0, 2)
+        grid_actions.addWidget(self.edit_action_right, 0, 3)
 
         self.edit_action_middle = QtWidgets.QLineEdit()
-        aform.addRow("Middle click:", self.edit_action_middle)
+        grid_actions.addWidget(QtWidgets.QLabel("Middle click:"), 1, 0)
+        grid_actions.addWidget(self.edit_action_middle, 1, 1)
 
         self.edit_action_double = QtWidgets.QLineEdit()
-        aform.addRow("Double-click:", self.edit_action_double)
+        grid_actions.addWidget(QtWidgets.QLabel("Double-click:"), 1, 2)
+        grid_actions.addWidget(self.edit_action_double, 1, 3)
+
+        grid_actions.setColumnStretch(1, 1)
+        grid_actions.setColumnStretch(3, 1)
+        outer_actions.addLayout(grid_actions)
 
         btn_actions_save = QtWidgets.QPushButton("Save click actions")
         btn_actions_save.clicked.connect(self._on_actions_save)
-        aform.addRow(btn_actions_save)
+        outer_actions.addWidget(btn_actions_save)
 
         layout.addWidget(grp_actions)
 
@@ -1714,35 +1787,104 @@ class MainWindow(QtWidgets.QMainWindow):
         if path:
             self.edit_wp_path.setText(path)
 
-    def _on_wallpaper_row_selected(self):
-        rows = self.tbl_wallpaper.selectionModel().selectedRows()
-        if not rows:
-            return
-        row = rows[0].row()
-        output = self.tbl_wallpaper.item(row, 0).text()
-        desktop = self.tbl_wallpaper.item(row, 1).text()
-        mode = self.tbl_wallpaper.item(row, 2).text()
-        interval = self.tbl_wallpaper.item(row, 3).text()
-        shuffle = self.tbl_wallpaper.item(row, 4).text()
-        fade = self.tbl_wallpaper.item(row, 5).text()
-        path = self.tbl_wallpaper.item(row, 6).text()
+    # ---- wallpaper canvas (static per-output boxes, click to select) ----
 
-        idx = self.cmb_wp_output.findData(output)
+    def _wp_layer_key(self, layer):
+        return (layer["output"], layer["desktop"]) if layer else None
+
+    def _wp_layer_lines(self, layer, header):
+        desktop = "all desktops" if layer["desktop"] == "*" else f"desktop {int(layer['desktop']) + 1}"
+        fade_s = int(layer.get("fade_ms", 0)) / 1000
+        extra = f"{layer['mode']}, {layer['interval']}s"
+        if layer.get("shuffle") == "1":
+            extra += ", shuffle"
+        if fade_s:
+            extra += f", fade {fade_s:g}s"
+        path = layer.get("path", "")
+        basename = path.rsplit("/", 1)[-1] if path else "-"
+        return [header, desktop, extra, basename]
+
+    def _wp_place_stack(self, rect, layers, header):
+        """Fills `rect` with either one "no layer" placeholder, or one
+        clickable WallpaperZoneItem per layer (stacked vertically if more
+        than one layer targets the same zone, e.g. one per desktop)."""
+        if not layers:
+            item = WallpaperZoneItem(QtCore.QRectF(0, 0, rect.width(), rect.height()),
+                                     [header, "No wallpaper set"], layer=None)
+            item.setPos(rect.topLeft())
+            self.wp_scene.addItem(item)
+            self.wp_items.append(item)
+            return
+        n = len(layers)
+        slice_h = rect.height() / n
+        for i, layer in enumerate(layers):
+            item = WallpaperZoneItem(QtCore.QRectF(0, 0, rect.width(), slice_h),
+                                     self._wp_layer_lines(layer, header), layer=layer)
+            item.setPos(rect.left(), rect.top() + i * slice_h)
+            item.selected = self._wp_layer_key(layer) == self._wp_layer_key(self.selected_wp_layer)
+            item.clicked.connect(self._on_wp_zone_clicked)
+            self.wp_scene.addItem(item)
+            self.wp_items.append(item)
+
+    def _wp_rebuild_scene(self):
+        self.wp_scene.clear()
+        self.wp_items = []
+        outputs = [o for o in self.outputs.values() if o.connected and o.enabled]
+        if not outputs:
+            self.wp_scene.setSceneRect(0, 0, 1, 1)
+            return
+
+        ox, oy = self.world_origin
+        scale = self.px_per_unit
+        global_layers = [l for l in self.wallpaper_layers if l.get("output") == "*"]
+
+        if global_layers:
+            min_x = min(o.x for o in outputs)
+            min_y = min(o.y for o in outputs)
+            max_x = max(o.x + o.rotated_size()[0] for o in outputs)
+            max_y = max(o.y + o.rotated_size()[1] for o in outputs)
+            rect = QtCore.QRectF((min_x - ox) * scale, (min_y - oy) * scale,
+                                 (max_x - min_x) * scale, (max_y - min_y) * scale)
+            self._wp_place_stack(rect, global_layers, "All outputs")
+        else:
+            for out in outputs:
+                w, h = out.rotated_size()
+                rect = QtCore.QRectF((out.x - ox) * scale, (out.y - oy) * scale,
+                                     w * scale, h * scale)
+                layers_here = [l for l in self.wallpaper_layers if l.get("output") == out.name]
+                self._wp_place_stack(rect, layers_here, out.name)
+
+        self.wp_scene.setSceneRect(self.wp_scene.itemsBoundingRect().adjusted(-20, -20, 20, 20))
+        self._wp_fit_view()
+
+    def _wp_fit_view(self):
+        if self.wp_scene.sceneRect().isValid():
+            self.wp_view.fitInView(self.wp_scene.sceneRect(), QtCore.Qt.AspectRatioMode.KeepAspectRatio
+                                   if _QT6 else QtCore.Qt.KeepAspectRatio)
+
+    def _on_wp_zone_clicked(self, layer):
+        self.selected_wp_layer = layer
+        key = self._wp_layer_key(layer)
+        for item in self.wp_items:
+            item.selected = self._wp_layer_key(item.layer) == key
+            item.update()
+
+        idx = self.cmb_wp_output.findData(layer["output"])
         self.cmb_wp_output.setCurrentIndex(idx if idx >= 0 else 0)
-        idx = self.cmb_wp_desktop.findData(desktop)
+        idx = self.cmb_wp_desktop.findData(layer["desktop"])
         self.cmb_wp_desktop.setCurrentIndex(idx if idx >= 0 else 0)
-        if mode in WALLPAPER_MODES:
-            self.cmb_wp_mode.setCurrentText(mode)
+        if layer["mode"] in WALLPAPER_MODES:
+            self.cmb_wp_mode.setCurrentText(layer["mode"])
         try:
-            self.spin_wp_interval.setValue(int(float(interval)))
+            self.spin_wp_interval.setValue(int(float(layer["interval"])))
         except ValueError:
             pass
-        self.chk_wp_shuffle.setChecked(shuffle == "yes")
+        self.chk_wp_shuffle.setChecked(layer.get("shuffle") == "1")
         try:
-            self.spin_wp_fade.setValue(float(fade))
+            self.spin_wp_fade.setValue(int(layer.get("fade_ms", 0)) / 1000)
         except ValueError:
             pass
-        self.edit_wp_path.setText(path)
+        self.edit_wp_path.setText(layer.get("path", ""))
 
     def _wallpaper_send(self, cmd_line):
         """Logs `cmd_line` (always) and sends it to the daemon unless
@@ -1782,27 +1924,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_wallpaper()
 
     def _on_wallpaper_next(self):
-        rows = self.tbl_wallpaper.selectionModel().selectedRows()
-        if not rows:
+        if not self.selected_wp_layer:
             QtWidgets.QMessageBox.information(
-                self, "No selection", "Select a layer in the table first.")
+                self, "No selection", "Click a layer in the drawing above first.")
             return
-        row = rows[0].row()
-        output = self.tbl_wallpaper.item(row, 0).text()
-        desktop = self.tbl_wallpaper.item(row, 1).text()
+        output = self.selected_wp_layer["output"]
+        desktop = self.selected_wp_layer["desktop"]
         self._wallpaper_send(f"NEXT\t{output}\t{desktop}")
         self._refresh_wallpaper()
 
     def _on_wallpaper_clear_selected(self):
-        rows = self.tbl_wallpaper.selectionModel().selectedRows()
-        if not rows:
+        if not self.selected_wp_layer:
             QtWidgets.QMessageBox.information(
-                self, "No selection", "Select a layer in the table first.")
+                self, "No selection", "Click a layer in the drawing above first.")
             return
-        row = rows[0].row()
-        output = self.tbl_wallpaper.item(row, 0).text()
-        desktop = self.tbl_wallpaper.item(row, 1).text()
+        output = self.selected_wp_layer["output"]
+        desktop = self.selected_wp_layer["desktop"]
         self._wallpaper_send(f"CLEAR\t{output}\t{desktop}")
+        self.selected_wp_layer = None
         self._refresh_wallpaper()
 
     def _on_wallpaper_clear_all(self):
@@ -1848,25 +1987,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cmb_wp_desktop.blockSignals(False)
 
         layers = xisback_list()
-        self.tbl_wallpaper.setRowCount(0)
+        self.wallpaper_layers = layers or []
         if layers is None:
             self.lbl_wallpaper_status.setText(
                 "xisback daemon not reachable yet (it will be "
                 "auto-started on the next action here).")
-            return
-        self.lbl_wallpaper_status.setText(
-            f"xisback connected — {len(layers)} active layer(s).")
-        for layer in layers:
-            row = self.tbl_wallpaper.rowCount()
-            self.tbl_wallpaper.insertRow(row)
-            for col, key in enumerate(("output", "desktop", "mode", "interval", "shuffle", "fade_ms", "path")):
-                if key == "shuffle":
-                    value = "yes" if layer[key] == "1" else "no"
-                elif key == "fade_ms":
-                    value = f"{int(layer[key]) / 1000:g}"
-                else:
-                    value = layer[key]
-                self.tbl_wallpaper.setItem(row, col, QtWidgets.QTableWidgetItem(value))
+        else:
+            self.lbl_wallpaper_status.setText(
+                f"xisback connected — {len(layers)} active layer(s).")
+
+        # Keep the same logical layer selected across refresh, if it's
+        # still around (e.g. after "Next slide" on a slideshow layer).
+        if self.selected_wp_layer is not None:
+            key = self._wp_layer_key(self.selected_wp_layer)
+            self.selected_wp_layer = next(
+                (l for l in self.wallpaper_layers if self._wp_layer_key(l) == key), None)
+        self._wp_rebuild_scene()
 
         actions = xisback_get_actions()
         if actions is not None:
@@ -2475,9 +2611,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self._fit_all_views()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # On first show, the splitter/scroll areas haven't settled into
+        # their final sizes yet when this fires, so fitInView() would use
+        # a stale (often tiny or oversized) viewport -- defer one tick via
+        # a 0ms timer so it runs after the event loop finishes layout.
+        QtCore.QTimer.singleShot(0, self._fit_all_views)
+
+    def _fit_all_views(self):
         if self.scene.sceneRect().isValid():
             self.view.fitInView(self.scene.sceneRect(), QtCore.Qt.AspectRatioMode.KeepAspectRatio
                                 if _QT6 else QtCore.Qt.KeepAspectRatio)
+        self._wp_fit_view()
 
     # ---------------------------------------------------------------- selection (Screens)
 
