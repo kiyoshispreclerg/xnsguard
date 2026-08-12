@@ -1226,7 +1226,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.chk_dpi_visual = QtWidgets.QCheckBox(
             "Drawing responds to DPI and Scale (shrinks/grows the box per output)")
-        self.chk_dpi_visual.setChecked(True)
+        self.chk_dpi_visual.setChecked(False)
         self.chk_dpi_visual.toggled.connect(lambda _checked: self._rebuild_scene())
         canvas_layout.addWidget(self.chk_dpi_visual)
 
@@ -1312,16 +1312,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_scale.valueChanged.connect(self._on_scale)
         form.addRow("Scale:", self.spin_scale)
 
-        outer.addWidget(grp_mon)
-
         # ---- advanced driver properties (dynamic, per output) ----
         self.grp_extra_editable = QtWidgets.QGroupBox(
             "Advanced properties (TearFree, underscan, scaling, PRIME, ...)")
         self.form_extra_editable = QtWidgets.QFormLayout(self.grp_extra_editable)
-        outer.addWidget(self.grp_extra_editable)
 
+        row_top = QtWidgets.QHBoxLayout()
+        row_top.addWidget(grp_mon, 1)
+        row_top.addWidget(self.grp_extra_editable, 1)
+        outer.addLayout(row_top)
+
+        # Read-only properties can pile up (LUTs aside, some drivers expose
+        # a dozen+), so they're split into 2 side-by-side forms (2 pairs of
+        # label:value columns) instead of one long single-column list.
         self.grp_extra_readonly = QtWidgets.QGroupBox("Other properties (read-only)")
-        self.form_extra_readonly = QtWidgets.QFormLayout(self.grp_extra_readonly)
+        readonly_row = QtWidgets.QHBoxLayout(self.grp_extra_readonly)
+        self.form_extra_readonly = QtWidgets.QFormLayout()
+        self.form_extra_readonly2 = QtWidgets.QFormLayout()
+        readonly_row.addLayout(self.form_extra_readonly)
+        readonly_row.addLayout(self.form_extra_readonly2)
         outer.addWidget(self.grp_extra_readonly)
 
         outer.addStretch(1)
@@ -1337,6 +1346,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.form_extra_editable.removeRow(0)
         while self.form_extra_readonly.rowCount():
             self.form_extra_readonly.removeRow(0)
+        while self.form_extra_readonly2.rowCount():
+            self.form_extra_readonly2.removeRow(0)
 
         for name in sorted(out.extra_props_meta):
             meta = out.extra_props_meta[name]
@@ -1345,9 +1356,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.form_extra_editable.addRow(name + ":", widget)
         self.grp_extra_editable.setVisible(bool(out.extra_props_meta))
 
-        for name in sorted(out.extra_props_readonly):
+        readonly_names = sorted(out.extra_props_readonly)
+        half = (len(readonly_names) + 1) // 2
+        for i, name in enumerate(readonly_names):
             lbl = QtWidgets.QLabel(out.extra_props_readonly[name] or "-")
-            self.form_extra_readonly.addRow(name + ":", lbl)
+            target = self.form_extra_readonly if i < half else self.form_extra_readonly2
+            target.addRow(name + ":", lbl)
         self.grp_extra_readonly.setVisible(bool(out.extra_props_readonly))
 
     def _make_extra_prop_widget(self, out, name, meta, value):
@@ -1452,7 +1466,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_kbd_rate.valueChanged.connect(lambda v: self._set_kbd("repeat_rate", v))
         form_kbd.addRow("Repeat rate:", self.spin_kbd_rate)
 
-        layout.addWidget(grp_kbd)
+        row_kbd_bell = QtWidgets.QHBoxLayout()
+        row_kbd_bell.addWidget(grp_kbd, 1)
 
         grp_bell = QtWidgets.QGroupBox("Bell")
         form_bell = QtWidgets.QFormLayout(grp_bell)
@@ -1475,7 +1490,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_bell_duration.valueChanged.connect(lambda v: self._set_kbd("bell_duration", v))
         form_bell.addRow("Duration:", self.spin_bell_duration)
 
-        layout.addWidget(grp_bell)
+        row_kbd_bell.addWidget(grp_bell, 1)
+        layout.addLayout(row_kbd_bell)
 
         grp_special = QtWidgets.QGroupBox("Special keyboard options")
         vform_special = QtWidgets.QVBoxLayout(grp_special)
@@ -1601,31 +1617,43 @@ class MainWindow(QtWidgets.QMainWindow):
         btn_refresh.clicked.connect(self._refresh_wallpaper)
         row_btns.addWidget(btn_refresh)
         row_btns.addStretch(1)
+        btn_global = QtWidgets.QPushButton("Same wallpaper for everything")
+        btn_global.clicked.connect(self._on_wallpaper_set_global)
+        row_btns.addWidget(btn_global)
         lv.addLayout(row_btns)
 
         layout.addWidget(grp_layers, 1)
 
         grp_set = QtWidgets.QGroupBox("Set / replace a layer")
-        form = QtWidgets.QFormLayout(grp_set)
+        outer_set = QtWidgets.QVBoxLayout(grp_set)
+
+        # First few fields packed 2-per-row (2 label:field column pairs) to
+        # save vertical space -- 3 rows instead of 6.
+        grid = QtWidgets.QGridLayout()
 
         self.cmb_wp_output = QtWidgets.QComboBox()
-        form.addRow("Output:", self.cmb_wp_output)
+        grid.addWidget(QtWidgets.QLabel("Output:"), 0, 0)
+        grid.addWidget(self.cmb_wp_output, 0, 1)
 
         self.cmb_wp_desktop = QtWidgets.QComboBox()
-        form.addRow("Desktop:", self.cmb_wp_desktop)
+        grid.addWidget(QtWidgets.QLabel("Desktop:"), 0, 2)
+        grid.addWidget(self.cmb_wp_desktop, 0, 3)
 
         self.cmb_wp_mode = QtWidgets.QComboBox()
         self.cmb_wp_mode.addItems(WALLPAPER_MODES)
-        form.addRow("Mode:", self.cmb_wp_mode)
+        grid.addWidget(QtWidgets.QLabel("Mode:"), 1, 0)
+        grid.addWidget(self.cmb_wp_mode, 1, 1)
 
         self.spin_wp_interval = QtWidgets.QSpinBox()
         self.spin_wp_interval.setRange(5, 86400)
         self.spin_wp_interval.setValue(300)
         self.spin_wp_interval.setSuffix(" s")
-        form.addRow("Slideshow interval:", self.spin_wp_interval)
+        grid.addWidget(QtWidgets.QLabel("Slideshow interval:"), 1, 2)
+        grid.addWidget(self.spin_wp_interval, 1, 3)
 
         self.chk_wp_shuffle = QtWidgets.QCheckBox("Random order (instead of alphabetical)")
-        form.addRow("Slideshow shuffle:", self.chk_wp_shuffle)
+        grid.addWidget(QtWidgets.QLabel("Slideshow shuffle:"), 2, 0)
+        grid.addWidget(self.chk_wp_shuffle, 2, 1)
 
         self.spin_wp_fade = QtWidgets.QDoubleSpinBox()
         self.spin_wp_fade.setRange(0.0, 5.0)
@@ -1634,7 +1662,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_wp_fade.setValue(1.0)
         self.spin_wp_fade.setSuffix(" s")
         self.spin_wp_fade.setSpecialValueText("Instant (no fade)")
-        form.addRow("Crossfade duration:", self.spin_wp_fade)
+        grid.addWidget(QtWidgets.QLabel("Crossfade duration:"), 2, 2)
+        grid.addWidget(self.spin_wp_fade, 2, 3)
+
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
+        outer_set.addLayout(grid)
+
+        form = QtWidgets.QFormLayout()
+        outer_set.addLayout(form)
 
         path_row = QtWidgets.QHBoxLayout()
         self.edit_wp_path = QtWidgets.QLineEdit()
@@ -1670,14 +1706,6 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addRow(overlap_note)
 
         layout.addWidget(grp_set)
-
-        grp_quick = QtWidgets.QGroupBox("Quick action")
-        qlayout = QtWidgets.QHBoxLayout(grp_quick)
-        btn_global = QtWidgets.QPushButton("Same wallpaper for everything")
-        btn_global.clicked.connect(self._on_wallpaper_set_global)
-        qlayout.addWidget(btn_global)
-        qlayout.addStretch(1)
-        layout.addWidget(grp_quick)
 
         grp_actions = QtWidgets.QGroupBox("Click actions (global, any layer)")
         aform = QtWidgets.QFormLayout(grp_actions)
@@ -1931,7 +1959,30 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_dpms_off.valueChanged.connect(lambda v: self._set_power("dpms_off", v))
         form.addRow("Off (0 = disabled):", self.spin_dpms_off)
 
-        layout.addWidget(grp)
+        row_dpms_saver = QtWidgets.QHBoxLayout()
+        row_dpms_saver.addWidget(grp, 1)
+
+        grp2 = QtWidgets.QGroupBox("Screensaver")
+        form2 = QtWidgets.QFormLayout(grp2)
+
+        self.spin_saver_timeout = QtWidgets.QSpinBox()
+        self.spin_saver_timeout.setRange(0, 36000)
+        self.spin_saver_timeout.setSuffix(" s")
+        self.spin_saver_timeout.valueChanged.connect(lambda v: self._set_power("saver_timeout", v))
+        form2.addRow("Timeout (0 = disabled):", self.spin_saver_timeout)
+
+        self.spin_saver_cycle = QtWidgets.QSpinBox()
+        self.spin_saver_cycle.setRange(0, 36000)
+        self.spin_saver_cycle.setSuffix(" s")
+        self.spin_saver_cycle.valueChanged.connect(lambda v: self._set_power("saver_cycle", v))
+        form2.addRow("Cycle:", self.spin_saver_cycle)
+
+        self.chk_prefer_blanking = QtWidgets.QCheckBox("Prefer blanking the screen")
+        self.chk_prefer_blanking.toggled.connect(lambda v: self._set_power("prefer_blanking", v))
+        form2.addRow(self.chk_prefer_blanking)
+
+        row_dpms_saver.addWidget(grp2, 1)
+        layout.addLayout(row_dpms_saver)
 
         grp_desktops = QtWidgets.QGroupBox("Virtual desktops")
         form_desktops = QtWidgets.QFormLayout(grp_desktops)
@@ -1959,27 +2010,6 @@ class MainWindow(QtWidgets.QMainWindow):
         form_desktops.addRow(self.lbl_desktop_note)
 
         layout.addWidget(grp_desktops)
-
-        grp2 = QtWidgets.QGroupBox("Screensaver")
-        form2 = QtWidgets.QFormLayout(grp2)
-
-        self.spin_saver_timeout = QtWidgets.QSpinBox()
-        self.spin_saver_timeout.setRange(0, 36000)
-        self.spin_saver_timeout.setSuffix(" s")
-        self.spin_saver_timeout.valueChanged.connect(lambda v: self._set_power("saver_timeout", v))
-        form2.addRow("Timeout (0 = disabled):", self.spin_saver_timeout)
-
-        self.spin_saver_cycle = QtWidgets.QSpinBox()
-        self.spin_saver_cycle.setRange(0, 36000)
-        self.spin_saver_cycle.setSuffix(" s")
-        self.spin_saver_cycle.valueChanged.connect(lambda v: self._set_power("saver_cycle", v))
-        form2.addRow("Cycle:", self.spin_saver_cycle)
-
-        self.chk_prefer_blanking = QtWidgets.QCheckBox("Prefer blanking the screen")
-        self.chk_prefer_blanking.toggled.connect(lambda v: self._set_power("prefer_blanking", v))
-        form2.addRow(self.chk_prefer_blanking)
-
-        layout.addWidget(grp2)
         layout.addStretch(1)
         return tab
 
