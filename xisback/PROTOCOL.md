@@ -26,6 +26,9 @@ SET\t<output>\t<desktop>\t<mode>\t<interval>\t<shuffle>\t<fade_ms>\t<path>\n
 CLEAR\t<output>\t<desktop>\n
 CLEARALL\n
 LIST\n
+NEXT\t<output>\t<desktop>\n
+ACTIONS\n
+SETACTIONS\t<left>\t<right>\t<middle>\t<double>\n
 PING\n
 QUIT\n
 ```
@@ -53,6 +56,14 @@ QUIT\n
 `(output, desktop)` pair **replaces** the existing layer (swaps
 image/folder, repositions if needed) instead of creating a new one.
 
+`NEXT` advances that exact layer's slideshow immediately (same effect as
+its interval timer firing right now, including a crossfade if configured)
+and resets the timer; it's a no-op (still `OK`) if the layer is a single
+image or `interval` is `0` — there's nothing to advance to. `ACTIONS` and
+`SETACTIONS` read/write the four click-action commands described in "Click
+actions" below; they're global, not per-layer, so they take no
+`output`/`desktop` arguments.
+
 ### Responses
 
 - `OK\n` — success, no extra body.
@@ -62,6 +73,8 @@ image/folder, repositions if needed) instead of creating a new one.
   as `SET` (without the leading `SET\t`):
   `output\tdesktop\tmode\tinterval\tshuffle\tfade_ms\tpath\n`.
   Connection closes (EOF) at the end of the list.
+- For `ACTIONS`: one line, `left\tright\tmiddle\tdouble\n` — the four
+  command strings currently bound (empty string for an unbound slot).
 
 ## Crossfade
 
@@ -79,17 +92,49 @@ immediately rather than animating, since there's no "old" content to fade
 from in that case. `<fade_ms>` is clamped to `[0, 5000]` by the daemon
 regardless of what a client sends.
 
+## Click actions
+
+Each layer's window accepts left/right/middle clicks and double-clicks
+(any button). What happens on click is **global** to the daemon, not
+per-layer: four shell command strings (`left`, `right`, `middle`,
+`double`), run via `sh -c "<cmd>"` when the corresponding click lands on
+*any* layer's window. An empty string means no action for that slot
+(the common case, and the default).
+
+The command runs detached (the daemon doesn't wait for it) with two
+environment variables set to identify which layer was actually clicked:
+`XISBACK_OUTPUT` and `XISBACK_DESKTOP` (same values as that layer's
+`<output>`/`<desktop>`). This is what makes a *generic* "next wallpaper"
+binding work without the daemon needing a special built-in for it — bind
+`xisback --next` as the command, and since `--next` falls back to
+`$XISBACK_OUTPUT`/`$XISBACK_DESKTOP` when `--output`/`--desktop` aren't
+passed explicitly, it advances whichever layer was clicked.
+
+Double-click detection needs to briefly hold back the single-click action
+to see if a second click of the same button arrives within 400ms — but
+only when a `double` command is actually configured; with no double-click
+binding, single clicks fire the instant the button goes down, no delay.
+
+Command strings must not contain literal tab or newline characters (they're
+flattened to spaces if you try) since they travel as tab-separated protocol
+fields and newline-terminated config lines; point a command at a script if
+you need something more elaborate than a one-liner.
+
 ## Persistence
 
-On every successful `SET`, `CLEAR`, or `CLEARALL`, the daemon rewrites
-`$XDG_CONFIG_HOME/xisback.conf` (fallback `~/.config/xisback.conf`) with one
-line per active layer, in the same field format as `LIST` (no command
-prefix). On startup, before processing command-line arguments, the daemon
-reads that file and replays each line as a `SET`, restoring the previous
-session's state — so a plain `xisback` invoked with no arguments (e.g. from
-a login autostart entry) comes back up with the last configured
-wallpaper/slideshow instead of a blank desktop until someone reconfigures
-it.
+On every successful `SET`, `CLEAR`, `CLEARALL`, or `SETACTIONS`, the daemon
+rewrites `$XDG_CONFIG_HOME/xisback.conf` (fallback `~/.config/xisback.conf`)
+with one `LAYER\t...` line per active layer (same fields as `SET`, plus the
+leading tag) and one `ACTIONS\t...` line for the click bindings. On
+startup, before processing command-line arguments, the daemon reads that
+file and replays each line (`SET` for `LAYER` lines, `SETACTIONS` for the
+`ACTIONS` line), restoring the previous session's state — so a plain
+`xisback` invoked with no arguments (e.g. from a login autostart entry)
+comes back up with the last configured wallpaper/slideshow and click
+bindings instead of a blank desktop until someone reconfigures it.
+Pre-0.4 config files (unprefixed layer lines, no click actions) are still
+read on first load for a smooth upgrade; they get rewritten in the new
+tagged format on the next change.
 
 ## Python example
 
@@ -123,6 +168,12 @@ send("CLEARALL")
 send("SET\t*\t*\tfill\t300\t0\t1000\t/home/kiyoshi/Pictures/wall.jpg")
 
 print(send("LIST"))
+
+# left-click advances whatever layer was clicked; double-click shows a
+# notification with which output/desktop it was; right/middle left unbound
+send("SETACTIONS\txisback --next\t\t\tnotify-send \"clicked $XISBACK_OUTPUT / $XISBACK_DESKTOP\"")
+
+print(send("ACTIONS"))
 ```
 
 ## Important rule: don't overlap layers
