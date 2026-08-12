@@ -521,6 +521,14 @@ static Window create_layer_window(Layer *l, int x, int y, int w, int h)
     long desktopVal = (l->desktop < 0) ? 0xFFFFFFFFL : (long)l->desktop;
     XChangeProperty(g_dpy, win, wmDesktop, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&desktopVal, 1);
 
+    /* ICCCM: tells the WM this window never wants keyboard focus, so a
+     * click on the wallpaper (needed for ButtonPress, below) doesn't
+     * steal focus from whatever the user was actually using. */
+    XWMHints hints;
+    hints.flags = InputHint;
+    hints.input = False;
+    XSetWMHints(g_dpy, win, &hints);
+
     XSelectInput(g_dpy, win, ButtonPressMask);
 
     return win;
