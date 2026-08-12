@@ -1157,7 +1157,7 @@ class MainWindow(QtWidgets.QMainWindow):
         bar = QtWidgets.QHBoxLayout()
         self.btn_detect = QtWidgets.QPushButton("Detect")
         self.btn_apply = QtWidgets.QPushButton("Apply")
-        self.chk_dry_run = QtWidgets.QCheckBox("Simulation mode (don't execute)")
+        self.chk_dry_run = QtWidgets.QCheckBox("Simulate only")
         self.chk_dry_run.setChecked(dry_run)
         bar.addWidget(self.btn_detect)
         bar.addWidget(self.btn_apply)
@@ -1225,7 +1225,7 @@ class MainWindow(QtWidgets.QMainWindow):
         canvas_layout.addWidget(self.view, 1)
 
         self.chk_dpi_visual = QtWidgets.QCheckBox(
-            "Drawing responds to DPI and Scale (shrinks/grows the box per output)")
+            "Drawing responds to DPI and Scale")
         self.chk_dpi_visual.setChecked(False)
         self.chk_dpi_visual.toggled.connect(lambda _checked: self._rebuild_scene())
         canvas_layout.addWidget(self.chk_dpi_visual)
@@ -1314,7 +1314,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ---- advanced driver properties (dynamic, per output) ----
         self.grp_extra_editable = QtWidgets.QGroupBox(
-            "Advanced properties (TearFree, underscan, scaling, PRIME, ...)")
+            "Advanced properties")
         self.form_extra_editable = QtWidgets.QFormLayout(self.grp_extra_editable)
 
         row_top = QtWidgets.QHBoxLayout()
@@ -1325,7 +1325,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Read-only properties can pile up (LUTs aside, some drivers expose
         # a dozen+), so they're split into 2 side-by-side forms (2 pairs of
         # label:value columns) instead of one long single-column list.
-        self.grp_extra_readonly = QtWidgets.QGroupBox("Other properties (read-only)")
+        self.grp_extra_readonly = QtWidgets.QGroupBox("Other properties")
         readonly_row = QtWidgets.QHBoxLayout(self.grp_extra_readonly)
         self.form_extra_readonly = QtWidgets.QFormLayout()
         self.form_extra_readonly2 = QtWidgets.QFormLayout()
@@ -1440,12 +1440,6 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addRow(self.chk_pointer_tapping)
 
         layout.addWidget(grp)
-        note = QtWidgets.QLabel(
-            "Read/applied via xinput (libinput properties). Controls are "
-            "disabled when the selected device doesn't support that "
-            "property (e.g. tapping on a mouse with no touchpad).")
-        note.setWordWrap(True)
-        layout.addWidget(note)
 
         grp_kbd = QtWidgets.QGroupBox("Key repeat")
         form_kbd = QtWidgets.QFormLayout(grp_kbd)
@@ -1505,12 +1499,6 @@ class MainWindow(QtWidgets.QMainWindow):
             "KickHotkeysOnRelease — switches keyboard layout on hotkey release")
         self.chk_kick_hotkeys.toggled.connect(lambda _v: self._update_dirty_indicators())
         vform_special.addWidget(self.chk_kick_hotkeys)
-
-        special_note = QtWidgets.QLabel(
-            "Read/applied via xinput, on the master keyboard device's "
-            "property.")
-        special_note.setWordWrap(True)
-        vform_special.addWidget(special_note)
 
         layout.addWidget(grp_special)
         layout.addStretch(1)
@@ -1683,41 +1671,14 @@ class MainWindow(QtWidgets.QMainWindow):
         path_row.addWidget(btn_wp_folder)
         form.addRow("Image or folder:", path_row)
 
-        path_note = QtWidgets.QLabel(
-            "A folder is treated as a slideshow (every image file inside "
-            "it, in alphabetical or shuffled order); the interval above "
-            "only applies in that case.")
-        path_note.setWordWrap(True)
-        form.addRow(path_note)
-
         btn_set = QtWidgets.QPushButton("Set layer")
         btn_set.clicked.connect(self._on_wallpaper_set)
         form.addRow(btn_set)
 
-        overlap_note = QtWidgets.QLabel(
-            "xisback does not validate overlap between layers: an "
-            "output=*/desktop=* layer covering the whole screen at the "
-            "same time as a specific output/desktop layer is an "
-            "inconsistent setup. When switching schemes (e.g. one global "
-            "wallpaper -> one per output), use \"Clear all layers\" "
-            "first.")
-        overlap_note.setWordWrap(True)
-        overlap_note.setStyleSheet(f"color: {SELECT_BORDER};")
-        form.addRow(overlap_note)
-
         layout.addWidget(grp_set)
 
-        grp_actions = QtWidgets.QGroupBox("Click actions (global, any layer)")
+        grp_actions = QtWidgets.QGroupBox("Click actions")
         aform = QtWidgets.QFormLayout(grp_actions)
-
-        actions_note = QtWidgets.QLabel(
-            "Shell command to run when a wallpaper window is clicked. Runs "
-            "detached with XISBACK_OUTPUT/XISBACK_DESKTOP set to the "
-            "clicked layer, so e.g. \"xisback --next\" advances whichever "
-            "layer was clicked. Leave blank for no action. Double-click is "
-            "detected regardless of which button.")
-        actions_note.setWordWrap(True)
-        aform.addRow(actions_note)
 
         self.edit_action_left = QtWidgets.QLineEdit()
         self.edit_action_left.setPlaceholderText("e.g. xisback --next")
@@ -1928,13 +1889,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_disable_primary_sel.toggled.connect(lambda _v: self._update_dirty_indicators())
         vform_special.addWidget(self.chk_disable_primary_sel)
 
-        special_note = QtWidgets.QLabel("Read/applied via xprop (root window property).")
-        special_note.setWordWrap(True)
-        vform_special.addWidget(special_note)
-
         layout.addWidget(grp_special)
 
-        grp = QtWidgets.QGroupBox("DPMS (monitor power saving)")
+        grp = QtWidgets.QGroupBox("DPMS")
         form = QtWidgets.QFormLayout(grp)
 
         self.chk_dpms_enabled = QtWidgets.QCheckBox("DPMS enabled")
@@ -1992,22 +1949,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_desktop_count.valueChanged.connect(self._set_desktop_count)
         form_desktops.addRow("Number of desktops:", self.spin_desktop_count)
 
-        self.lbl_desktop_note = QtWidgets.QLabel()
-        self.lbl_desktop_note.setWordWrap(True)
-        if self.wmctrl_available:
-            self.lbl_desktop_note.setText(
-                "Applied via `wmctrl -n N` (EWMH _NET_NUMBER_OF_DESKTOPS "
-                "request). Depends on the window manager honoring it -- "
-                "some WMs (e.g. i3, sway) manage workspaces their own way "
-                "and ignore this.")
-        else:
+        if not self.wmctrl_available:
+            self.lbl_desktop_note = QtWidgets.QLabel()
+            self.lbl_desktop_note.setWordWrap(True)
             self.lbl_desktop_note.setText(
                 "wmctrl not found in PATH -- install it to change the "
                 "desktop count from here (the field above is read-only "
                 "until then).")
             self.lbl_desktop_note.setStyleSheet(f"color: {SELECT_BORDER};")
             self.spin_desktop_count.setEnabled(False)
-        form_desktops.addRow(self.lbl_desktop_note)
+            form_desktops.addRow(self.lbl_desktop_note)
 
         layout.addWidget(grp_desktops)
         layout.addStretch(1)
@@ -2131,14 +2082,6 @@ class MainWindow(QtWidgets.QMainWindow):
         rv.addLayout(row_btns)
 
         layout.addWidget(grp_rules, 1)
-
-        note = QtWidgets.QLabel(
-            "Rule changes (Add/Remove/Reload) act immediately on xisguard, "
-            "same as the Wallpaper tab -- they aren't part of the staged "
-            "Apply. Removing a rule doesn't retract access already granted "
-            "to a client in the current session, only future decisions.")
-        note.setWordWrap(True)
-        layout.addWidget(note)
 
         layout.addStretch(1)
         return outer_tab
