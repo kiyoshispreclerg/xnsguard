@@ -812,6 +812,20 @@ def xisback_list():
     return layers
 
 
+def xisback_get_actions():
+    """Returns a {"left", "right", "middle", "double"} dict of the
+    currently configured click-action commands (global, not per-layer), or
+    None if the daemon couldn't be reached."""
+    try:
+        resp = _xisback_send("ACTIONS")
+    except OSError:
+        return None
+    lines = resp.splitlines()
+    parts = lines[0].split("\t") if lines else []
+    parts += [""] * (4 - len(parts))
+    return dict(zip(("left", "right", "middle", "double"), parts[:4]))
+
+
 def detect_desktop_count():
     """Number of virtual desktops via the root window's NETWM property,
     used to populate the desktop picker (SET's <desktop> field is a
@@ -1573,6 +1587,10 @@ class MainWindow(QtWidgets.QMainWindow):
         lv.addWidget(self.tbl_wallpaper)
 
         row_btns = QtWidgets.QHBoxLayout()
+        btn_next = QtWidgets.QPushButton("Next slide")
+        btn_next.setToolTip("Advance the selected layer's slideshow now (no-op if it isn't a slideshow).")
+        btn_next.clicked.connect(self._on_wallpaper_next)
+        row_btns.addWidget(btn_next)
         btn_clear_selected = QtWidgets.QPushButton("Clear selected layer")
         btn_clear_selected.clicked.connect(self._on_wallpaper_clear_selected)
         row_btns.addWidget(btn_clear_selected)
@@ -1661,6 +1679,37 @@ class MainWindow(QtWidgets.QMainWindow):
         qlayout.addStretch(1)
         layout.addWidget(grp_quick)
 
+        grp_actions = QtWidgets.QGroupBox("Click actions (global, any layer)")
+        aform = QtWidgets.QFormLayout(grp_actions)
+
+        actions_note = QtWidgets.QLabel(
+            "Shell command to run when a wallpaper window is clicked. Runs "
+            "detached with XISBACK_OUTPUT/XISBACK_DESKTOP set to the "
+            "clicked layer, so e.g. \"xisback --next\" advances whichever "
+            "layer was clicked. Leave blank for no action. Double-click is "
+            "detected regardless of which button.")
+        actions_note.setWordWrap(True)
+        aform.addRow(actions_note)
+
+        self.edit_action_left = QtWidgets.QLineEdit()
+        self.edit_action_left.setPlaceholderText("e.g. xisback --next")
+        aform.addRow("Left click:", self.edit_action_left)
+
+        self.edit_action_right = QtWidgets.QLineEdit()
+        aform.addRow("Right click:", self.edit_action_right)
+
+        self.edit_action_middle = QtWidgets.QLineEdit()
+        aform.addRow("Middle click:", self.edit_action_middle)
+
+        self.edit_action_double = QtWidgets.QLineEdit()
+        aform.addRow("Double-click:", self.edit_action_double)
+
+        btn_actions_save = QtWidgets.QPushButton("Save click actions")
+        btn_actions_save.clicked.connect(self._on_actions_save)
+        aform.addRow(btn_actions_save)
+
+        layout.addWidget(grp_actions)
+
         return tab
 
     def _pick_wallpaper_file(self):
@@ -1743,6 +1792,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._wallpaper_send(f"SET\t{output}\t{desktop}\t{mode}\t{interval}\t{shuffle}\t{fade_ms}\t{path}")
         self._refresh_wallpaper()
 
+    def _on_wallpaper_next(self):
+        rows = self.tbl_wallpaper.selectionModel().selectedRows()
+        if not rows:
+            QtWidgets.QMessageBox.information(
+                self, "No selection", "Select a layer in the table first.")
+            return
+        row = rows[0].row()
+        output = self.tbl_wallpaper.item(row, 0).text()
+        desktop = self.tbl_wallpaper.item(row, 1).text()
+        self._wallpaper_send(f"NEXT\t{output}\t{desktop}")
+        self._refresh_wallpaper()
+
     def _on_wallpaper_clear_selected(self):
         rows = self.tbl_wallpaper.selectionModel().selectedRows()
         if not rows:
@@ -1771,6 +1832,14 @@ class MainWindow(QtWidgets.QMainWindow):
         fade_ms = round(self.spin_wp_fade.value() * 1000)
         self._wallpaper_send("CLEARALL")
         self._wallpaper_send(f"SET\t*\t*\t{mode}\t{interval}\t{shuffle}\t{fade_ms}\t{path}")
+        self._refresh_wallpaper()
+
+    def _on_actions_save(self):
+        left = self.edit_action_left.text()
+        right = self.edit_action_right.text()
+        middle = self.edit_action_middle.text()
+        double = self.edit_action_double.text()
+        self._wallpaper_send(f"SETACTIONS\t{left}\t{right}\t{middle}\t{double}")
         self._refresh_wallpaper()
 
     def _refresh_wallpaper(self):
@@ -1809,6 +1878,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 else:
                     value = layer[key]
                 self.tbl_wallpaper.setItem(row, col, QtWidgets.QTableWidgetItem(value))
+
+        actions = xisback_get_actions()
+        if actions is not None:
+            self.edit_action_left.setText(actions["left"])
+            self.edit_action_right.setText(actions["right"])
+            self.edit_action_middle.setText(actions["middle"])
+            self.edit_action_double.setText(actions["double"])
 
     # ---------------------------------------------------------------- Other tab
 
