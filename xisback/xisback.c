@@ -487,6 +487,31 @@ static int resolve_output_geometry(const char *name, int *ox, int *oy, int *ow, 
     return found;
 }
 
+/* Fills `names` with the currently connected, actively-driven (has a CRTC)
+ * XRandR output names, in their natural enumeration order. Used to
+ * reconcile config output names against reality at startup -- see
+ * build_output_rename_map(). */
+static int list_connected_outputs(char names[][64], int max)
+{
+    XRRScreenResources *res = XRRGetScreenResourcesCurrent(g_dpy, g_root);
+    if (!res) {
+        return 0;
+    }
+    int n = 0;
+    for (int i = 0; i < res->noutput && n < max; i++) {
+        XRROutputInfo *oi = XRRGetOutputInfo(g_dpy, res, res->outputs[i]);
+        if (oi && oi->connection == RR_Connected && oi->crtc) {
+            snprintf(names[n], 64, "%s", oi->name);
+            n++;
+        }
+        if (oi) {
+            XRRFreeOutputInfo(oi);
+        }
+    }
+    XRRFreeScreenResources(res);
+    return n;
+}
+
 static void layer_geometry(Layer *l, int *x, int *y, int *w, int *h)
 {
     if (strcmp(l->output, "*") == 0 || !resolve_output_geometry(l->output, x, y, w, h)) {
@@ -862,8 +887,141 @@ static void save_config(void)
     }
 }
 
+typedef struct {
+    char from[64];
+    char to[64];
+} OutputRename;
+
+/* Reconciles the config's output names against what's actually connected
+ * right now. Outputs get renamed by drivers/re-plugging often enough that a
+ * saved "HDMI-1" layer can silently stop matching anything on the next
+ * boot -- layer_geometry() then falls back to full-screen for it, and with
+ * one full-screen layer per originally-per-output wallpaper stacked on top
+ * of each other, it looks like a single wallpaper covering everything.
+ *
+ * Names that already match exactly are left alone. The remaining
+ * (config name, real name) pairs are only auto-matched positionally when
+ * their counts agree -- i.e. the monitor count didn't change, just the
+ * names -- since that's the one case where "just renumber them in order"
+ * is a safe guess rather than a coin flip. Returns the number of pairs
+ * written to `map` (possibly 0, meaning no remapping is needed or possible). */
+static int build_output_rename_map(const char *path, OutputRename *map, int max_map)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        return 0;
+    }
+
+    char cfg_outputs[MAX_LAYERS][64];
+    int n_cfg = 0;
+    char line[LINE_MAX_LEN];
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[--len] = 0;
+        }
+        if (len == 0) {
+            continue;
+        }
+        char *fields[8];
+        int nf = 0;
+        char *p = line;
+        fields[nf++] = p;
+        while (nf < 8 && (p = strchr(p, '\t'))) {
+            *p = 0;
+            p++;
+            fields[nf++] = p;
+        }
+        /* Same output field position in both the current "LAYER\t..." format
+         * and the pre-0.4 unprefixed one. */
+        const char *output = (strcmp(fields[0], "LAYER") == 0 && nf >= 2) ? fields[1]
+                            : (nf == 7) ? fields[0]
+                            : NULL;
+        if (!output || strcmp(output, "*") == 0) {
+            continue;
+        }
+        int dup = 0;
+        for (int i = 0; i < n_cfg; i++) {
+            if (strcmp(cfg_outputs[i], output) == 0) {
+                dup = 1;
+                break;
+            }
+        }
+        if (!dup && n_cfg < MAX_LAYERS) {
+            snprintf(cfg_outputs[n_cfg], sizeof(cfg_outputs[n_cfg]), "%s", output);
+            n_cfg++;
+        }
+    }
+    fclose(f);
+
+    char real_outputs[MAX_LAYERS][64];
+    int n_real = list_connected_outputs(real_outputs, MAX_LAYERS);
+
+    if (n_cfg == 0 || n_cfg != n_real) {
+        return 0;
+    }
+
+    char unmatched_cfg[MAX_LAYERS][64];
+    char unmatched_real[MAX_LAYERS][64];
+    int n_unmatched_cfg = 0, n_unmatched_real = 0;
+
+    for (int i = 0; i < n_cfg; i++) {
+        int found = 0;
+        for (int j = 0; j < n_real; j++) {
+            if (strcmp(cfg_outputs[i], real_outputs[j]) == 0) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            snprintf(unmatched_cfg[n_unmatched_cfg], sizeof(unmatched_cfg[0]), "%s", cfg_outputs[i]);
+            n_unmatched_cfg++;
+        }
+    }
+    for (int j = 0; j < n_real; j++) {
+        int found = 0;
+        for (int i = 0; i < n_cfg; i++) {
+            if (strcmp(real_outputs[j], cfg_outputs[i]) == 0) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            snprintf(unmatched_real[n_unmatched_real], sizeof(unmatched_real[0]), "%s", real_outputs[j]);
+            n_unmatched_real++;
+        }
+    }
+
+    /* n_unmatched_cfg == n_unmatched_real is guaranteed here: n_cfg == n_real
+     * and both lists remove the same exactly-matched names from equal-size
+     * pools. */
+    int n_map = 0;
+    for (int i = 0; i < n_unmatched_cfg && n_map < max_map; i++) {
+        snprintf(map[n_map].from, sizeof(map[n_map].from), "%s", unmatched_cfg[i]);
+        snprintf(map[n_map].to, sizeof(map[n_map].to), "%s", unmatched_real[i]);
+        n_map++;
+    }
+    return n_map;
+}
+
+static const char *apply_output_rename(const OutputRename *map, int n_map, const char *name)
+{
+    for (int i = 0; i < n_map; i++) {
+        if (strcmp(map[i].from, name) == 0) {
+            return map[i].to;
+        }
+    }
+    return name;
+}
+
 static void load_config(void)
 {
+    OutputRename rename_map[MAX_LAYERS];
+    int n_rename = build_output_rename_map(g_configpath, rename_map, MAX_LAYERS);
+    for (int i = 0; i < n_rename; i++) {
+        fprintf(stderr, "xisback: config: output '%s' not found but screen count still matches, using '%s' instead (by screen order)\n", rename_map[i].from, rename_map[i].to);
+    }
+
     FILE *f = fopen(g_configpath, "r");
     if (!f) {
         return;
@@ -894,8 +1052,9 @@ static void load_config(void)
                 continue;
             }
             enum mode mode = (strcmp(fields[3], "stretch") == 0) ? MODE_STRETCH : MODE_FILL;
+            const char *output = apply_output_rename(rename_map, n_rename, fields[1]);
             char errbuf[256];
-            if (layer_apply_set(fields[1], parse_desktop(fields[2]), mode, atoi(fields[4]), atoi(fields[5]), atoi(fields[6]), fields[7], errbuf, sizeof(errbuf)) != 0) {
+            if (layer_apply_set(output, parse_desktop(fields[2]), mode, atoi(fields[4]), atoi(fields[5]), atoi(fields[6]), fields[7], errbuf, sizeof(errbuf)) != 0) {
                 fprintf(stderr, "xisback: config: %s\n", errbuf);
             }
         } else if (strcmp(fields[0], "ACTIONS") == 0) {
@@ -912,8 +1071,9 @@ static void load_config(void)
              * them so upgrading the binary doesn't silently drop whatever
              * wallpaper was already configured. */
             enum mode mode = (strcmp(fields[2], "stretch") == 0) ? MODE_STRETCH : MODE_FILL;
+            const char *output = apply_output_rename(rename_map, n_rename, fields[0]);
             char errbuf[256];
-            if (layer_apply_set(fields[0], parse_desktop(fields[1]), mode, atoi(fields[3]), atoi(fields[4]), atoi(fields[5]), fields[6], errbuf, sizeof(errbuf)) != 0) {
+            if (layer_apply_set(output, parse_desktop(fields[1]), mode, atoi(fields[3]), atoi(fields[4]), atoi(fields[5]), fields[6], errbuf, sizeof(errbuf)) != 0) {
                 fprintf(stderr, "xisback: config: %s\n", errbuf);
             }
         } else {
