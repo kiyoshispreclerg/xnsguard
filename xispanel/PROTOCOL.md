@@ -127,10 +127,20 @@ Widget types implemented so far:
   button, it shrinks to as little as one button wide and shows a small
   up/down arrow pair (one task at a time) instead of overflowing the
   panel -- see "Widget sizing" below.
+- `winctl`: active-window icon + title, plus configurable window-control
+  buttons -- similar to KDE's "Active Window Control" plasmoid. Options:
+  `buttons=<comma-list>` (any of `min`, `max`, `close`, in the order given
+  -- default `min,max,close`), `show=maximized|always` (only show the
+  buttons while the active window is maximized, or always -- default
+  `maximized`), `side=start|end` (buttons before or after the icon/title,
+  *within this widget* -- default `end`). The maximize button draws as a
+  single square when the active window isn't maximized and as two
+  overlapping squares (restore) when it is. Polls `_NET_ACTIVE_WINDOW`
+  every ~300ms, same tradeoff as `tasklist`'s polling.
 
-More widget types (tray, window controls, global menu, launcher, system
-monitor) are later phases -- see the plan this tool was built from; they
-are not implemented yet.
+More widget types (tray, global menu, launcher, system monitor) are later
+phases -- see the plan this tool was built from; they are not implemented
+yet.
 
 ### Widget sizing
 
@@ -183,9 +193,10 @@ own file" structure:
   (activate/close/minimize/maximize/move), plus `_NET_WM_ICON` decoding
   and the icon/text drawing helpers built on top of it.
 - `menu.c`: the generic context-menu popup described above.
-- `widgets/spacer.c`, `widgets/clock.c`, `widgets/tasklist.c`: one file
-  per widget type. Adding a new type is "write `widgets/foo.c` defining a
-  `PanelWidgetOps foo_ops`, declare it `extern` in `xispanel.h`, add it to
+- `widgets/spacer.c`, `widgets/clock.c`, `widgets/tasklist.c`,
+  `widgets/winctl.c`: one file per widget type. Adding a new type is
+  "write `widgets/foo.c` defining a `PanelWidgetOps foo_ops`, declare it
+  `extern` in `xispanel.h`, add it to
   the registry array in `xispanel.c`" -- no other file needs to change.
 
 ## Design notes

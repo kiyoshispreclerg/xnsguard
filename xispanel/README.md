@@ -22,9 +22,15 @@ Imlib2 for image decoding -- the same dependency spirit as
   out shortly after).
 - A small widget system (compile-time registry, no plugins/dlopen), each
   type in its own file under [widgets/](widgets/): `spacer` (fixed or
-  greedy/fill), `clock`, and `tasklist` (EWMH-based, wide/compact modes,
-  per-window context menu with minimize/maximize/move/close/pin -- see
-  [PROTOCOL.md](PROTOCOL.md)).
+  greedy/fill), `clock`, `tasklist` (EWMH-based, wide/compact modes,
+  per-window context menu with minimize/maximize/move/close/pin, shrinks
+  to a scrollable strip with an up/down arrow pair when it doesn't fit),
+  and `winctl` (active window's icon/title + configurable
+  minimize/maximize/close buttons, similar to KDE's Active Window Control
+  -- see [PROTOCOL.md](PROTOCOL.md)).
+- Widgets that don't fit the panel's available space shrink toward a
+  per-type minimum instead of overflowing it (see PROTOCOL.md's "Widget
+  sizing").
 - A generic context-menu popup any widget can use for itself or a
   sub-item, not just the panel as a whole.
 - Basic theming: background/foreground color with alpha (real per-pixel
@@ -74,6 +80,7 @@ Example config:
 PANEL	top	*	edge=top	pct=100	thickness=32	mode=dock
 WIDGET	top	0	tasklist	mode=wide
 WIDGET	top	1	spacer
-WIDGET	top	2	clock	format=%H:%M
+WIDGET	top	2	winctl	buttons=min,max,close	show=maximized
+WIDGET	top	3	clock	format=%H:%M
 THEME	top	bg=#202020cc	fg=#eeeeee	spacing=6
 ```

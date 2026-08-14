@@ -187,5 +187,6 @@ int panel_menu_handle_event(const XEvent *ev);
 extern const PanelWidgetOps spacer_ops;
 extern const PanelWidgetOps clock_ops;
 extern const PanelWidgetOps tasklist_ops;
+extern const PanelWidgetOps winctl_ops;
 
 #endif

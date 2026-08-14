@@ -239,6 +239,7 @@ static const PanelWidgetOps *g_widget_registry[] = {
     &spacer_ops,
     &clock_ops,
     &tasklist_ops,
+    &winctl_ops,
     NULL,
 };
 
