@@ -34,7 +34,7 @@ static void clock_on_tick(PanelWidget *w, uint64_t now)
     w->next_tick_ms = now + 1000;
 }
 
-static void clock_measure(PanelWidget *w, int cross_axis, int *out_len)
+static void clock_measure(PanelWidget *w, int cross_axis, int *out_len, int *out_min_len)
 {
     (void)cross_axis;
     ClockPriv *cp = w->priv;
@@ -43,6 +43,7 @@ static void clock_measure(PanelWidget *w, int cross_axis, int *out_len)
     cairo_text_extents_t ext;
     cairo_text_extents(p->cr, sample, &ext);
     *out_len = (int)ext.x_advance + 16;
+    *out_min_len = *out_len; /* a clipped clock is worse than useless -- don't shrink it */
 }
 
 static void clock_paint(PanelWidget *w, cairo_t *cr)

@@ -17,11 +17,12 @@ static int spacer_init(PanelWidget *w)
     return 0;
 }
 
-static void spacer_measure(PanelWidget *w, int cross_axis, int *out_len)
+static void spacer_measure(PanelWidget *w, int cross_axis, int *out_len, int *out_min_len)
 {
     (void)cross_axis;
     SpacerPriv *sp = w->priv;
     *out_len = sp->fixed_size > 0 ? sp->fixed_size : -1;
+    *out_min_len = 0; /* first thing squeezed out when space runs short */
 }
 
 static void spacer_paint(PanelWidget *w, cairo_t *cr)

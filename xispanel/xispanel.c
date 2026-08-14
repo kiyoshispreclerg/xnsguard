@@ -103,6 +103,13 @@ static char g_configpath[PATH_MAX];
 static FT_Library g_ft_lib;
 static FT_Face g_ft_face;
 
+/* Only needed for dock-mode windows, which (unlike overlay/autohide) are
+ * managed rather than override-redirect -- see panel_create_window(). */
+static Atom g_atom_net_wm_state;
+static Atom g_atom_net_wm_state_skip_taskbar;
+static Atom g_atom_net_wm_state_skip_pager;
+static Atom g_atom_net_wm_desktop;
+
 /* ------------------------------------------------------------------ */
 /* small helpers exposed to widgets                                     */
 /* ------------------------------------------------------------------ */
@@ -412,9 +419,19 @@ static void panel_pick_visual(Panel *p)
 
 static Window panel_create_window(Panel *p, int x, int y, int w, int h)
 {
+    /* dock mode needs to be a WM-managed window: this KWin fork's strut
+     * handling (workspace.cpp's updateClientArea()) only walks its list of
+     * managed clients, never the separate unmanaged/override-redirect list
+     * -- so an override-redirect panel can set _NET_WM_STRUT_PARTIAL all it
+     * wants and no screen space will ever actually be reserved. overlay/
+     * autohide don't need struts at all, so they stay override-redirect to
+     * avoid the WM ever touching their position (matters for the autohide
+     * slide animation). */
+    int managed = (p->mode == MODE_DOCK);
+
     XSetWindowAttributes attrs;
     memset(&attrs, 0, sizeof(attrs));
-    attrs.override_redirect = True;
+    attrs.override_redirect = managed ? False : True;
     attrs.colormap = p->cmap;
     attrs.border_pixel = 0;
     attrs.background_pixel = 0;
@@ -430,6 +447,41 @@ static Window panel_create_window(Panel *p, int x, int y, int w, int h)
     XSetClassHint(g_dpy, win, &ch);
 
     XChangeProperty(g_dpy, win, g_atom_wm_window_type, XA_ATOM, 32, PropModeReplace, (unsigned char *)&g_atom_wm_window_type_dock, 1);
+
+    if (managed) {
+        /* ICCCM input=False: never wants keyboard focus, so click-to-focus
+         * policies must never give it focus (mouse clicks still work --
+         * ButtonPress delivery doesn't require focus). */
+        XWMHints hints;
+        memset(&hints, 0, sizeof(hints));
+        hints.flags = InputHint;
+        hints.input = False;
+        XSetWMHints(g_dpy, win, &hints);
+
+        /* ICCCM PPosition: tells the WM the position was chosen by the
+         * application, not left to the placement policy -- otherwise a
+         * managed window's initial x/y is only a hint some WMs ignore. */
+        XSizeHints sh;
+        memset(&sh, 0, sizeof(sh));
+        sh.flags = PPosition | PSize;
+        sh.x = x;
+        sh.y = y;
+        sh.width = w;
+        sh.height = h;
+        XSetWMNormalHints(g_dpy, win, &sh);
+
+        /* Initial _NET_WM_STATE: read by the WM at manage() time, same as
+         * if these had been requested via a _NET_WM_STATE client message
+         * after mapping. Keeps the panel out of the taskbar/pager despite
+         * now being a real managed window. */
+        Atom states[2] = {g_atom_net_wm_state_skip_taskbar, g_atom_net_wm_state_skip_pager};
+        XChangeProperty(g_dpy, win, g_atom_net_wm_state, XA_ATOM, 32, PropModeReplace, (unsigned char *)states, 2);
+
+        /* All desktops. */
+        long all_desktops = -1;
+        XChangeProperty(g_dpy, win, g_atom_net_wm_desktop, XA_CARDINAL, 32, PropModeReplace,
+                         (unsigned char *)&all_desktops, 1);
+    }
 
     return win;
 }
@@ -470,10 +522,15 @@ static void panel_create_surface(Panel *p)
 {
     p->surface = cairo_xlib_surface_create(g_dpy, p->win, p->visual, p->w, p->h);
     p->cr = cairo_create(p->surface);
+
+    p->buf_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, p->w, p->h);
+    p->buf_cr = cairo_create(p->buf_surface);
     if (g_font_face) {
         cairo_set_font_face(p->cr, g_font_face);
+        cairo_set_font_face(p->buf_cr, g_font_face);
     }
     cairo_set_font_size(p->cr, p->thickness * 0.45);
+    cairo_set_font_size(p->buf_cr, p->thickness * 0.45);
 }
 
 /* ------------------------------------------------------------------ */
@@ -484,34 +541,73 @@ static void panel_layout(Panel *p)
 {
     int axis_len = (p->edge == EDGE_TOP || p->edge == EDGE_BOTTOM) ? p->w : p->h;
     int lens[MAX_WIDGETS];
+    int mins[MAX_WIDGETS];
     int n_greedy = 0;
     int fixed_total = 0;
+    int min_total = 0;
 
     for (int i = 0; i < p->n_widgets; i++) {
         PanelWidget *w = &p->widgets[i];
         int out_len = 0;
+        int out_min = 0;
         if (w->ops->measure) {
-            w->ops->measure(w, p->thickness, &out_len);
+            w->ops->measure(w, p->thickness, &out_len, &out_min);
         }
         lens[i] = out_len;
         if (out_len < 0) {
             n_greedy++;
+            mins[i] = 0;
         } else {
             fixed_total += out_len;
+            mins[i] = out_min < 0 ? 0 : (out_min > out_len ? out_len : out_min);
+            min_total += mins[i];
         }
     }
 
     int spacing_total = p->spacing * (p->n_widgets > 0 ? p->n_widgets - 1 : 0);
-    int remaining = axis_len - fixed_total - spacing_total;
-    int greedy_each = (n_greedy > 0 && remaining > 0) ? remaining / n_greedy : 0;
+    int available = axis_len - spacing_total;
+    if (available < 0) {
+        available = 0;
+    }
+
+    int final_lens[MAX_WIDGETS];
+
+    if (fixed_total <= available) {
+        /* Everyone gets their desired size; greedy widgets split whatever
+         * is left over. */
+        int remaining = available - fixed_total;
+        int greedy_each = (n_greedy > 0 && remaining > 0) ? remaining / n_greedy : 0;
+        for (int i = 0; i < p->n_widgets; i++) {
+            final_lens[i] = lens[i] < 0 ? greedy_each : lens[i];
+        }
+    } else {
+        /* Doesn't fit even with every greedy widget at 0: shrink fixed
+         * widgets toward their reported minimum, proportionally to how
+         * much slack each one has, so no single widget eats the whole
+         * squeeze. If even every widget's minimum doesn't fit, this is a
+         * panel too small for its content -- everyone just gets their
+         * minimum and the last one(s) get slightly clipped, which is the
+         * best any layout can do here. */
+        int shrinkable = fixed_total - min_total;
+        int deficit = fixed_total - available;
+        if (deficit > shrinkable) {
+            deficit = shrinkable;
+        }
+        for (int i = 0; i < p->n_widgets; i++) {
+            if (lens[i] < 0) {
+                final_lens[i] = 0;
+                continue;
+            }
+            int slack = lens[i] - mins[i];
+            int shrink = (shrinkable > 0) ? (int)((int64_t)deficit * slack / shrinkable) : 0;
+            final_lens[i] = lens[i] - shrink;
+        }
+    }
 
     int cursor = 0;
     for (int i = 0; i < p->n_widgets; i++) {
         PanelWidget *w = &p->widgets[i];
-        int len = lens[i] < 0 ? greedy_each : lens[i];
-        if (len < 0) {
-            len = 0;
-        }
+        int len = final_lens[i] < 0 ? 0 : final_lens[i];
         w->x = cursor;
         w->len = len;
         w->thickness = p->thickness;
@@ -521,7 +617,7 @@ static void panel_layout(Panel *p)
 
 static void panel_repaint(Panel *p)
 {
-    if (!p->cr) {
+    if (!p->cr || !p->buf_cr) {
         return;
     }
 
@@ -529,11 +625,49 @@ static void panel_repaint(Panel *p)
      * from passing malformed UTF-8 to cairo_show_text -- window titles are
      * supposed to be UTF-8 but not every client is well-behaved), every
      * subsequent call on it becomes a silent no-op *permanently*, even
-     * cairo_save()/cairo_restore(). Since p->cr is reused across every
-     * repaint rather than recreated each time, one bad frame would
-     * otherwise blank the panel forever. Recreate it here instead of
-     * trusting every current and future widget to never make this
-     * mistake. */
+     * cairo_save()/cairo_restore(). Since these cairo_t's are reused across
+     * every repaint rather than recreated each time, one bad frame would
+     * otherwise blank the panel forever. Recreate here instead of trusting
+     * every current and future widget to never make this mistake. */
+    if (cairo_status(p->buf_cr) != CAIRO_STATUS_SUCCESS) {
+        fprintf(stderr, "xispanel: panel '%s': cairo error (%s), recreating drawing context\n", p->name,
+                cairo_status_to_string(cairo_status(p->buf_cr)));
+        cairo_destroy(p->buf_cr);
+        p->buf_cr = cairo_create(p->buf_surface);
+        if (g_font_face) {
+            cairo_set_font_face(p->buf_cr, g_font_face);
+        }
+        cairo_set_font_size(p->buf_cr, p->thickness * 0.45);
+    }
+
+    /* Every widget paints into the offscreen buf_cr/buf_surface first. Only
+     * the single cairo_paint() below (blitting the finished buffer onto the
+     * real, on-screen p->cr/surface) touches the window itself -- painting
+     * straight onto the xlib surface instead sent each widget's fills/
+     * strokes as its own X request, which a compositor could pick up
+     * mid-repaint and show as flicker (worst on tasklist, which repaints on
+     * every ~800ms poll tick even with nothing visibly different). */
+    cairo_save(p->buf_cr);
+    cairo_set_operator(p->buf_cr, CAIRO_OPERATOR_SOURCE);
+    cairo_set_source_rgba(p->buf_cr, p->bg_r, p->bg_g, p->bg_b, p->bg_a);
+    cairo_paint(p->buf_cr);
+    cairo_restore(p->buf_cr);
+
+    cairo_set_operator(p->buf_cr, CAIRO_OPERATOR_OVER);
+    for (int i = 0; i < p->n_widgets; i++) {
+        PanelWidget *w = &p->widgets[i];
+        if (w->ops->paint) {
+            cairo_save(p->buf_cr);
+            w->ops->paint(w, p->buf_cr);
+            cairo_restore(p->buf_cr);
+        }
+    }
+    cairo_surface_flush(p->buf_surface);
+
+    /* p->cr is also used directly by widgets' measure() (cairo_text_extents
+     * needs *some* cairo_t with the right font set, and measure() doesn't
+     * get one passed in) -- so it can be poisoned by bad UTF-8 same as
+     * buf_cr, even though it's mostly just the final blit target here. */
     if (cairo_status(p->cr) != CAIRO_STATUS_SUCCESS) {
         fprintf(stderr, "xispanel: panel '%s': cairo error (%s), recreating drawing context\n", p->name,
                 cairo_status_to_string(cairo_status(p->cr)));
@@ -547,19 +681,9 @@ static void panel_repaint(Panel *p)
 
     cairo_save(p->cr);
     cairo_set_operator(p->cr, CAIRO_OPERATOR_SOURCE);
-    cairo_set_source_rgba(p->cr, p->bg_r, p->bg_g, p->bg_b, p->bg_a);
+    cairo_set_source_surface(p->cr, p->buf_surface, 0, 0);
     cairo_paint(p->cr);
     cairo_restore(p->cr);
-
-    cairo_set_operator(p->cr, CAIRO_OPERATOR_OVER);
-    for (int i = 0; i < p->n_widgets; i++) {
-        PanelWidget *w = &p->widgets[i];
-        if (w->ops->paint) {
-            cairo_save(p->cr);
-            w->ops->paint(w, p->cr);
-            cairo_restore(p->cr);
-        }
-    }
     cairo_surface_flush(p->surface);
     XFlush(g_dpy);
     p->dirty = 0;
@@ -662,6 +786,14 @@ static void panel_destroy_widgets(Panel *p)
 static void panel_deactivate(Panel *p)
 {
     panel_destroy_widgets(p);
+    if (p->buf_cr) {
+        cairo_destroy(p->buf_cr);
+        p->buf_cr = NULL;
+    }
+    if (p->buf_surface) {
+        cairo_surface_destroy(p->buf_surface);
+        p->buf_surface = NULL;
+    }
     if (p->cr) {
         cairo_destroy(p->cr);
         p->cr = NULL;
@@ -1056,12 +1188,13 @@ static Panel *find_panel_by_window(Window win, int *is_sensor)
 static void dispatch_button(Panel *p, int button, int x, int y, int root_x, int root_y)
 {
     int axis_pos = (p->edge == EDGE_TOP || p->edge == EDGE_BOTTOM) ? x : y;
+    int cross_pos = (p->edge == EDGE_TOP || p->edge == EDGE_BOTTOM) ? y : x;
     for (int i = 0; i < p->n_widgets; i++) {
         PanelWidget *w = &p->widgets[i];
         if (axis_pos >= w->x && axis_pos < w->x + w->len) {
             if (w->ops->on_button) {
                 int local = axis_pos - w->x;
-                w->ops->on_button(w, button, local, 0, root_x, root_y);
+                w->ops->on_button(w, button, local, cross_pos, root_x, root_y);
             }
             return;
         }
@@ -1089,6 +1222,10 @@ static int run_as_daemon(const char *sockpath)
     }
 
     ewmh_init_atoms();
+    g_atom_net_wm_state = XInternAtom(g_dpy, "_NET_WM_STATE", False);
+    g_atom_net_wm_state_skip_taskbar = XInternAtom(g_dpy, "_NET_WM_STATE_SKIP_TASKBAR", False);
+    g_atom_net_wm_state_skip_pager = XInternAtom(g_dpy, "_NET_WM_STATE_SKIP_PAGER", False);
+    g_atom_net_wm_desktop = XInternAtom(g_dpy, "_NET_WM_DESKTOP", False);
 
     int rr_error_base;
     if (!XRRQueryExtension(g_dpy, &g_rr_event_base, &rr_error_base)) {

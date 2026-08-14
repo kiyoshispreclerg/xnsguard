@@ -33,8 +33,14 @@ typedef struct {
     void (*destroy)(PanelWidget *w);
     /* Reports desired size along the panel's main axis. out_len < 0 means
      * "greedy": fill whatever space is left after fixed-size widgets,
-     * split evenly among every greedy widget in the same panel. */
-    void (*measure)(PanelWidget *w, int cross_axis, int *out_len);
+     * split evenly among every greedy widget in the same panel.
+     * out_min_len is the smallest length the widget can still render
+     * something useful in -- panel_layout() shrinks fixed-size widgets
+     * toward their min (proportionally, never below it) when every
+     * widget's desired length doesn't fit the panel. A widget that can't
+     * meaningfully shrink (spacer, clock) just reports out_min_len ==
+     * out_len. */
+    void (*measure)(PanelWidget *w, int cross_axis, int *out_len, int *out_min_len);
     void (*paint)(PanelWidget *w, cairo_t *cr);
     /* root_x/root_y: screen-absolute click position, for widgets that pop
      * up a context menu (panel_menu_open() takes screen coordinates). */
@@ -87,6 +93,14 @@ struct Panel {
     Colormap cmap;
     cairo_surface_t *surface;
     cairo_t *cr;
+    /* Offscreen backing buffer: every widget paints here, then a single
+     * cairo_paint() blits the whole thing onto `surface` at the end of
+     * panel_repaint(). Painting each widget straight onto the on-screen
+     * xlib surface sent each fill/stroke as its own X request, which a
+     * compositor could pick up mid-repaint -- visible as flicker, worst on
+     * tasklist since it repaints on every ~800ms poll tick. */
+    cairo_surface_t *buf_surface;
+    cairo_t *buf_cr;
 
     int mapped;
     int dirty;
@@ -133,6 +147,7 @@ int ewmh_get_desktop(Window w); /* -1 = sticky/not set */
 void ewmh_get_state_flags(Window w, int *minimized, int *maximized);
 Window ewmh_get_active_window(void);
 int ewmh_get_number_of_desktops(void);
+int ewmh_skip_taskbar(Window w); /* 1 if a taskbar should never list this window */
 void ewmh_activate(Window w);
 void ewmh_close(Window w);
 void ewmh_toggle_maximize(Window w);

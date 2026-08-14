@@ -35,6 +35,8 @@ static Atom g_atom_net_wm_moveresize;
 static Atom g_atom_net_number_of_desktops;
 static Atom g_atom_wm_state; /* ICCCM WM_STATE, distinct from _NET_WM_STATE */
 static Atom g_atom_wm_change_state;
+static Atom g_atom_net_wm_state_skip_taskbar;
+static Atom g_atom_net_wm_window_type_desktop;
 
 #define ICON_PROP_MAX_LONGS 200000
 
@@ -61,6 +63,49 @@ void ewmh_init_atoms(void)
     g_atom_net_number_of_desktops = XInternAtom(g_dpy, "_NET_NUMBER_OF_DESKTOPS", False);
     g_atom_wm_state = XInternAtom(g_dpy, "WM_STATE", False);
     g_atom_wm_change_state = XInternAtom(g_dpy, "WM_CHANGE_STATE", False);
+    g_atom_net_wm_state_skip_taskbar = XInternAtom(g_dpy, "_NET_WM_STATE_SKIP_TASKBAR", False);
+    g_atom_net_wm_window_type_desktop = XInternAtom(g_dpy, "_NET_WM_WINDOW_TYPE_DESKTOP", False);
+}
+
+/* Windows a taskbar should never list: desktop/dock window types (KDE's
+ * own desktop containment layer and any other panel/dock, including
+ * xispanel's own panel windows before they're filtered by class), or
+ * anything explicitly asking to be skipped via _NET_WM_STATE_SKIP_TASKBAR. */
+int ewmh_skip_taskbar(Window w)
+{
+    Atom actual_type;
+    int actual_format;
+    unsigned long n_items, bytes_after;
+    unsigned char *prop = NULL;
+
+    if (XGetWindowProperty(g_dpy, w, g_atom_wm_window_type, 0, 16, False, XA_ATOM, &actual_type, &actual_format,
+                            &n_items, &bytes_after, &prop) == Success &&
+        prop) {
+        Atom *atoms = (Atom *)(void *)prop;
+        for (unsigned long i = 0; i < n_items; i++) {
+            if (atoms[i] == g_atom_net_wm_window_type_desktop || atoms[i] == g_atom_wm_window_type_dock) {
+                XFree(prop);
+                return 1;
+            }
+        }
+        XFree(prop);
+    }
+
+    prop = NULL;
+    if (XGetWindowProperty(g_dpy, w, g_atom_net_wm_state, 0, 32, False, XA_ATOM, &actual_type, &actual_format,
+                            &n_items, &bytes_after, &prop) == Success &&
+        prop) {
+        Atom *atoms = (Atom *)(void *)prop;
+        for (unsigned long i = 0; i < n_items; i++) {
+            if (atoms[i] == g_atom_net_wm_state_skip_taskbar) {
+                XFree(prop);
+                return 1;
+            }
+        }
+        XFree(prop);
+    }
+
+    return 0;
 }
 
 int ewmh_get_client_list(Window **out_list, int *out_n)

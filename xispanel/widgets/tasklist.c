@@ -29,6 +29,8 @@
 #define MAX_TASKS 64
 #define TASKLIST_BTN_GAP 3
 #define TASKLIST_WIDE_MAXW 180
+#define TASKLIST_ARROW_W 14
+#define TASKLIST_ARROW_GAP 4
 
 typedef struct {
     Window win;
@@ -46,8 +48,21 @@ typedef struct {
     TaskEntry tasks[MAX_TASKS];
     int n_tasks;
     int n_desktops;
-    int btn_x[MAX_TASKS];
-    int btn_w[MAX_TASKS];
+    int btn_w[MAX_TASKS]; /* natural (unclipped) width of each task's button */
+
+    /* Visible window into `tasks`, recomputed by tasklist_layout_visible()
+     * from the widget's *actual* allotted w->len (which panel_layout() may
+     * have shrunk below the natural total width computed above) every
+     * paint/on_button call -- cheap enough not to bother caching across
+     * calls, and guarantees paint() and on_button() can never disagree
+     * about where a button is. */
+    int scroll_offset; /* index into tasks[] of the first visible button */
+    int vis_idx[MAX_TASKS]; /* tasks[] index for each visible slot */
+    int vis_x[MAX_TASKS];
+    int vis_w[MAX_TASKS];
+    int n_visible;
+    int scrollable; /* 1 if not everything fits and the arrow pair is shown */
+    int arrow_x; /* local x of the up/down arrow pair, valid iff scrollable */
 } TasklistPriv;
 
 static int tasklist_find(TasklistPriv *tp, Window win)
@@ -99,6 +114,9 @@ static void tasklist_on_tick(PanelWidget *w, uint64_t now)
     int icon_px = w->thickness > 8 ? w->thickness - 8 : 16;
     for (int i = 0; i < n; i++) {
         Window win = list[i];
+        if (ewmh_skip_taskbar(win)) {
+            continue;
+        }
         int old_idx = tasklist_find(tp, win);
         TaskEntry *e = &fresh[n_fresh++];
         memset(e, 0, sizeof(*e));
@@ -129,7 +147,7 @@ static void tasklist_on_tick(PanelWidget *w, uint64_t now)
     tp->n_desktops = ewmh_get_number_of_desktops();
 }
 
-static void tasklist_measure(PanelWidget *w, int cross_axis, int *out_len)
+static void tasklist_measure(PanelWidget *w, int cross_axis, int *out_len, int *out_min_len)
 {
     TasklistPriv *tp = w->priv;
     Panel *p = w->panel;
@@ -147,11 +165,64 @@ static void tasklist_measure(PanelWidget *w, int cross_axis, int *out_len)
                 bw = TASKLIST_WIDE_MAXW;
             }
         }
-        tp->btn_x[i] = cursor;
         tp->btn_w[i] = bw;
         cursor += bw + TASKLIST_BTN_GAP;
     }
     *out_len = tp->n_tasks > 0 ? cursor - TASKLIST_BTN_GAP : 0;
+
+    /* Minimum: room for exactly one task button (compact-sized, since that's
+     * the smallest a button can usefully be) plus the up/down arrow pair
+     * that tasklist_layout_visible() reserves once scrolling kicks in. */
+    *out_min_len = tp->n_tasks > 0 ? (icon_px + 8 + TASKLIST_ARROW_W + TASKLIST_ARROW_GAP) : 0;
+}
+
+/* Recomputes which tasks are visible (tp->vis_*) from the widget's actual
+ * allotted w->len, which may be less than the natural width tasklist_measure()
+ * reported if panel_layout() had to shrink it to fit the panel. Called at
+ * the top of both paint() and on_button() so hit-testing and drawing can
+ * never disagree about where a button (or the scroll arrows) actually is. */
+static void tasklist_layout_visible(PanelWidget *w)
+{
+    TasklistPriv *tp = w->priv;
+
+    int natural_total = 0;
+    for (int i = 0; i < tp->n_tasks; i++) {
+        natural_total += tp->btn_w[i] + (i > 0 ? TASKLIST_BTN_GAP : 0);
+    }
+
+    tp->scrollable = natural_total > w->len;
+    int content_avail = tp->scrollable ? w->len - TASKLIST_ARROW_W - TASKLIST_ARROW_GAP : w->len;
+    if (content_avail < 0) {
+        content_avail = 0;
+    }
+
+    if (tp->scroll_offset >= tp->n_tasks) {
+        tp->scroll_offset = tp->n_tasks > 0 ? tp->n_tasks - 1 : 0;
+    }
+    if (tp->scroll_offset < 0) {
+        tp->scroll_offset = 0;
+    }
+
+    int cursor = 0;
+    tp->n_visible = 0;
+    for (int i = tp->scroll_offset; i < tp->n_tasks && tp->n_visible < MAX_TASKS; i++) {
+        int bw = tp->btn_w[i];
+        int gap = tp->n_visible > 0 ? TASKLIST_BTN_GAP : 0;
+        if (tp->n_visible > 0 && cursor + gap + bw > content_avail) {
+            break;
+        }
+        if (tp->n_visible == 0 && bw > content_avail) {
+            bw = content_avail; /* clip the single button that still fits */
+        }
+        cursor += gap;
+        tp->vis_idx[tp->n_visible] = i;
+        tp->vis_x[tp->n_visible] = cursor;
+        tp->vis_w[tp->n_visible] = bw;
+        cursor += bw;
+        tp->n_visible++;
+    }
+
+    tp->arrow_x = tp->scrollable ? w->len - TASKLIST_ARROW_W : -1;
 }
 
 static void tasklist_paint(PanelWidget *w, cairo_t *cr)
@@ -163,14 +234,16 @@ static void tasklist_paint(PanelWidget *w, cairo_t *cr)
     (void)owidth;
     (void)oheight;
 
+    tasklist_layout_visible(w);
+
     Window active = ewmh_get_active_window();
     int icon_px = w->thickness > 8 ? w->thickness - 8 : 16;
     int icon_y = oy + (w->thickness - icon_px) / 2;
 
-    for (int i = 0; i < tp->n_tasks; i++) {
-        TaskEntry *e = &tp->tasks[i];
-        int bx = ox + tp->btn_x[i];
-        int bw = tp->btn_w[i];
+    for (int vi = 0; vi < tp->n_visible; vi++) {
+        TaskEntry *e = &tp->tasks[tp->vis_idx[vi]];
+        int bx = ox + tp->vis_x[vi];
+        int bw = tp->vis_w[vi];
 
         if (e->win == active) {
             cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.18);
@@ -218,6 +291,28 @@ static void tasklist_paint(PanelWidget *w, cairo_t *cr)
         }
         cairo_pop_group_to_source(cr);
         cairo_paint_with_alpha(cr, e->minimized ? 0.55 : 1.0);
+    }
+
+    if (tp->scrollable) {
+        int ax = ox + tp->arrow_x;
+        int half = w->thickness / 2;
+        int can_up = tp->scroll_offset > 0;
+        int can_down = tp->vis_idx[tp->n_visible - 1] < tp->n_tasks - 1;
+        double cx = ax + TASKLIST_ARROW_W / 2.0;
+
+        cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, can_up ? 0.85 : 0.25);
+        cairo_move_to(cr, cx - 4, oy + half - 3);
+        cairo_line_to(cr, cx + 4, oy + half - 3);
+        cairo_line_to(cr, cx, oy + 2);
+        cairo_close_path(cr);
+        cairo_fill(cr);
+
+        cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, can_down ? 0.85 : 0.25);
+        cairo_move_to(cr, cx - 4, oy + half + 3);
+        cairo_line_to(cr, cx + 4, oy + half + 3);
+        cairo_line_to(cr, cx, oy + w->thickness - 2);
+        cairo_close_path(cr);
+        cairo_fill(cr);
     }
 }
 
@@ -267,12 +362,27 @@ static void tasklist_menu_select(Panel *panel, PanelWidget *w, void *ctx, int in
 
 static int tasklist_on_button(PanelWidget *w, int button, int local_x, int local_y, int root_x, int root_y)
 {
-    (void)local_y;
     TasklistPriv *tp = w->priv;
+    tasklist_layout_visible(w);
+
+    if (tp->scrollable && local_x >= tp->arrow_x && button == Button1) {
+        if (local_y < w->thickness / 2) {
+            if (tp->scroll_offset > 0) {
+                tp->scroll_offset--;
+            }
+        } else {
+            if (tp->n_visible > 0 && tp->vis_idx[tp->n_visible - 1] < tp->n_tasks - 1) {
+                tp->scroll_offset++;
+            }
+        }
+        w->panel->dirty = 1;
+        return 1;
+    }
+
     int idx = -1;
-    for (int i = 0; i < tp->n_tasks; i++) {
-        if (local_x >= tp->btn_x[i] && local_x < tp->btn_x[i] + tp->btn_w[i]) {
-            idx = i;
+    for (int vi = 0; vi < tp->n_visible; vi++) {
+        if (local_x >= tp->vis_x[vi] && local_x < tp->vis_x[vi] + tp->vis_w[vi]) {
+            idx = tp->vis_idx[vi];
             break;
         }
     }

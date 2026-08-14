@@ -120,11 +120,30 @@ Widget types implemented so far:
   currently a visual-only toggle for the running session -- a pinned
   entry does not yet survive its window closing and relaunch on click,
   since that needs `.desktop`-file lookup by `WM_CLASS`, which is
-  launcher-phase territory.
+  launcher-phase territory. Windows of type `_NET_WM_WINDOW_TYPE_DESKTOP`/
+  `_NET_WM_WINDOW_TYPE_DOCK` or carrying `_NET_WM_STATE_SKIP_TASKBAR` are
+  never listed (desktop containment layers, other panels, xispanel's own
+  panel windows). If the widget doesn't have room for every open window's
+  button, it shrinks to as little as one button wide and shows a small
+  up/down arrow pair (one task at a time) instead of overflowing the
+  panel -- see "Widget sizing" below.
 
 More widget types (tray, window controls, global menu, launcher, system
 monitor) are later phases -- see the plan this tool was built from; they
 are not implemented yet.
+
+### Widget sizing
+
+Every widget reports both a desired length and a minimum length from
+`measure()`. `panel_layout()` gives each widget its desired length as long
+as everything fits; once it doesn't, it shrinks widgets proportionally to
+how much slack (desired minus minimum) each one has, never below any
+widget's minimum. Widgets that can't meaningfully shrink (`clock`) report
+`min == desired`; `spacer`'s minimum is always `0`, so it's the first
+thing squeezed away. `tasklist`'s minimum is one button plus room for the
+scroll-arrow pair described above -- if it's given less than its natural
+width, it shows as many buttons as fit starting from its current scroll
+position rather than clipping or overflowing.
 
 ### `THEME`
 
@@ -171,11 +190,21 @@ own file" structure:
 
 ## Design notes
 
-- Panel windows are `override-redirect`: xispanel manages its own
-  position/stacking rather than asking a window manager to. `dock` mode
-  still reserves space via `_NET_WM_STRUT_PARTIAL`/`_NET_WM_STRUT` --
-  every WM that matters here reads that property from any top-level
-  window, managed or not.
+- `overlay`/`autohide` panel windows are `override-redirect`: xispanel
+  manages their own position/stacking rather than asking a window manager
+  to, which is what makes the autohide slide animation reliable. `dock`
+  mode panels are *not* override-redirect, on purpose: at least one
+  real-world WM (this repo's KWin fork) only walks its list of managed
+  clients when recomputing `_NET_WORKAREA`, so an override-redirect
+  window's `_NET_WM_STRUT_PARTIAL` is set but silently never honored --
+  reserving screen space requires being a real, WM-managed client. A dock
+  panel sets `_NET_WM_WINDOW_TYPE_DOCK` (which every WM that matters here
+  auto-disables decoration for), `WM_HINTS.input = False` (never wants
+  keyboard focus, so click-to-focus can't steal it), and initial
+  `_NET_WM_STATE_SKIP_TASKBAR`/`_NET_WM_STATE_SKIP_PAGER` +
+  `_NET_WM_DESKTOP = -1` (all desktops) before the first map, same as any
+  other well-behaved managed dock/panel application (plasmashell, tint2,
+  polybar's `dock` mode) does.
 - `autohide` panels start hidden (unmapped) and stay that way until the
   pointer enters a permanently-mapped, always-raised 1px sensor strip
   running the length of the configured edge. The full panel window then
@@ -196,3 +225,10 @@ own file" structure:
   outright if it ever ends up in an error state anyway -- defense in
   depth, since a single bad frame blanking a panel forever would be a
   much worse failure mode than one widget occasionally not repainting.
+- Every panel repaints into an offscreen `cairo_image_surface_t` first
+  (`Panel::buf_surface`/`buf_cr`), then blits the finished frame onto the
+  real, on-screen `cairo_xlib_surface_t` with a single `cairo_paint()`.
+  Painting widgets directly onto the on-screen surface sent each widget's
+  fills/strokes as its own X request, which a compositor could pick up
+  mid-repaint -- visible as flicker, worst on `tasklist` since it repaints
+  on every ~800ms poll tick even when nothing actually changed.
