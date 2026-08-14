@@ -8,11 +8,11 @@
  *
  * A "panel" is a bar anchored to one edge (top/bottom/left/right) of one
  * XRandR output, sized by a percentage of that edge plus a fixed
- * thickness, holding an ordered list of "widgets" (spacer, clock, ...).
- * Multiple panels (e.g. one per output, or two on the same output) are
- * multiple entries in one config file served by one daemon process --
- * same relationship xisback has between its process and its per-(output,
- * desktop) wallpaper layers.
+ * thickness, holding an ordered list of "widgets" (spacer, clock,
+ * tasklist, ...). Multiple panels (e.g. one per output, or two on the
+ * same output) are multiple entries in one config file served by one
+ * daemon process -- same relationship xisback has between its process
+ * and its per-(output, desktop) wallpaper layers.
  *
  * Panel windows are override-redirect: this keeps xispanel independent of
  * whatever window manager happens to be running (no reparenting, no
@@ -24,19 +24,23 @@
  * state machine below does its own slide animation instead of asking the
  * WM for one.
  *
- * Widgets are a compile-time registry of PanelWidgetOps vtables (see
- * "widget system" below) -- no dlopen, in the same "flat file, no
- * abstraction beyond what's needed" spirit as the rest of this kit. Only
- * two widget types exist so far (spacer, clock); once there are more than
- * a handful they should move to their own widgets/ directory, but with two
- * types splitting them out today would just be indirection for its own
- * sake.
+ * This file owns the panel/window/layout/config/IPC machinery. Widget
+ * types live in their own widgets/ directory (see xispanel.h for the
+ * PanelWidgetOps vtable + core API they're built against) and are wired
+ * in as a compile-time registry below -- no dlopen, in the same "flat
+ * files, no abstraction beyond what's needed" spirit as the rest of this
+ * kit. EWMH/ICCCM helpers live in ewmh.c, the context-menu popup in
+ * menu.c. Widget add/remove/reorder is done by editing the config file
+ * and sending RELOAD (or restarting) -- there is no live IPC mutation of
+ * a panel's widget list yet, see PROTOCOL.md.
  *
  * Rendering: one ARGB32 (if available) cairo_xlib_surface per panel
- * window. Imlib2 is pulled in now for future icon/bitmap-theme decoding
- * (widgets that need it) even though nothing decodes an image yet in this
- * phase. Text goes through cairo_ft_font_face_create_for_ft_face with a
- * Fontconfig-resolved font -- no Pango, no GLib.
+ * window. Imlib2 is pulled in for future bitmap-theme decoding (nothing
+ * uses it yet); window icons come from _NET_WM_ICON via Xlib directly
+ * (ewmh.c), not Imlib2 -- it's already raw ARGB pixel data, no
+ * image-format decoding needed. Text goes through
+ * cairo_ft_font_face_create_for_ft_face with a Fontconfig-resolved font
+ * -- no Pango, no GLib.
  *
  * Config lives at $XDG_CONFIG_HOME/xispanel.conf and is *not* written by
  * this program yet: PANEL/WIDGET/THEME lines are hand-edited (or written
@@ -46,6 +50,8 @@
  * mutates a panel. See PROTOCOL.md.
  */
 
+#include "xispanel.h"
+
 #include <Imlib2.h>
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
@@ -54,7 +60,6 @@
 
 #include <cairo/cairo-ft.h>
 #include <cairo/cairo-xlib.h>
-#include <cairo/cairo.h>
 #include <fontconfig/fontconfig.h>
 #include <ft2build.h>
 #include FT_FREETYPE_H
@@ -63,7 +68,6 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -77,38 +81,43 @@
 
 #define XISPANEL_VERSION "0.1.0"
 #define MAX_PANELS 8
-#define MAX_WIDGETS 32
 #define LINE_MAX_LEN 2048
 #define IPC_MAX_LEN 4096
 #define AUTOHIDE_ANIM_MS 150
 #define AUTOHIDE_DELAY_MS 400
 
-enum edge { EDGE_TOP, EDGE_BOTTOM, EDGE_LEFT, EDGE_RIGHT };
-enum panel_mode { MODE_DOCK, MODE_OVERLAY, MODE_AUTOHIDE };
-enum autohide_state { AH_HIDDEN, AH_SHOWING, AH_SHOWN, AH_HIDING };
-
-typedef struct PanelWidget PanelWidget;
-typedef struct Panel Panel;
-
 /* ------------------------------------------------------------------ */
-/* time helpers                                                        */
+/* globals                                                              */
 /* ------------------------------------------------------------------ */
 
-static uint64_t now_ms(void)
+Display *g_dpy;
+Window g_root;
+int g_screen;
+cairo_font_face_t *g_font_face;
+
+static int g_rr_event_base;
+static volatile sig_atomic_t g_quit = 0;
+static Panel g_panels[MAX_PANELS];
+static char g_configpath[PATH_MAX];
+
+static FT_Library g_ft_lib;
+static FT_Face g_ft_face;
+
+/* ------------------------------------------------------------------ */
+/* small helpers exposed to widgets                                     */
+/* ------------------------------------------------------------------ */
+
+uint64_t now_ms(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000L);
 }
 
-/* ------------------------------------------------------------------ */
-/* small string / config helpers                                       */
-/* ------------------------------------------------------------------ */
-
 /* Looks up "key=value" inside a whitespace-separated token line (the tail
  * of a PANEL/WIDGET/THEME config record, or a widget's own config_kv).
  * Returns 1 if found. */
-static int kv_get(const char *kvline, const char *key, char *out, size_t outsz)
+int kv_get(const char *kvline, const char *key, char *out, size_t outsz)
 {
     if (!kvline) {
         return 0;
@@ -140,7 +149,7 @@ static int kv_get(const char *kvline, const char *key, char *out, size_t outsz)
     return 0;
 }
 
-static int kv_get_int(const char *kvline, const char *key, int defval)
+int kv_get_int(const char *kvline, const char *key, int defval)
 {
     char buf[32];
     if (kv_get(kvline, key, buf, sizeof(buf))) {
@@ -148,6 +157,30 @@ static int kv_get_int(const char *kvline, const char *key, int defval)
     }
     return defval;
 }
+
+/* Real window-space rectangle for a widget, accounting for panel
+ * orientation (horizontal panels lay widgets out along x, vertical panels
+ * along y). Widgets that don't care about orientation (most of them) just
+ * call this once from paint()/on_button(). */
+void widget_get_rect(const PanelWidget *w, int *x, int *y, int *width, int *height)
+{
+    Panel *p = w->panel;
+    if (p->edge == EDGE_TOP || p->edge == EDGE_BOTTOM) {
+        *x = w->x;
+        *y = 0;
+        *width = w->len;
+        *height = w->thickness;
+    } else {
+        *x = 0;
+        *y = w->x;
+        *width = w->thickness;
+        *height = w->len;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* config-only string helpers (not part of the widget-facing API)       */
+/* ------------------------------------------------------------------ */
 
 static void join_fields(char **fields, int start, int nf, char *out, size_t outsz)
 {
@@ -192,207 +225,13 @@ static void parse_hex_color(const char *hex, double *r, double *g, double *b, do
 }
 
 /* ------------------------------------------------------------------ */
-/* widget system                                                       */
+/* widget registry                                                      */
 /* ------------------------------------------------------------------ */
-
-typedef struct {
-    const char *type_name; /* "spacer", "clock", ... -- used in config */
-    size_t priv_size; /* per-instance state, zeroed on creation */
-
-    int (*init)(PanelWidget *w);
-    void (*destroy)(PanelWidget *w);
-    /* Reports desired size along the panel's main axis. out_len < 0 means
-     * "greedy": fill whatever space is left after fixed-size widgets,
-     * split evenly among every greedy widget in the same panel. */
-    void (*measure)(PanelWidget *w, int cross_axis, int *out_len);
-    void (*paint)(PanelWidget *w, cairo_t *cr);
-    int (*on_button)(PanelWidget *w, int button, int local_x, int local_y);
-    void (*on_tick)(PanelWidget *w, uint64_t now);
-} PanelWidgetOps;
-
-struct PanelWidget {
-    const PanelWidgetOps *ops;
-    Panel *panel;
-    int order;
-    char config_kv[256]; /* raw "key=value key2=value2 ..." from config */
-    void *priv;
-
-    /* Filled in by panel_layout(); main-axis position/length, cross-axis
-     * thickness (<= panel thickness). */
-    int x, len, thickness;
-
-    /* 0 = no pending tick. Folded into the main loop's "soonest timeout"
-     * computation so widgets don't need their own timerfd. */
-    uint64_t next_tick_ms;
-};
-
-struct Panel {
-    int in_use;
-    char name[32];
-    char output[64]; /* "*" or an XRandR output name */
-    enum edge edge;
-    int pct; /* 0-100 */
-    int thickness_cfg;
-    enum panel_mode mode;
-
-    /* theme */
-    double bg_r, bg_g, bg_b, bg_a;
-    double fg_r, fg_g, fg_b, fg_a;
-    int spacing;
-
-    /* resolved output geometry */
-    int out_x, out_y, out_w, out_h;
-    /* resolved panel geometry when shown */
-    int x, y, w, h;
-    int thickness;
-    /* resolved panel geometry when fully hidden (autohide only) */
-    int hidden_x, hidden_y;
-
-    Window win;
-    Window sensor_win; /* autohide only: always-mapped 1px edge sensor */
-    Visual *visual;
-    int depth;
-    Colormap cmap;
-    cairo_surface_t *surface;
-    cairo_t *cr;
-
-    int mapped;
-    int dirty;
-
-    enum autohide_state ah_state;
-    uint64_t ah_anim_start_ms;
-    uint64_t ah_hide_deadline_ms; /* 0 = none pending */
-
-    PanelWidget widgets[MAX_WIDGETS];
-    int n_widgets;
-};
-
-/* Real window-space rectangle for a widget, accounting for panel
- * orientation (horizontal panels lay widgets out along x, vertical panels
- * along y). Widgets that don't care about orientation (most of them) just
- * call this once from paint()/on_button(). */
-static void widget_get_rect(const PanelWidget *w, int *x, int *y, int *width, int *height)
-{
-    Panel *p = w->panel;
-    if (p->edge == EDGE_TOP || p->edge == EDGE_BOTTOM) {
-        *x = w->x;
-        *y = 0;
-        *width = w->len;
-        *height = w->thickness;
-    } else {
-        *x = 0;
-        *y = w->x;
-        *width = w->thickness;
-        *height = w->len;
-    }
-}
-
-/* ---- spacer widget --------------------------------------------------- */
-
-typedef struct {
-    int fixed_size; /* 0 = greedy */
-} SpacerPriv;
-
-static int spacer_init(PanelWidget *w)
-{
-    SpacerPriv *sp = w->priv;
-    sp->fixed_size = kv_get_int(w->config_kv, "size", 0);
-    return 0;
-}
-
-static void spacer_measure(PanelWidget *w, int cross_axis, int *out_len)
-{
-    (void)cross_axis;
-    SpacerPriv *sp = w->priv;
-    *out_len = sp->fixed_size > 0 ? sp->fixed_size : -1;
-}
-
-static void spacer_paint(PanelWidget *w, cairo_t *cr)
-{
-    (void)w;
-    (void)cr; /* transparent: the panel background already shows through */
-}
-
-static const PanelWidgetOps spacer_ops = {
-    .type_name = "spacer",
-    .priv_size = sizeof(SpacerPriv),
-    .init = spacer_init,
-    .destroy = NULL,
-    .measure = spacer_measure,
-    .paint = spacer_paint,
-    .on_button = NULL,
-    .on_tick = NULL,
-};
-
-/* ---- clock widget ------------------------------------------------------ */
-
-typedef struct {
-    char format[64];
-    char text[64];
-} ClockPriv;
-
-static int clock_init(PanelWidget *w)
-{
-    ClockPriv *cp = w->priv;
-    if (!kv_get(w->config_kv, "format", cp->format, sizeof(cp->format))) {
-        snprintf(cp->format, sizeof(cp->format), "%%H:%%M");
-    }
-    cp->text[0] = 0;
-    w->next_tick_ms = now_ms(); /* paint something immediately */
-    return 0;
-}
-
-static void clock_on_tick(PanelWidget *w, uint64_t now)
-{
-    ClockPriv *cp = w->priv;
-    time_t t = time(NULL);
-    struct tm tmv;
-    localtime_r(&t, &tmv);
-    strftime(cp->text, sizeof(cp->text), cp->format, &tmv);
-    w->next_tick_ms = now + 1000;
-}
-
-static void clock_measure(PanelWidget *w, int cross_axis, int *out_len)
-{
-    (void)cross_axis;
-    ClockPriv *cp = w->priv;
-    Panel *p = w->panel;
-    const char *sample = cp->text[0] ? cp->text : "00:00";
-    cairo_text_extents_t ext;
-    cairo_text_extents(p->cr, sample, &ext);
-    *out_len = (int)ext.x_advance + 16;
-}
-
-static void clock_paint(PanelWidget *w, cairo_t *cr)
-{
-    ClockPriv *cp = w->priv;
-    Panel *p = w->panel;
-    int x, y, width, height;
-    widget_get_rect(w, &x, &y, &width, &height);
-
-    cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, p->fg_a);
-    cairo_text_extents_t ext;
-    cairo_text_extents(cr, cp->text, &ext);
-    double tx = x + (width - ext.width) / 2.0 - ext.x_bearing;
-    double ty = y + (height - ext.height) / 2.0 - ext.y_bearing;
-    cairo_move_to(cr, tx, ty);
-    cairo_show_text(cr, cp->text);
-}
-
-static const PanelWidgetOps clock_ops = {
-    .type_name = "clock",
-    .priv_size = sizeof(ClockPriv),
-    .init = clock_init,
-    .destroy = NULL,
-    .measure = clock_measure,
-    .paint = clock_paint,
-    .on_button = NULL,
-    .on_tick = clock_on_tick,
-};
 
 static const PanelWidgetOps *g_widget_registry[] = {
     &spacer_ops,
     &clock_ops,
+    &tasklist_ops,
     NULL,
 };
 
@@ -405,27 +244,6 @@ static const PanelWidgetOps *find_widget_ops(const char *type_name)
     }
     return NULL;
 }
-
-/* ------------------------------------------------------------------ */
-/* panel                                                                */
-/* ------------------------------------------------------------------ */
-
-static Display *g_dpy;
-static Window g_root;
-static int g_screen;
-static int g_rr_event_base;
-static volatile sig_atomic_t g_quit = 0;
-static Panel g_panels[MAX_PANELS];
-static char g_configpath[PATH_MAX];
-
-static Atom g_atom_wm_window_type;
-static Atom g_atom_wm_window_type_dock;
-static Atom g_atom_wm_strut;
-static Atom g_atom_wm_strut_partial;
-
-static FT_Library g_ft_lib;
-static FT_Face g_ft_face;
-static cairo_font_face_t *g_font_face;
 
 /* ------------------------------------------------------------------ */
 /* font setup                                                           */
@@ -706,6 +524,27 @@ static void panel_repaint(Panel *p)
     if (!p->cr) {
         return;
     }
+
+    /* Once a cairo_t enters an error state (e.g. CAIRO_STATUS_INVALID_STRING
+     * from passing malformed UTF-8 to cairo_show_text -- window titles are
+     * supposed to be UTF-8 but not every client is well-behaved), every
+     * subsequent call on it becomes a silent no-op *permanently*, even
+     * cairo_save()/cairo_restore(). Since p->cr is reused across every
+     * repaint rather than recreated each time, one bad frame would
+     * otherwise blank the panel forever. Recreate it here instead of
+     * trusting every current and future widget to never make this
+     * mistake. */
+    if (cairo_status(p->cr) != CAIRO_STATUS_SUCCESS) {
+        fprintf(stderr, "xispanel: panel '%s': cairo error (%s), recreating drawing context\n", p->name,
+                cairo_status_to_string(cairo_status(p->cr)));
+        cairo_destroy(p->cr);
+        p->cr = cairo_create(p->surface);
+        if (g_font_face) {
+            cairo_set_font_face(p->cr, g_font_face);
+        }
+        cairo_set_font_size(p->cr, p->thickness * 0.45);
+    }
+
     cairo_save(p->cr);
     cairo_set_operator(p->cr, CAIRO_OPERATOR_SOURCE);
     cairo_set_source_rgba(p->cr, p->bg_r, p->bg_g, p->bg_b, p->bg_a);
@@ -1061,6 +900,7 @@ static void load_config(void)
 
 static void reload_all_panels(void)
 {
+    panel_menu_close(); /* about to invalidate every Panel/PanelWidget it could reference */
     for (int i = 0; i < MAX_PANELS; i++) {
         if (g_panels[i].in_use) {
             panel_deactivate(&g_panels[i]);
@@ -1213,7 +1053,7 @@ static Panel *find_panel_by_window(Window win, int *is_sensor)
     return NULL;
 }
 
-static void dispatch_button(Panel *p, int button, int x, int y)
+static void dispatch_button(Panel *p, int button, int x, int y, int root_x, int root_y)
 {
     int axis_pos = (p->edge == EDGE_TOP || p->edge == EDGE_BOTTOM) ? x : y;
     for (int i = 0; i < p->n_widgets; i++) {
@@ -1221,7 +1061,7 @@ static void dispatch_button(Panel *p, int button, int x, int y)
         if (axis_pos >= w->x && axis_pos < w->x + w->len) {
             if (w->ops->on_button) {
                 int local = axis_pos - w->x;
-                w->ops->on_button(w, button, local, 0);
+                w->ops->on_button(w, button, local, 0, root_x, root_y);
             }
             return;
         }
@@ -1248,10 +1088,7 @@ static int run_as_daemon(const char *sockpath)
         fprintf(stderr, "xispanel: could not resolve a default font via fontconfig\n");
     }
 
-    g_atom_wm_window_type = XInternAtom(g_dpy, "_NET_WM_WINDOW_TYPE", False);
-    g_atom_wm_window_type_dock = XInternAtom(g_dpy, "_NET_WM_WINDOW_TYPE_DOCK", False);
-    g_atom_wm_strut = XInternAtom(g_dpy, "_NET_WM_STRUT", False);
-    g_atom_wm_strut_partial = XInternAtom(g_dpy, "_NET_WM_STRUT_PARTIAL", False);
+    ewmh_init_atoms();
 
     int rr_error_base;
     if (!XRRQueryExtension(g_dpy, &g_rr_event_base, &rr_error_base)) {
@@ -1364,11 +1201,13 @@ static int run_as_daemon(const char *sockpath)
                     XRRUpdateConfiguration(&ev);
                     reload_all_panels();
                     XFlush(g_dpy);
+                } else if (panel_menu_handle_event(&ev)) {
+                    /* consumed by the open context menu */
                 } else if (ev.type == ButtonPress) {
                     int is_sensor = 0;
                     Panel *p = find_panel_by_window(ev.xbutton.window, &is_sensor);
                     if (p && !is_sensor) {
-                        dispatch_button(p, (int)ev.xbutton.button, ev.xbutton.x, ev.xbutton.y);
+                        dispatch_button(p, (int)ev.xbutton.button, ev.xbutton.x, ev.xbutton.y, ev.xbutton.x_root, ev.xbutton.y_root);
                     }
                 } else if (ev.type == EnterNotify) {
                     int is_sensor = 0;
@@ -1422,6 +1261,7 @@ static int run_as_daemon(const char *sockpath)
         XFlush(g_dpy);
     }
 
+    panel_menu_close();
     for (int i = 0; i < MAX_PANELS; i++) {
         if (g_panels[i].in_use) {
             panel_deactivate(&g_panels[i]);

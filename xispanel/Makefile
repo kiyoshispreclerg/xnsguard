@@ -1,11 +1,19 @@
 CFLAGS ?= -Wall -Wextra -O2
-LIBS := $(shell pkg-config --cflags --libs x11 xrandr cairo cairo-xlib imlib2 freetype2 fontconfig) -lm
+PKGS := x11 xrandr cairo cairo-xlib imlib2 freetype2 fontconfig
+CPPFLAGS := $(shell pkg-config --cflags $(PKGS))
+LDLIBS := $(shell pkg-config --libs $(PKGS)) -lm
 
 PREFIX ?= /usr/local
 BINDIR := $(PREFIX)/bin
 
-xispanel: xispanel.c
-	$(CC) $(CFLAGS) -o $@ $< $(LIBS)
+SRCS := xispanel.c ewmh.c menu.c widgets/spacer.c widgets/clock.c widgets/tasklist.c
+OBJS := $(SRCS:.c=.o)
+
+xispanel: $(OBJS)
+	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDLIBS)
+
+%.o: %.c xispanel.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c -o $@ $<
 
 install: xispanel
 	install -Dm755 xispanel $(DESTDIR)$(BINDIR)/xispanel
@@ -14,6 +22,6 @@ uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/xispanel
 
 clean:
-	rm -f xispanel
+	rm -f xispanel $(OBJS)
 
 .PHONY: clean install uninstall

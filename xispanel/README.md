@@ -11,7 +11,7 @@ Imlib2 for image decoding -- the same dependency spirit as
 
 ### Status
 
-**Early / core only.** What works right now:
+**Early.** What works right now:
 
 - One or more panels, each anchored to an edge (top/bottom/left/right) of
   a chosen XRandR output (or the whole virtual screen), sized by a
@@ -20,17 +20,23 @@ Imlib2 for image decoding -- the same dependency spirit as
   `_NET_WM_STRUT_PARTIAL`), `overlay` (floats above everything, no
   reserved space), `autohide` (overlay that slides in on hover and back
   out shortly after).
-- A small widget system (compile-time registry, no plugins/dlopen) with
-  two widget types so far: `spacer` (fixed or greedy/fill) and `clock`.
+- A small widget system (compile-time registry, no plugins/dlopen), each
+  type in its own file under [widgets/](widgets/): `spacer` (fixed or
+  greedy/fill), `clock`, and `tasklist` (EWMH-based, wide/compact modes,
+  per-window context menu with minimize/maximize/move/close/pin -- see
+  [PROTOCOL.md](PROTOCOL.md)).
+- A generic context-menu popup any widget can use for itself or a
+  sub-item, not just the panel as a whole.
 - Basic theming: background/foreground color with alpha (real per-pixel
   transparency when a compositor provides an ARGB visual), spacing.
 - A control socket (see [PROTOCOL.md](PROTOCOL.md)) for `PING`,
   `GET_STATUS`, `RELOAD`, `QUIT`.
 
 Everything else this tool is meant to eventually do -- system tray,
-global menu, task list with window thumbnails and media controls,
-application launcher, system monitor -- is **not implemented yet**. See
-the phased plan this was built from for what's next.
+global menu, window thumbnails, media controls, application launcher,
+system monitor -- is **not implemented yet**. See the phased plan this
+was built from, and [PROTOCOL.md](PROTOCOL.md)'s "Source layout" section
+for how a new widget type gets added.
 
 ### Dependencies
 
@@ -66,7 +72,8 @@ Example config:
 
 ```
 PANEL	top	*	edge=top	pct=100	thickness=32	mode=dock
-WIDGET	top	0	spacer
-WIDGET	top	1	clock	format=%H:%M
+WIDGET	top	0	tasklist	mode=wide
+WIDGET	top	1	spacer
+WIDGET	top	2	clock	format=%H:%M
 THEME	top	bg=#202020cc	fg=#eeeeee	spacing=6
 ```

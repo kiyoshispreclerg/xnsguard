@@ -107,11 +107,24 @@ Widget types implemented so far:
   every greedy spacer on the panel. A greedy spacer before a fixed-size
   widget right-aligns everything after it.
 - `clock`: `format=<strftime format>` (default `%H:%M`). Updates once a
-  second.
+  second. No timezone popup yet.
+- `tasklist`: `mode=wide|compact` (default `wide`). One button per
+  top-level window from `_NET_CLIENT_LIST`, refreshed by polling every
+  ~800ms. `wide` draws icon+title (Windows XP style, titles truncated
+  with an ellipsis and capped at 180px); `compact` draws icon only
+  (Windows 7 style). A small desktop-number badge is drawn on a task's
+  icon when the session has more than one virtual desktop. Left-click
+  activates a window (or minimizes it if it's already the active one,
+  clicking again restores it); right-click opens a context menu
+  (Minimizar/Maximizar/Mover/Fechar, plus Fixar/Desafixar). "Fixar" is
+  currently a visual-only toggle for the running session -- a pinned
+  entry does not yet survive its window closing and relaunch on click,
+  since that needs `.desktop`-file lookup by `WM_CLASS`, which is
+  launcher-phase territory.
 
-More widget types (tasklist, tray, window controls, global menu,
-launcher, system monitor) are later phases -- see the plan this tool was
-built from; they are not implemented yet.
+More widget types (tray, window controls, global menu, launcher, system
+monitor) are later phases -- see the plan this tool was built from; they
+are not implemented yet.
 
 ### `THEME`
 
@@ -123,6 +136,38 @@ THEME	top	bg=#202020cc	fg=#eeeeee	spacing=6
   the X server has a 32-bit ARGB visual available, i.e. a compositor is
   running -- otherwise the background renders fully opaque).
 - `spacing`: pixels of gap between adjacent widgets (default `4`).
+
+## Context menus
+
+Any widget can pop up a context menu for itself or one of its own
+sub-items (e.g. `tasklist`'s per-window menu) via a generic popup system
+shared by every widget type -- the menu code itself doesn't know or care
+what the items mean, only how to draw/position/dismiss the popup. It's an
+`override-redirect` window with an exclusive pointer+keyboard grab while
+open: a click outside the menu's bounds, or Escape, dismisses it (a click
+outside is *not* re-delivered to whatever was actually underneath it --
+a known, accepted simplification; click again to interact with that).
+
+## Source layout
+
+Following the plan's "widgets can be added/removed/reordered, each is its
+own file" structure:
+
+- `xispanel.c`: main, config parsing, IPC, the select() event loop, panel
+  geometry/window/rendering/autohide/lifecycle, and the compile-time
+  widget registry (an array of externs pointing at each widget's
+  `PanelWidgetOps`).
+- `xispanel.h`: shared `Panel`/`PanelWidget`/`PanelWidgetOps` types and
+  the core API a widget file is built against (`now_ms`, `kv_get`,
+  `widget_get_rect`, the `ewmh_*` helpers, `panel_menu_open`, ...).
+- `ewmh.c`: EWMH/ICCCM client-list reading and window-control actions
+  (activate/close/minimize/maximize/move), plus `_NET_WM_ICON` decoding
+  and the icon/text drawing helpers built on top of it.
+- `menu.c`: the generic context-menu popup described above.
+- `widgets/spacer.c`, `widgets/clock.c`, `widgets/tasklist.c`: one file
+  per widget type. Adding a new type is "write `widgets/foo.c` defining a
+  `PanelWidgetOps foo_ops`, declare it `extern` in `xispanel.h`, add it to
+  the registry array in `xispanel.c`" -- no other file needs to change.
 
 ## Design notes
 
@@ -141,3 +186,13 @@ THEME	top	bg=#202020cc	fg=#eeeeee	spacing=6
   robust, at the cost of losing any in-flight autohide animation state
   across a hotplug (hotplug is rare enough that this doesn't matter in
   practice).
+- Every panel's `cairo_t` is created once and reused across every
+  repaint, not recreated per frame. Cairo hard-fails (and stays failed --
+  `cairo_save`/`cairo_restore` become no-ops too) on invalid UTF-8 passed
+  to text functions, and window-supplied text (titles, `WM_CLASS`, ...)
+  is not guaranteed to be well-formed even where the spec says it should
+  be. `ewmh_get_title()` sanitizes to valid UTF-8, `trim_to_width()` never
+  truncates mid-codepoint, and `panel_repaint()` recreates the `cairo_t`
+  outright if it ever ends up in an error state anyway -- defense in
+  depth, since a single bad frame blanking a panel forever would be a
+  much worse failure mode than one widget occasionally not repainting.
