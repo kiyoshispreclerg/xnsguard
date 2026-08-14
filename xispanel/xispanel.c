@@ -1,0 +1,1522 @@
+/*
+ * xispanel - minimal desktop panel/taskbar daemon.
+ *
+ * One process per session (guarded by an flock'd lock file under
+ * XDG_RUNTIME_DIR, same pattern as xisback/xisguard). Any further
+ * invocation talks to the already running instance over a Unix socket
+ * (see PROTOCOL.md) instead of spawning a second process.
+ *
+ * A "panel" is a bar anchored to one edge (top/bottom/left/right) of one
+ * XRandR output, sized by a percentage of that edge plus a fixed
+ * thickness, holding an ordered list of "widgets" (spacer, clock, ...).
+ * Multiple panels (e.g. one per output, or two on the same output) are
+ * multiple entries in one config file served by one daemon process --
+ * same relationship xisback has between its process and its per-(output,
+ * desktop) wallpaper layers.
+ *
+ * Panel windows are override-redirect: this keeps xispanel independent of
+ * whatever window manager happens to be running (no reparenting, no
+ * negotiating "always on top" state with the WM) while still reserving
+ * screen space via _NET_WM_STRUT_PARTIAL in "dock" mode -- every WM that
+ * matters here reads that property from any top-level window, managed or
+ * not. The tradeoff is that xispanel itself is fully responsible for
+ * raising/positioning/clipping its own windows, which is why the autohide
+ * state machine below does its own slide animation instead of asking the
+ * WM for one.
+ *
+ * Widgets are a compile-time registry of PanelWidgetOps vtables (see
+ * "widget system" below) -- no dlopen, in the same "flat file, no
+ * abstraction beyond what's needed" spirit as the rest of this kit. Only
+ * two widget types exist so far (spacer, clock); once there are more than
+ * a handful they should move to their own widgets/ directory, but with two
+ * types splitting them out today would just be indirection for its own
+ * sake.
+ *
+ * Rendering: one ARGB32 (if available) cairo_xlib_surface per panel
+ * window. Imlib2 is pulled in now for future icon/bitmap-theme decoding
+ * (widgets that need it) even though nothing decodes an image yet in this
+ * phase. Text goes through cairo_ft_font_face_create_for_ft_face with a
+ * Fontconfig-resolved font -- no Pango, no GLib.
+ *
+ * Config lives at $XDG_CONFIG_HOME/xispanel.conf and is *not* written by
+ * this program yet: PANEL/WIDGET/THEME lines are hand-edited (or written
+ * by a future xisconf tab) and picked up on startup or via the IPC RELOAD
+ * command. Persisting live-mutated state (SET_WIDGET etc. over the IPC
+ * socket) is a later phase once there is any IPC command that actually
+ * mutates a panel. See PROTOCOL.md.
+ */
+
+#include <Imlib2.h>
+#include <X11/Xatom.h>
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/extensions/Xrandr.h>
+
+#include <cairo/cairo-ft.h>
+#include <cairo/cairo-xlib.h>
+#include <cairo/cairo.h>
+#include <fontconfig/fontconfig.h>
+#include <ft2build.h>
+#include FT_FREETYPE_H
+
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/file.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <time.h>
+#include <unistd.h>
+
+#define XISPANEL_VERSION "0.1.0"
+#define MAX_PANELS 8
+#define MAX_WIDGETS 32
+#define LINE_MAX_LEN 2048
+#define IPC_MAX_LEN 4096
+#define AUTOHIDE_ANIM_MS 150
+#define AUTOHIDE_DELAY_MS 400
+
+enum edge { EDGE_TOP, EDGE_BOTTOM, EDGE_LEFT, EDGE_RIGHT };
+enum panel_mode { MODE_DOCK, MODE_OVERLAY, MODE_AUTOHIDE };
+enum autohide_state { AH_HIDDEN, AH_SHOWING, AH_SHOWN, AH_HIDING };
+
+typedef struct PanelWidget PanelWidget;
+typedef struct Panel Panel;
+
+/* ------------------------------------------------------------------ */
+/* time helpers                                                        */
+/* ------------------------------------------------------------------ */
+
+static uint64_t now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000L);
+}
+
+/* ------------------------------------------------------------------ */
+/* small string / config helpers                                       */
+/* ------------------------------------------------------------------ */
+
+/* Looks up "key=value" inside a whitespace-separated token line (the tail
+ * of a PANEL/WIDGET/THEME config record, or a widget's own config_kv).
+ * Returns 1 if found. */
+static int kv_get(const char *kvline, const char *key, char *out, size_t outsz)
+{
+    if (!kvline) {
+        return 0;
+    }
+    size_t keylen = strlen(key);
+    const char *p = kvline;
+    while (*p) {
+        while (*p == ' ' || *p == '\t') {
+            p++;
+        }
+        if (!*p) {
+            break;
+        }
+        const char *tok_start = p;
+        while (*p && *p != ' ' && *p != '\t') {
+            p++;
+        }
+        size_t tok_len = (size_t)(p - tok_start);
+        if (tok_len > keylen && tok_start[keylen] == '=' && strncmp(tok_start, key, keylen) == 0) {
+            size_t vlen = tok_len - keylen - 1;
+            if (vlen >= outsz) {
+                vlen = outsz - 1;
+            }
+            memcpy(out, tok_start + keylen + 1, vlen);
+            out[vlen] = 0;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int kv_get_int(const char *kvline, const char *key, int defval)
+{
+    char buf[32];
+    if (kv_get(kvline, key, buf, sizeof(buf))) {
+        return atoi(buf);
+    }
+    return defval;
+}
+
+static void join_fields(char **fields, int start, int nf, char *out, size_t outsz)
+{
+    out[0] = 0;
+    size_t used = 0;
+    for (int i = start; i < nf; i++) {
+        size_t len = strlen(fields[i]);
+        if (used + len + 2 >= outsz) {
+            break;
+        }
+        if (used > 0) {
+            out[used++] = ' ';
+        }
+        memcpy(out + used, fields[i], len);
+        used += len;
+        out[used] = 0;
+    }
+}
+
+/* "#RRGGBB" or "#RRGGBBAA" -> 0..1 components. Leaves *r/g/b/a untouched
+ * (caller should pre-seed with a default) if hex is empty or malformed. */
+static void parse_hex_color(const char *hex, double *r, double *g, double *b, double *a)
+{
+    if (!hex || hex[0] != '#') {
+        return;
+    }
+    size_t len = strlen(hex);
+    if (len != 7 && len != 9) {
+        return;
+    }
+    unsigned int ri, gi, bi, ai = 255;
+    if (sscanf(hex + 1, "%2x%2x%2x", &ri, &gi, &bi) != 3) {
+        return;
+    }
+    if (len == 9) {
+        sscanf(hex + 7, "%2x", &ai);
+    }
+    *r = ri / 255.0;
+    *g = gi / 255.0;
+    *b = bi / 255.0;
+    *a = ai / 255.0;
+}
+
+/* ------------------------------------------------------------------ */
+/* widget system                                                       */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    const char *type_name; /* "spacer", "clock", ... -- used in config */
+    size_t priv_size; /* per-instance state, zeroed on creation */
+
+    int (*init)(PanelWidget *w);
+    void (*destroy)(PanelWidget *w);
+    /* Reports desired size along the panel's main axis. out_len < 0 means
+     * "greedy": fill whatever space is left after fixed-size widgets,
+     * split evenly among every greedy widget in the same panel. */
+    void (*measure)(PanelWidget *w, int cross_axis, int *out_len);
+    void (*paint)(PanelWidget *w, cairo_t *cr);
+    int (*on_button)(PanelWidget *w, int button, int local_x, int local_y);
+    void (*on_tick)(PanelWidget *w, uint64_t now);
+} PanelWidgetOps;
+
+struct PanelWidget {
+    const PanelWidgetOps *ops;
+    Panel *panel;
+    int order;
+    char config_kv[256]; /* raw "key=value key2=value2 ..." from config */
+    void *priv;
+
+    /* Filled in by panel_layout(); main-axis position/length, cross-axis
+     * thickness (<= panel thickness). */
+    int x, len, thickness;
+
+    /* 0 = no pending tick. Folded into the main loop's "soonest timeout"
+     * computation so widgets don't need their own timerfd. */
+    uint64_t next_tick_ms;
+};
+
+struct Panel {
+    int in_use;
+    char name[32];
+    char output[64]; /* "*" or an XRandR output name */
+    enum edge edge;
+    int pct; /* 0-100 */
+    int thickness_cfg;
+    enum panel_mode mode;
+
+    /* theme */
+    double bg_r, bg_g, bg_b, bg_a;
+    double fg_r, fg_g, fg_b, fg_a;
+    int spacing;
+
+    /* resolved output geometry */
+    int out_x, out_y, out_w, out_h;
+    /* resolved panel geometry when shown */
+    int x, y, w, h;
+    int thickness;
+    /* resolved panel geometry when fully hidden (autohide only) */
+    int hidden_x, hidden_y;
+
+    Window win;
+    Window sensor_win; /* autohide only: always-mapped 1px edge sensor */
+    Visual *visual;
+    int depth;
+    Colormap cmap;
+    cairo_surface_t *surface;
+    cairo_t *cr;
+
+    int mapped;
+    int dirty;
+
+    enum autohide_state ah_state;
+    uint64_t ah_anim_start_ms;
+    uint64_t ah_hide_deadline_ms; /* 0 = none pending */
+
+    PanelWidget widgets[MAX_WIDGETS];
+    int n_widgets;
+};
+
+/* Real window-space rectangle for a widget, accounting for panel
+ * orientation (horizontal panels lay widgets out along x, vertical panels
+ * along y). Widgets that don't care about orientation (most of them) just
+ * call this once from paint()/on_button(). */
+static void widget_get_rect(const PanelWidget *w, int *x, int *y, int *width, int *height)
+{
+    Panel *p = w->panel;
+    if (p->edge == EDGE_TOP || p->edge == EDGE_BOTTOM) {
+        *x = w->x;
+        *y = 0;
+        *width = w->len;
+        *height = w->thickness;
+    } else {
+        *x = 0;
+        *y = w->x;
+        *width = w->thickness;
+        *height = w->len;
+    }
+}
+
+/* ---- spacer widget --------------------------------------------------- */
+
+typedef struct {
+    int fixed_size; /* 0 = greedy */
+} SpacerPriv;
+
+static int spacer_init(PanelWidget *w)
+{
+    SpacerPriv *sp = w->priv;
+    sp->fixed_size = kv_get_int(w->config_kv, "size", 0);
+    return 0;
+}
+
+static void spacer_measure(PanelWidget *w, int cross_axis, int *out_len)
+{
+    (void)cross_axis;
+    SpacerPriv *sp = w->priv;
+    *out_len = sp->fixed_size > 0 ? sp->fixed_size : -1;
+}
+
+static void spacer_paint(PanelWidget *w, cairo_t *cr)
+{
+    (void)w;
+    (void)cr; /* transparent: the panel background already shows through */
+}
+
+static const PanelWidgetOps spacer_ops = {
+    .type_name = "spacer",
+    .priv_size = sizeof(SpacerPriv),
+    .init = spacer_init,
+    .destroy = NULL,
+    .measure = spacer_measure,
+    .paint = spacer_paint,
+    .on_button = NULL,
+    .on_tick = NULL,
+};
+
+/* ---- clock widget ------------------------------------------------------ */
+
+typedef struct {
+    char format[64];
+    char text[64];
+} ClockPriv;
+
+static int clock_init(PanelWidget *w)
+{
+    ClockPriv *cp = w->priv;
+    if (!kv_get(w->config_kv, "format", cp->format, sizeof(cp->format))) {
+        snprintf(cp->format, sizeof(cp->format), "%%H:%%M");
+    }
+    cp->text[0] = 0;
+    w->next_tick_ms = now_ms(); /* paint something immediately */
+    return 0;
+}
+
+static void clock_on_tick(PanelWidget *w, uint64_t now)
+{
+    ClockPriv *cp = w->priv;
+    time_t t = time(NULL);
+    struct tm tmv;
+    localtime_r(&t, &tmv);
+    strftime(cp->text, sizeof(cp->text), cp->format, &tmv);
+    w->next_tick_ms = now + 1000;
+}
+
+static void clock_measure(PanelWidget *w, int cross_axis, int *out_len)
+{
+    (void)cross_axis;
+    ClockPriv *cp = w->priv;
+    Panel *p = w->panel;
+    const char *sample = cp->text[0] ? cp->text : "00:00";
+    cairo_text_extents_t ext;
+    cairo_text_extents(p->cr, sample, &ext);
+    *out_len = (int)ext.x_advance + 16;
+}
+
+static void clock_paint(PanelWidget *w, cairo_t *cr)
+{
+    ClockPriv *cp = w->priv;
+    Panel *p = w->panel;
+    int x, y, width, height;
+    widget_get_rect(w, &x, &y, &width, &height);
+
+    cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, p->fg_a);
+    cairo_text_extents_t ext;
+    cairo_text_extents(cr, cp->text, &ext);
+    double tx = x + (width - ext.width) / 2.0 - ext.x_bearing;
+    double ty = y + (height - ext.height) / 2.0 - ext.y_bearing;
+    cairo_move_to(cr, tx, ty);
+    cairo_show_text(cr, cp->text);
+}
+
+static const PanelWidgetOps clock_ops = {
+    .type_name = "clock",
+    .priv_size = sizeof(ClockPriv),
+    .init = clock_init,
+    .destroy = NULL,
+    .measure = clock_measure,
+    .paint = clock_paint,
+    .on_button = NULL,
+    .on_tick = clock_on_tick,
+};
+
+static const PanelWidgetOps *g_widget_registry[] = {
+    &spacer_ops,
+    &clock_ops,
+    NULL,
+};
+
+static const PanelWidgetOps *find_widget_ops(const char *type_name)
+{
+    for (int i = 0; g_widget_registry[i]; i++) {
+        if (strcmp(g_widget_registry[i]->type_name, type_name) == 0) {
+            return g_widget_registry[i];
+        }
+    }
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* panel                                                                */
+/* ------------------------------------------------------------------ */
+
+static Display *g_dpy;
+static Window g_root;
+static int g_screen;
+static int g_rr_event_base;
+static volatile sig_atomic_t g_quit = 0;
+static Panel g_panels[MAX_PANELS];
+static char g_configpath[PATH_MAX];
+
+static Atom g_atom_wm_window_type;
+static Atom g_atom_wm_window_type_dock;
+static Atom g_atom_wm_strut;
+static Atom g_atom_wm_strut_partial;
+
+static FT_Library g_ft_lib;
+static FT_Face g_ft_face;
+static cairo_font_face_t *g_font_face;
+
+/* ------------------------------------------------------------------ */
+/* font setup                                                           */
+/* ------------------------------------------------------------------ */
+
+static int init_font(const char *family_hint)
+{
+    if (FT_Init_FreeType(&g_ft_lib) != 0) {
+        return -1;
+    }
+    if (!FcInit()) {
+        return -1;
+    }
+    FcPattern *pat = FcNameParse((const FcChar8 *)(family_hint && *family_hint ? family_hint : "sans-serif"));
+    FcConfigSubstitute(NULL, pat, FcMatchPattern);
+    FcDefaultSubstitute(pat);
+    FcResult result;
+    FcPattern *match = FcFontMatch(NULL, pat, &result);
+    FcPatternDestroy(pat);
+    if (!match) {
+        return -1;
+    }
+    FcChar8 *file = NULL;
+    if (FcPatternGetString(match, FC_FILE, 0, &file) != FcResultMatch) {
+        FcPatternDestroy(match);
+        return -1;
+    }
+    if (FT_New_Face(g_ft_lib, (const char *)file, 0, &g_ft_face) != 0) {
+        FcPatternDestroy(match);
+        return -1;
+    }
+    FcPatternDestroy(match);
+    g_font_face = cairo_ft_font_face_create_for_ft_face(g_ft_face, 0);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* RandR output geometry (same pattern as xisback's resolve_output_geometry)*/
+/* ------------------------------------------------------------------ */
+
+static int resolve_output_geometry(const char *name, int *ox, int *oy, int *ow, int *oh)
+{
+    XRRScreenResources *res = XRRGetScreenResourcesCurrent(g_dpy, g_root);
+    if (!res) {
+        return 0;
+    }
+    int found = 0;
+    for (int i = 0; i < res->noutput && !found; i++) {
+        XRROutputInfo *oi = XRRGetOutputInfo(g_dpy, res, res->outputs[i]);
+        if (oi && oi->connection == RR_Connected && oi->crtc && strcmp(oi->name, name) == 0) {
+            XRRCrtcInfo *ci = XRRGetCrtcInfo(g_dpy, res, oi->crtc);
+            if (ci) {
+                *ox = ci->x;
+                *oy = ci->y;
+                *ow = (int)ci->width;
+                *oh = (int)ci->height;
+                found = 1;
+                XRRFreeCrtcInfo(ci);
+            }
+        }
+        if (oi) {
+            XRRFreeOutputInfo(oi);
+        }
+    }
+    XRRFreeScreenResources(res);
+    return found;
+}
+
+static void panel_resolve_geometry(Panel *p)
+{
+    if (strcmp(p->output, "*") != 0 && resolve_output_geometry(p->output, &p->out_x, &p->out_y, &p->out_w, &p->out_h)) {
+        /* matched */
+    } else {
+        if (strcmp(p->output, "*") != 0) {
+            fprintf(stderr, "xispanel: panel '%s': output '%s' not found, falling back to full screen\n", p->name, p->output);
+        }
+        p->out_x = 0;
+        p->out_y = 0;
+        p->out_w = DisplayWidth(g_dpy, g_screen);
+        p->out_h = DisplayHeight(g_dpy, g_screen);
+    }
+
+    p->thickness = p->thickness_cfg;
+
+    if (p->edge == EDGE_TOP || p->edge == EDGE_BOTTOM) {
+        p->w = p->out_w * p->pct / 100;
+        p->h = p->thickness;
+        p->x = p->out_x + (p->out_w - p->w) / 2;
+        p->y = (p->edge == EDGE_TOP) ? p->out_y : (p->out_y + p->out_h - p->thickness);
+        p->hidden_x = p->x;
+        p->hidden_y = (p->edge == EDGE_TOP) ? (p->out_y - p->thickness) : (p->out_y + p->out_h);
+    } else {
+        p->h = p->out_h * p->pct / 100;
+        p->w = p->thickness;
+        p->y = p->out_y + (p->out_h - p->h) / 2;
+        p->x = (p->edge == EDGE_LEFT) ? p->out_x : (p->out_x + p->out_w - p->thickness);
+        p->hidden_y = p->y;
+        p->hidden_x = (p->edge == EDGE_LEFT) ? (p->out_x - p->thickness) : (p->out_x + p->out_w);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* strut (dock mode)                                                    */
+/* ------------------------------------------------------------------ */
+
+static void panel_apply_strut(Panel *p)
+{
+    if (p->mode != MODE_DOCK) {
+        return;
+    }
+    /* _NET_WM_STRUT_PARTIAL: left, right, top, bottom, left_start_y,
+     * left_end_y, right_start_y, right_end_y, top_start_x, top_end_x,
+     * bottom_start_x, bottom_end_x */
+    long strut[12] = {0};
+    long strut4[4] = {0};
+    switch (p->edge) {
+    case EDGE_TOP:
+        strut[2] = p->y + p->h; /* distance from top of screen */
+        strut[8] = p->x;
+        strut[9] = p->x + p->w - 1;
+        strut4[2] = strut[2];
+        break;
+    case EDGE_BOTTOM:
+        strut[3] = DisplayHeight(g_dpy, g_screen) - p->y;
+        strut[10] = p->x;
+        strut[11] = p->x + p->w - 1;
+        strut4[3] = strut[3];
+        break;
+    case EDGE_LEFT:
+        strut[0] = p->x + p->w;
+        strut[4] = p->y;
+        strut[5] = p->y + p->h - 1;
+        strut4[0] = strut[0];
+        break;
+    case EDGE_RIGHT:
+        strut[1] = DisplayWidth(g_dpy, g_screen) - p->x;
+        strut[6] = p->y;
+        strut[7] = p->y + p->h - 1;
+        strut4[1] = strut[1];
+        break;
+    }
+    XChangeProperty(g_dpy, p->win, g_atom_wm_strut_partial, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)strut, 12);
+    XChangeProperty(g_dpy, p->win, g_atom_wm_strut, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)strut4, 4);
+}
+
+/* ------------------------------------------------------------------ */
+/* window / cairo surface creation                                      */
+/* ------------------------------------------------------------------ */
+
+static void panel_pick_visual(Panel *p)
+{
+    XVisualInfo vinfo;
+    if (XMatchVisualInfo(g_dpy, g_screen, 32, TrueColor, &vinfo)) {
+        p->visual = vinfo.visual;
+        p->depth = vinfo.depth;
+        p->cmap = XCreateColormap(g_dpy, g_root, p->visual, AllocNone);
+    } else {
+        /* No ARGB visual available (no compositor advertising one): fall
+         * back to the default visual. Backgrounds configured with alpha
+         * < 1 will just render fully opaque. */
+        p->visual = DefaultVisual(g_dpy, g_screen);
+        p->depth = DefaultDepth(g_dpy, g_screen);
+        p->cmap = DefaultColormap(g_dpy, g_screen);
+    }
+}
+
+static Window panel_create_window(Panel *p, int x, int y, int w, int h)
+{
+    XSetWindowAttributes attrs;
+    memset(&attrs, 0, sizeof(attrs));
+    attrs.override_redirect = True;
+    attrs.colormap = p->cmap;
+    attrs.border_pixel = 0;
+    attrs.background_pixel = 0;
+    attrs.event_mask = ButtonPressMask | EnterWindowMask | LeaveWindowMask | ExposureMask;
+
+    Window win = XCreateWindow(g_dpy, g_root, x, y, (unsigned)w, (unsigned)h, 0, p->depth, InputOutput, p->visual,
+                                CWOverrideRedirect | CWColormap | CWBorderPixel | CWBackPixel | CWEventMask, &attrs);
+
+    char title[64];
+    snprintf(title, sizeof(title), "xispanel:%s", p->name);
+    XStoreName(g_dpy, win, title);
+    XClassHint ch = {(char *)"xispanel", (char *)"xispanel"};
+    XSetClassHint(g_dpy, win, &ch);
+
+    XChangeProperty(g_dpy, win, g_atom_wm_window_type, XA_ATOM, 32, PropModeReplace, (unsigned char *)&g_atom_wm_window_type_dock, 1);
+
+    return win;
+}
+
+static Window panel_create_sensor(Panel *p)
+{
+    XSetWindowAttributes attrs;
+    memset(&attrs, 0, sizeof(attrs));
+    attrs.override_redirect = True;
+    attrs.background_pixel = BlackPixel(g_dpy, g_screen);
+    attrs.event_mask = EnterWindowMask;
+
+    int sx, sy, sw, sh;
+    if (p->edge == EDGE_TOP || p->edge == EDGE_BOTTOM) {
+        sx = p->x;
+        sy = (p->edge == EDGE_TOP) ? p->out_y : (p->out_y + p->out_h - 1);
+        sw = p->w;
+        sh = 1;
+    } else {
+        sx = (p->edge == EDGE_LEFT) ? p->out_x : (p->out_x + p->out_w - 1);
+        sy = p->y;
+        sw = 1;
+        sh = p->h;
+    }
+
+    Window win = XCreateWindow(g_dpy, g_root, sx, sy, (unsigned)sw, (unsigned)sh, 0, CopyFromParent, InputOutput,
+                                DefaultVisual(g_dpy, g_screen), CWOverrideRedirect | CWBackPixel | CWEventMask, &attrs);
+    XMapWindow(g_dpy, win);
+    /* Must stay on top (not lowered) or it would sit behind whatever else
+     * occupies that screen edge and never receive the EnterNotify that
+     * triggers the show animation -- X only delivers pointer-crossing
+     * events to the topmost window under the pointer. */
+    XRaiseWindow(g_dpy, win);
+    return win;
+}
+
+static void panel_create_surface(Panel *p)
+{
+    p->surface = cairo_xlib_surface_create(g_dpy, p->win, p->visual, p->w, p->h);
+    p->cr = cairo_create(p->surface);
+    if (g_font_face) {
+        cairo_set_font_face(p->cr, g_font_face);
+    }
+    cairo_set_font_size(p->cr, p->thickness * 0.45);
+}
+
+/* ------------------------------------------------------------------ */
+/* layout + paint                                                       */
+/* ------------------------------------------------------------------ */
+
+static void panel_layout(Panel *p)
+{
+    int axis_len = (p->edge == EDGE_TOP || p->edge == EDGE_BOTTOM) ? p->w : p->h;
+    int lens[MAX_WIDGETS];
+    int n_greedy = 0;
+    int fixed_total = 0;
+
+    for (int i = 0; i < p->n_widgets; i++) {
+        PanelWidget *w = &p->widgets[i];
+        int out_len = 0;
+        if (w->ops->measure) {
+            w->ops->measure(w, p->thickness, &out_len);
+        }
+        lens[i] = out_len;
+        if (out_len < 0) {
+            n_greedy++;
+        } else {
+            fixed_total += out_len;
+        }
+    }
+
+    int spacing_total = p->spacing * (p->n_widgets > 0 ? p->n_widgets - 1 : 0);
+    int remaining = axis_len - fixed_total - spacing_total;
+    int greedy_each = (n_greedy > 0 && remaining > 0) ? remaining / n_greedy : 0;
+
+    int cursor = 0;
+    for (int i = 0; i < p->n_widgets; i++) {
+        PanelWidget *w = &p->widgets[i];
+        int len = lens[i] < 0 ? greedy_each : lens[i];
+        if (len < 0) {
+            len = 0;
+        }
+        w->x = cursor;
+        w->len = len;
+        w->thickness = p->thickness;
+        cursor += len + p->spacing;
+    }
+}
+
+static void panel_repaint(Panel *p)
+{
+    if (!p->cr) {
+        return;
+    }
+    cairo_save(p->cr);
+    cairo_set_operator(p->cr, CAIRO_OPERATOR_SOURCE);
+    cairo_set_source_rgba(p->cr, p->bg_r, p->bg_g, p->bg_b, p->bg_a);
+    cairo_paint(p->cr);
+    cairo_restore(p->cr);
+
+    cairo_set_operator(p->cr, CAIRO_OPERATOR_OVER);
+    for (int i = 0; i < p->n_widgets; i++) {
+        PanelWidget *w = &p->widgets[i];
+        if (w->ops->paint) {
+            cairo_save(p->cr);
+            w->ops->paint(w, p->cr);
+            cairo_restore(p->cr);
+        }
+    }
+    cairo_surface_flush(p->surface);
+    XFlush(g_dpy);
+    p->dirty = 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* autohide state machine                                               */
+/* ------------------------------------------------------------------ */
+
+static void panel_autohide_enter(Panel *p)
+{
+    if (p->mode != MODE_AUTOHIDE) {
+        return;
+    }
+    p->ah_hide_deadline_ms = 0;
+    if (p->ah_state == AH_SHOWN || p->ah_state == AH_SHOWING) {
+        return;
+    }
+    p->ah_state = AH_SHOWING;
+    p->ah_anim_start_ms = now_ms();
+    if (!p->mapped) {
+        XMoveWindow(g_dpy, p->win, p->hidden_x, p->hidden_y);
+        XMapWindow(g_dpy, p->win);
+        XRaiseWindow(g_dpy, p->win);
+        p->mapped = 1;
+    }
+}
+
+static void panel_autohide_leave(Panel *p)
+{
+    if (p->mode != MODE_AUTOHIDE) {
+        return;
+    }
+    if (p->ah_state == AH_SHOWN || p->ah_state == AH_SHOWING) {
+        p->ah_hide_deadline_ms = now_ms() + AUTOHIDE_DELAY_MS;
+    }
+}
+
+static int lerp_int(int from, int to, double t)
+{
+    return from + (int)((to - from) * t + 0.5);
+}
+
+/* Advances one autohide animation step for `p`. Returns 1 if `p` needs to
+ * be woken again soon (mid-animation or waiting out the hide delay). */
+static int panel_autohide_tick(Panel *p, uint64_t now)
+{
+    if (p->mode != MODE_AUTOHIDE) {
+        return 0;
+    }
+
+    if (p->ah_hide_deadline_ms && now >= p->ah_hide_deadline_ms) {
+        p->ah_hide_deadline_ms = 0;
+        p->ah_state = AH_HIDING;
+        p->ah_anim_start_ms = now;
+    }
+
+    if (p->ah_state == AH_SHOWING || p->ah_state == AH_HIDING) {
+        double t = (double)(now - p->ah_anim_start_ms) / AUTOHIDE_ANIM_MS;
+        if (t >= 1.0) {
+            t = 1.0;
+        }
+        int from_x = (p->ah_state == AH_SHOWING) ? p->hidden_x : p->x;
+        int from_y = (p->ah_state == AH_SHOWING) ? p->hidden_y : p->y;
+        int to_x = (p->ah_state == AH_SHOWING) ? p->x : p->hidden_x;
+        int to_y = (p->ah_state == AH_SHOWING) ? p->y : p->hidden_y;
+        XMoveWindow(g_dpy, p->win, lerp_int(from_x, to_x, t), lerp_int(from_y, to_y, t));
+        if (t >= 1.0) {
+            if (p->ah_state == AH_SHOWING) {
+                p->ah_state = AH_SHOWN;
+            } else {
+                p->ah_state = AH_HIDDEN;
+                XUnmapWindow(g_dpy, p->win);
+                p->mapped = 0;
+            }
+            return p->ah_hide_deadline_ms != 0;
+        }
+        return 1;
+    }
+
+    return p->ah_hide_deadline_ms != 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* panel lifecycle                                                      */
+/* ------------------------------------------------------------------ */
+
+static void panel_destroy_widgets(Panel *p)
+{
+    for (int i = 0; i < p->n_widgets; i++) {
+        PanelWidget *w = &p->widgets[i];
+        if (w->ops->destroy) {
+            w->ops->destroy(w);
+        }
+        free(w->priv);
+    }
+    p->n_widgets = 0;
+}
+
+static void panel_deactivate(Panel *p)
+{
+    panel_destroy_widgets(p);
+    if (p->cr) {
+        cairo_destroy(p->cr);
+        p->cr = NULL;
+    }
+    if (p->surface) {
+        cairo_surface_destroy(p->surface);
+        p->surface = NULL;
+    }
+    if (p->sensor_win != None) {
+        XDestroyWindow(g_dpy, p->sensor_win);
+        p->sensor_win = None;
+    }
+    if (p->win != None) {
+        XDestroyWindow(g_dpy, p->win);
+        p->win = None;
+    }
+    if (p->cmap != None && p->cmap != DefaultColormap(g_dpy, g_screen)) {
+        XFreeColormap(g_dpy, p->cmap);
+        p->cmap = None;
+    }
+}
+
+static void panel_activate(Panel *p)
+{
+    panel_resolve_geometry(p);
+    panel_pick_visual(p);
+
+    int start_x = p->x, start_y = p->y;
+    p->ah_state = AH_HIDDEN;
+    p->ah_hide_deadline_ms = 0;
+    if (p->mode == MODE_AUTOHIDE) {
+        start_x = p->hidden_x;
+        start_y = p->hidden_y;
+    }
+
+    p->win = panel_create_window(p, start_x, start_y, p->w, p->h);
+    panel_apply_strut(p);
+    panel_create_surface(p);
+
+    for (int i = 0; i < p->n_widgets; i++) {
+        p->widgets[i].panel = p;
+    }
+    panel_layout(p);
+
+    if (p->mode == MODE_AUTOHIDE) {
+        p->sensor_win = panel_create_sensor(p);
+        p->mapped = 0;
+    } else {
+        XMapWindow(g_dpy, p->win);
+        XRaiseWindow(g_dpy, p->win);
+        p->mapped = 1;
+    }
+    p->dirty = 1;
+}
+
+static Panel *find_panel(const char *name)
+{
+    for (int i = 0; i < MAX_PANELS; i++) {
+        if (g_panels[i].in_use && strcmp(g_panels[i].name, name) == 0) {
+            return &g_panels[i];
+        }
+    }
+    return NULL;
+}
+
+static Panel *alloc_panel(const char *name, const char *output)
+{
+    for (int i = 0; i < MAX_PANELS; i++) {
+        if (!g_panels[i].in_use) {
+            Panel *p = &g_panels[i];
+            memset(p, 0, sizeof(*p));
+            p->in_use = 1;
+            snprintf(p->name, sizeof(p->name), "%s", name);
+            snprintf(p->output, sizeof(p->output), "%s", output);
+            p->edge = EDGE_TOP;
+            p->pct = 100;
+            p->thickness_cfg = 32;
+            p->mode = MODE_DOCK;
+            p->bg_r = 0.12;
+            p->bg_g = 0.12;
+            p->bg_b = 0.12;
+            p->bg_a = 0.85;
+            p->fg_r = p->fg_g = p->fg_b = 0.93;
+            p->fg_a = 1.0;
+            p->spacing = 4;
+            return p;
+        }
+    }
+    return NULL;
+}
+
+static void panel_add_widget(Panel *p, int order, const char *type, const char *kvline)
+{
+    (void)order; /* config lines are already emitted in the desired order */
+    if (p->n_widgets >= MAX_WIDGETS) {
+        fprintf(stderr, "xispanel: panel '%s': too many widgets, ignoring '%s'\n", p->name, type);
+        return;
+    }
+    const PanelWidgetOps *ops = find_widget_ops(type);
+    if (!ops) {
+        fprintf(stderr, "xispanel: panel '%s': unknown widget type '%s'\n", p->name, type);
+        return;
+    }
+    PanelWidget *w = &p->widgets[p->n_widgets++];
+    memset(w, 0, sizeof(*w));
+    w->ops = ops;
+    w->panel = p;
+    snprintf(w->config_kv, sizeof(w->config_kv), "%s", kvline ? kvline : "");
+    if (ops->priv_size > 0) {
+        w->priv = calloc(1, ops->priv_size);
+    }
+    if (ops->init) {
+        ops->init(w);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* config ($XDG_CONFIG_HOME/xispanel.conf)                              */
+/* ------------------------------------------------------------------ */
+
+static enum edge parse_edge(const char *s)
+{
+    if (!strcmp(s, "bottom")) {
+        return EDGE_BOTTOM;
+    }
+    if (!strcmp(s, "left")) {
+        return EDGE_LEFT;
+    }
+    if (!strcmp(s, "right")) {
+        return EDGE_RIGHT;
+    }
+    return EDGE_TOP;
+}
+
+static enum panel_mode parse_mode(const char *s)
+{
+    if (!strcmp(s, "overlay")) {
+        return MODE_OVERLAY;
+    }
+    if (!strcmp(s, "autohide")) {
+        return MODE_AUTOHIDE;
+    }
+    return MODE_DOCK;
+}
+
+static void apply_panel_kv(Panel *p, const char *kvline)
+{
+    char buf[64];
+    if (kv_get(kvline, "edge", buf, sizeof(buf))) {
+        p->edge = parse_edge(buf);
+    }
+    p->pct = kv_get_int(kvline, "pct", p->pct);
+    if (p->pct < 1) {
+        p->pct = 1;
+    }
+    if (p->pct > 100) {
+        p->pct = 100;
+    }
+    p->thickness_cfg = kv_get_int(kvline, "thickness", p->thickness_cfg);
+    if (kv_get(kvline, "mode", buf, sizeof(buf))) {
+        p->mode = parse_mode(buf);
+    }
+}
+
+static void apply_theme_kv(Panel *p, const char *kvline)
+{
+    char buf[32];
+    if (kv_get(kvline, "bg", buf, sizeof(buf))) {
+        parse_hex_color(buf, &p->bg_r, &p->bg_g, &p->bg_b, &p->bg_a);
+    }
+    if (kv_get(kvline, "fg", buf, sizeof(buf))) {
+        parse_hex_color(buf, &p->fg_r, &p->fg_g, &p->fg_b, &p->fg_a);
+    }
+    p->spacing = kv_get_int(kvline, "spacing", p->spacing);
+}
+
+static void load_config(void)
+{
+    FILE *f = fopen(g_configpath, "r");
+    if (!f) {
+        return;
+    }
+    char line[LINE_MAX_LEN];
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[--len] = 0;
+        }
+        if (len == 0 || line[0] == '#') {
+            continue;
+        }
+
+        char *fields[16];
+        int nf = 0;
+        char *p = line;
+        fields[nf++] = p;
+        while (nf < 16 && (p = strchr(p, '\t'))) {
+            *p = 0;
+            p++;
+            fields[nf++] = p;
+        }
+
+        if (strcmp(fields[0], "PANEL") == 0 && nf >= 3) {
+            Panel *pan = alloc_panel(fields[1], fields[2]);
+            if (!pan) {
+                fprintf(stderr, "xispanel: config: too many panels, ignoring '%s'\n", fields[1]);
+                continue;
+            }
+            char kvline[LINE_MAX_LEN];
+            join_fields(fields, 3, nf, kvline, sizeof(kvline));
+            apply_panel_kv(pan, kvline);
+        } else if (strcmp(fields[0], "WIDGET") == 0 && nf >= 4) {
+            Panel *pan = find_panel(fields[1]);
+            if (!pan) {
+                fprintf(stderr, "xispanel: config: WIDGET references unknown panel '%s'\n", fields[1]);
+                continue;
+            }
+            char kvline[LINE_MAX_LEN];
+            join_fields(fields, 4, nf, kvline, sizeof(kvline));
+            panel_add_widget(pan, atoi(fields[2]), fields[3], kvline);
+        } else if (strcmp(fields[0], "THEME") == 0 && nf >= 2) {
+            Panel *pan = find_panel(fields[1]);
+            if (!pan) {
+                fprintf(stderr, "xispanel: config: THEME references unknown panel '%s'\n", fields[1]);
+                continue;
+            }
+            char kvline[LINE_MAX_LEN];
+            join_fields(fields, 2, nf, kvline, sizeof(kvline));
+            apply_theme_kv(pan, kvline);
+        } else {
+            fprintf(stderr, "xispanel: config: skipping unknown line: '%s'\n", line);
+        }
+    }
+    fclose(f);
+}
+
+static void reload_all_panels(void)
+{
+    for (int i = 0; i < MAX_PANELS; i++) {
+        if (g_panels[i].in_use) {
+            panel_deactivate(&g_panels[i]);
+        }
+    }
+    memset(g_panels, 0, sizeof(g_panels));
+    load_config();
+    for (int i = 0; i < MAX_PANELS; i++) {
+        if (g_panels[i].in_use) {
+            panel_activate(&g_panels[i]);
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* IPC (line-JSON over $XDG_RUNTIME_DIR/xispanel-ctl.sock)              */
+/* ------------------------------------------------------------------ */
+
+/* sockaddr_un.sun_path is only 108 bytes on Linux, well short of PATH_MAX
+ * -- an unusually long $XDG_RUNTIME_DIR would otherwise get silently
+ * truncated by snprintf, and two differently-long paths could then
+ * collide on the same truncated socket name. Fail loudly instead. */
+static int build_sockaddr_un(struct sockaddr_un *addr, const char *path)
+{
+    memset(addr, 0, sizeof(*addr));
+    addr->sun_family = AF_UNIX;
+    if (strlen(path) >= sizeof(addr->sun_path)) {
+        fprintf(stderr, "xispanel: socket path too long (>%zu bytes): %s\n", sizeof(addr->sun_path) - 1, path);
+        return -1;
+    }
+    memcpy(addr->sun_path, path, strlen(path) + 1);
+    return 0;
+}
+
+/* Same minimal flat-JSON helpers as xisguard-ctl -- good enough for the
+ * request shapes this protocol actually needs, no parser dependency. */
+static int json_get_str(const char *msg, const char *key, char *dst, size_t dst_sz)
+{
+    dst[0] = 0;
+    char needle[64];
+    snprintf(needle, sizeof(needle), "\"%s\":", key);
+    const char *p = strstr(msg, needle);
+    if (!p) {
+        return 0;
+    }
+    p += strlen(needle);
+    while (*p == ' ') {
+        p++;
+    }
+    if (*p != '"') {
+        return 0;
+    }
+    p++;
+    const char *end = strchr(p, '"');
+    if (!end) {
+        return 0;
+    }
+    size_t len = (size_t)(end - p);
+    if (len >= dst_sz) {
+        len = dst_sz - 1;
+    }
+    memcpy(dst, p, len);
+    dst[len] = 0;
+    return 1;
+}
+
+static void handle_ipc_message(const char *req, char *resp, size_t resp_sz)
+{
+    char cmd[32];
+    json_get_str(req, "cmd", cmd, sizeof(cmd));
+
+    if (strcmp(cmd, "PING") == 0) {
+        snprintf(resp, resp_sz, "{\"ok\":true,\"pong\":true}\n");
+    } else if (strcmp(cmd, "GET_STATUS") == 0) {
+        int n_panels = 0;
+        for (int i = 0; i < MAX_PANELS; i++) {
+            if (g_panels[i].in_use) {
+                n_panels++;
+            }
+        }
+        snprintf(resp, resp_sz, "{\"ok\":true,\"version\":\"%s\",\"panels\":%d}\n", XISPANEL_VERSION, n_panels);
+    } else if (strcmp(cmd, "RELOAD") == 0) {
+        reload_all_panels();
+        snprintf(resp, resp_sz, "{\"ok\":true}\n");
+    } else if (strcmp(cmd, "QUIT") == 0) {
+        g_quit = 1;
+        snprintf(resp, resp_sz, "{\"ok\":true}\n");
+    } else {
+        snprintf(resp, resp_sz, "{\"ok\":false,\"error\":\"unknown command\"}\n");
+    }
+}
+
+static int ipc_client_request(const char *sockpath, const char *req)
+{
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        perror("xispanel: socket");
+        return 1;
+    }
+    struct sockaddr_un addr;
+    if (build_sockaddr_un(&addr, sockpath) != 0) {
+        close(fd);
+        return 1;
+    }
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        fprintf(stderr, "xispanel: could not connect to daemon (%s)\n", sockpath);
+        close(fd);
+        return 1;
+    }
+    if (write(fd, req, strlen(req)) < 0) {
+        perror("xispanel: write");
+    }
+    shutdown(fd, SHUT_WR);
+
+    char buf[IPC_MAX_LEN];
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof(buf) - 1)) > 0) {
+        buf[n] = 0;
+        fputs(buf, stdout);
+    }
+    close(fd);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* main loop                                                            */
+/* ------------------------------------------------------------------ */
+
+static void handle_signal(int sig)
+{
+    (void)sig;
+    g_quit = 1;
+}
+
+static Panel *find_panel_by_window(Window win, int *is_sensor)
+{
+    for (int i = 0; i < MAX_PANELS; i++) {
+        if (!g_panels[i].in_use) {
+            continue;
+        }
+        if (g_panels[i].win == win) {
+            *is_sensor = 0;
+            return &g_panels[i];
+        }
+        if (g_panels[i].sensor_win == win) {
+            *is_sensor = 1;
+            return &g_panels[i];
+        }
+    }
+    return NULL;
+}
+
+static void dispatch_button(Panel *p, int button, int x, int y)
+{
+    int axis_pos = (p->edge == EDGE_TOP || p->edge == EDGE_BOTTOM) ? x : y;
+    for (int i = 0; i < p->n_widgets; i++) {
+        PanelWidget *w = &p->widgets[i];
+        if (axis_pos >= w->x && axis_pos < w->x + w->len) {
+            if (w->ops->on_button) {
+                int local = axis_pos - w->x;
+                w->ops->on_button(w, button, local, 0);
+            }
+            return;
+        }
+    }
+}
+
+static int run_as_daemon(const char *sockpath)
+{
+    g_dpy = XOpenDisplay(NULL);
+    if (!g_dpy) {
+        fprintf(stderr, "xispanel: could not open the X display\n");
+        return 1;
+    }
+    g_screen = DefaultScreen(g_dpy);
+    g_root = RootWindow(g_dpy, g_screen);
+
+    imlib_context_set_display(g_dpy);
+    imlib_context_set_visual(DefaultVisual(g_dpy, g_screen));
+    imlib_context_set_colormap(DefaultColormap(g_dpy, g_screen));
+    imlib_context_set_anti_alias(1);
+    imlib_context_set_dither(1);
+
+    if (init_font(NULL) != 0) {
+        fprintf(stderr, "xispanel: could not resolve a default font via fontconfig\n");
+    }
+
+    g_atom_wm_window_type = XInternAtom(g_dpy, "_NET_WM_WINDOW_TYPE", False);
+    g_atom_wm_window_type_dock = XInternAtom(g_dpy, "_NET_WM_WINDOW_TYPE_DOCK", False);
+    g_atom_wm_strut = XInternAtom(g_dpy, "_NET_WM_STRUT", False);
+    g_atom_wm_strut_partial = XInternAtom(g_dpy, "_NET_WM_STRUT_PARTIAL", False);
+
+    int rr_error_base;
+    if (!XRRQueryExtension(g_dpy, &g_rr_event_base, &rr_error_base)) {
+        fprintf(stderr, "xispanel: RandR extension unavailable, named outputs won't work\n");
+        g_rr_event_base = -1;
+    } else {
+        XRRSelectInput(g_dpy, g_root, RRScreenChangeNotifyMask);
+    }
+
+    unlink(sockpath);
+    int listenfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un addr;
+    if (build_sockaddr_un(&addr, sockpath) != 0) {
+        return 1;
+    }
+    if (bind(listenfd, (struct sockaddr *)&addr, sizeof(addr)) != 0 || listen(listenfd, 16) != 0) {
+        perror("xispanel: bind/listen");
+        return 1;
+    }
+    chmod(sockpath, 0600);
+
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
+    signal(SIGPIPE, SIG_IGN);
+    fcntl(listenfd, F_SETFD, FD_CLOEXEC);
+    fcntl(ConnectionNumber(g_dpy), F_SETFD, FD_CLOEXEC);
+
+    reload_all_panels();
+    XFlush(g_dpy);
+
+    int xfd = ConnectionNumber(g_dpy);
+    while (!g_quit) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(listenfd, &rfds);
+        FD_SET(xfd, &rfds);
+        int maxfd = listenfd > xfd ? listenfd : xfd;
+
+        uint64_t now = now_ms();
+        long timeout_ms = -1;
+        int any_animating = 0;
+        uint64_t soonest_tick = 0;
+
+        for (int i = 0; i < MAX_PANELS; i++) {
+            Panel *p = &g_panels[i];
+            if (!p->in_use) {
+                continue;
+            }
+            if (p->mode == MODE_AUTOHIDE && (p->ah_state == AH_SHOWING || p->ah_state == AH_HIDING || p->ah_hide_deadline_ms)) {
+                any_animating = 1;
+            }
+            for (int j = 0; j < p->n_widgets; j++) {
+                uint64_t t = p->widgets[j].next_tick_ms;
+                if (t != 0 && (soonest_tick == 0 || t < soonest_tick)) {
+                    soonest_tick = t;
+                }
+            }
+        }
+        if (any_animating) {
+            timeout_ms = 33;
+        }
+        if (soonest_tick != 0) {
+            long delta = (long)(soonest_tick > now ? soonest_tick - now : 0);
+            if (timeout_ms < 0 || delta < timeout_ms) {
+                timeout_ms = delta;
+            }
+        }
+
+        struct timeval tv;
+        struct timeval *tvp = NULL;
+        if (timeout_ms >= 0) {
+            tv.tv_sec = timeout_ms / 1000;
+            tv.tv_usec = (timeout_ms % 1000) * 1000;
+            tvp = &tv;
+        }
+
+        int r = select(maxfd + 1, &rfds, NULL, NULL, tvp);
+        if (r < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+
+        if (r > 0 && FD_ISSET(listenfd, &rfds)) {
+            int cfd = accept(listenfd, NULL, NULL);
+            if (cfd >= 0) {
+                struct timeval tvto = {5, 0};
+                setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tvto, sizeof(tvto));
+                setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tvto, sizeof(tvto));
+                char reqbuf[IPC_MAX_LEN];
+                ssize_t n = read(cfd, reqbuf, sizeof(reqbuf) - 1);
+                if (n > 0) {
+                    reqbuf[n] = 0;
+                    char resp[IPC_MAX_LEN];
+                    handle_ipc_message(reqbuf, resp, sizeof(resp));
+                    if (write(cfd, resp, strlen(resp)) < 0) {
+                        perror("xispanel: write");
+                    }
+                }
+                close(cfd);
+            }
+        }
+
+        if (r > 0 && FD_ISSET(xfd, &rfds)) {
+            while (XPending(g_dpy)) {
+                XEvent ev;
+                XNextEvent(g_dpy, &ev);
+                if (g_rr_event_base >= 0 && ev.type == g_rr_event_base + RRScreenChangeNotify) {
+                    XRRUpdateConfiguration(&ev);
+                    reload_all_panels();
+                    XFlush(g_dpy);
+                } else if (ev.type == ButtonPress) {
+                    int is_sensor = 0;
+                    Panel *p = find_panel_by_window(ev.xbutton.window, &is_sensor);
+                    if (p && !is_sensor) {
+                        dispatch_button(p, (int)ev.xbutton.button, ev.xbutton.x, ev.xbutton.y);
+                    }
+                } else if (ev.type == EnterNotify) {
+                    int is_sensor = 0;
+                    Panel *p = find_panel_by_window(ev.xcrossing.window, &is_sensor);
+                    if (p) {
+                        panel_autohide_enter(p);
+                    }
+                } else if (ev.type == LeaveNotify) {
+                    int is_sensor = 0;
+                    Panel *p = find_panel_by_window(ev.xcrossing.window, &is_sensor);
+                    if (p && !is_sensor) {
+                        panel_autohide_leave(p);
+                    }
+                } else if (ev.type == Expose) {
+                    int is_sensor = 0;
+                    Panel *p = find_panel_by_window(ev.xexpose.window, &is_sensor);
+                    if (p && !is_sensor) {
+                        p->dirty = 1;
+                    }
+                }
+            }
+        }
+
+        now = now_ms();
+        for (int i = 0; i < MAX_PANELS; i++) {
+            Panel *p = &g_panels[i];
+            if (!p->in_use) {
+                continue;
+            }
+            panel_autohide_tick(p, now);
+            for (int j = 0; j < p->n_widgets; j++) {
+                PanelWidget *w = &p->widgets[j];
+                if (w->next_tick_ms != 0 && now >= w->next_tick_ms && w->ops->on_tick) {
+                    w->ops->on_tick(w, now);
+                    p->dirty = 1;
+                }
+            }
+            if (p->dirty && p->mapped) {
+                panel_layout(p);
+                panel_repaint(p);
+            }
+        }
+        /* Autohide's XMoveWindow/XMapWindow/XUnmapWindow calls above (and
+         * panel_autohide_enter()'s, from the event-handling block earlier
+         * in this iteration) are buffered by Xlib until something flushes
+         * them. Xlib only auto-flushes from XPending()/XNextEvent(), which
+         * we only call when the X fd is already readable -- without this,
+         * a pure animation/timeout-driven tick (no incoming X event) could
+         * sit in the client buffer indefinitely, waiting for unrelated
+         * server traffic to nudge it out. */
+        XFlush(g_dpy);
+    }
+
+    for (int i = 0; i < MAX_PANELS; i++) {
+        if (g_panels[i].in_use) {
+            panel_deactivate(&g_panels[i]);
+        }
+    }
+    close(listenfd);
+    unlink(sockpath);
+    if (g_font_face) {
+        cairo_font_face_destroy(g_font_face);
+    }
+    if (g_ft_face) {
+        FT_Done_Face(g_ft_face);
+    }
+    if (g_ft_lib) {
+        FT_Done_FreeType(g_ft_lib);
+    }
+    XCloseDisplay(g_dpy);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* entry point                                                          */
+/* ------------------------------------------------------------------ */
+
+static void usage(const char *prog)
+{
+    fprintf(stderr,
+            "usage: %s [options]\n"
+            "\n"
+            "  --reload    tell the running daemon to reload its config\n"
+            "  --quit      stop the running daemon\n"
+            "  --version   print version and exit\n"
+            "\n"
+            "With no options, runs as the daemon (or does nothing but report\n"
+            "'already running' if one is active). Panels/widgets/theme are\n"
+            "configured in $XDG_CONFIG_HOME/xispanel.conf -- see PROTOCOL.md.\n",
+            prog);
+}
+
+int main(int argc, char **argv)
+{
+    const char *rundir = getenv("XDG_RUNTIME_DIR");
+    if (!rundir || !*rundir) {
+        rundir = "/tmp";
+    }
+    char sockpath[PATH_MAX];
+    char lockpath[PATH_MAX];
+    snprintf(sockpath, sizeof(sockpath), "%s/xispanel-ctl.sock", rundir);
+    snprintf(lockpath, sizeof(lockpath), "%s/xispanel.lock", rundir);
+
+    const char *xdg_config = getenv("XDG_CONFIG_HOME");
+    if (xdg_config && *xdg_config) {
+        mkdir(xdg_config, 0700);
+        snprintf(g_configpath, sizeof(g_configpath), "%s/xispanel.conf", xdg_config);
+    } else {
+        const char *home = getenv("HOME");
+        if (!home || !*home) {
+            home = "/tmp";
+        }
+        char configdir[PATH_MAX];
+        snprintf(configdir, sizeof(configdir), "%s/.config", home);
+        mkdir(configdir, 0700);
+        snprintf(g_configpath, sizeof(g_configpath), "%s/xispanel.conf", configdir);
+    }
+
+    if (argc > 1) {
+        if (!strcmp(argv[1], "--version")) {
+            printf("xispanel %s\n", XISPANEL_VERSION);
+            return 0;
+        }
+        if (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help")) {
+            usage(argv[0]);
+            return 0;
+        }
+        if (!strcmp(argv[1], "--quit")) {
+            return ipc_client_request(sockpath, "{\"cmd\":\"QUIT\"}\n");
+        }
+        if (!strcmp(argv[1], "--reload")) {
+            return ipc_client_request(sockpath, "{\"cmd\":\"RELOAD\"}\n");
+        }
+        fprintf(stderr, "xispanel: unknown option '%s'\n", argv[1]);
+        usage(argv[0]);
+        return 1;
+    }
+
+    int lockfd = open(lockpath, O_CREAT | O_RDWR, 0600);
+    if (lockfd < 0) {
+        perror("xispanel: open lock");
+        return 1;
+    }
+    if (flock(lockfd, LOCK_EX | LOCK_NB) != 0) {
+        close(lockfd);
+        fprintf(stderr, "xispanel: already running\n");
+        return 1;
+    }
+
+    return run_as_daemon(sockpath);
+}
