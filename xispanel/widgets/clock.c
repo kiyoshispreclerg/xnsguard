@@ -46,6 +46,23 @@ static void clock_measure(PanelWidget *w, int cross_axis, int *out_len, int *out
     *out_min_len = *out_len; /* a clipped clock is worse than useless -- don't shrink it */
 }
 
+static int clock_get_tooltip(PanelWidget *w, int local_x, char *buf, size_t bufsz, int *anchor_x, int *anchor_w)
+{
+    (void)local_x;
+    time_t t = time(NULL);
+    struct tm tmv;
+    localtime_r(&t, &tmv);
+    /* Full weekday + date on one line, HH:MM:SS on the next -- locale-aware
+     * (see setlocale(LC_TIME) in main()), unlike the panel's short format. */
+    char line1[96], line2[32];
+    strftime(line1, sizeof(line1), "%A, %d de %B de %Y", &tmv);
+    strftime(line2, sizeof(line2), "%H:%M:%S", &tmv);
+    snprintf(buf, bufsz, "%s\n%s", line1, line2);
+    *anchor_x = 0;
+    *anchor_w = w->len;
+    return 1;
+}
+
 static void clock_paint(PanelWidget *w, cairo_t *cr)
 {
     ClockPriv *cp = w->priv;
@@ -71,4 +88,5 @@ const PanelWidgetOps clock_ops = {
     .paint = clock_paint,
     .on_button = NULL,
     .on_tick = clock_on_tick,
+    .get_tooltip = clock_get_tooltip,
 };

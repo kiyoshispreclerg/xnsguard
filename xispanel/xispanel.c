@@ -67,6 +67,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <locale.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -436,7 +437,7 @@ static Window panel_create_window(Panel *p, int x, int y, int w, int h)
     attrs.colormap = p->cmap;
     attrs.border_pixel = 0;
     attrs.background_pixel = 0;
-    attrs.event_mask = ButtonPressMask | EnterWindowMask | LeaveWindowMask | ExposureMask;
+    attrs.event_mask = ButtonPressMask | EnterWindowMask | LeaveWindowMask | PointerMotionMask | ExposureMask;
 
     Window win = XCreateWindow(g_dpy, g_root, x, y, (unsigned)w, (unsigned)h, 0, p->depth, InputOutput, p->visual,
                                 CWOverrideRedirect | CWColormap | CWBorderPixel | CWBackPixel | CWEventMask, &attrs);
@@ -1034,6 +1035,7 @@ static void load_config(void)
 static void reload_all_panels(void)
 {
     panel_menu_close(); /* about to invalidate every Panel/PanelWidget it could reference */
+    tooltip_close();
     for (int i = 0; i < MAX_PANELS; i++) {
         if (g_panels[i].in_use) {
             panel_deactivate(&g_panels[i]);
@@ -1294,6 +1296,13 @@ static int run_as_daemon(const char *sockpath)
                 timeout_ms = delta;
             }
         }
+        uint64_t tooltip_wake = tooltip_next_wake_ms();
+        if (tooltip_wake != 0) {
+            long delta = (long)(tooltip_wake > now ? tooltip_wake - now : 0);
+            if (timeout_ms < 0 || delta < timeout_ms) {
+                timeout_ms = delta;
+            }
+        }
 
         struct timeval tv;
         struct timeval *tvp = NULL;
@@ -1341,11 +1350,22 @@ static int run_as_daemon(const char *sockpath)
                     XFlush(g_dpy);
                 } else if (panel_menu_handle_event(&ev)) {
                     /* consumed by the open context menu */
+                } else if (tooltip_handle_event(&ev)) {
+                    /* consumed by the tooltip popup (just Expose -- it
+                     * takes no grab and never handles clicks) */
                 } else if (ev.type == ButtonPress) {
                     int is_sensor = 0;
                     Panel *p = find_panel_by_window(ev.xbutton.window, &is_sensor);
                     if (p && !is_sensor) {
+                        tooltip_close();
                         dispatch_button(p, (int)ev.xbutton.button, ev.xbutton.x, ev.xbutton.y, ev.xbutton.x_root, ev.xbutton.y_root);
+                    }
+                } else if (ev.type == MotionNotify) {
+                    int is_sensor = 0;
+                    Panel *p = find_panel_by_window(ev.xmotion.window, &is_sensor);
+                    if (p && !is_sensor) {
+                        int axis_pos = (p->edge == EDGE_TOP || p->edge == EDGE_BOTTOM) ? ev.xmotion.x : ev.xmotion.y;
+                        tooltip_notice_motion(p, axis_pos);
                     }
                 } else if (ev.type == EnterNotify) {
                     int is_sensor = 0;
@@ -1358,6 +1378,7 @@ static int run_as_daemon(const char *sockpath)
                     Panel *p = find_panel_by_window(ev.xcrossing.window, &is_sensor);
                     if (p && !is_sensor) {
                         panel_autohide_leave(p);
+                        tooltip_notice_leave(p);
                     }
                 } else if (ev.type == Expose) {
                     int is_sensor = 0;
@@ -1370,6 +1391,7 @@ static int run_as_daemon(const char *sockpath)
         }
 
         now = now_ms();
+        tooltip_tick(now);
         for (int i = 0; i < MAX_PANELS; i++) {
             Panel *p = &g_panels[i];
             if (!p->in_use) {
@@ -1400,6 +1422,7 @@ static int run_as_daemon(const char *sockpath)
     }
 
     panel_menu_close();
+    tooltip_close();
     for (int i = 0; i < MAX_PANELS; i++) {
         if (g_panels[i].in_use) {
             panel_deactivate(&g_panels[i]);
@@ -1441,6 +1464,11 @@ static void usage(const char *prog)
 
 int main(int argc, char **argv)
 {
+    /* LC_TIME affects strftime()'s %A/%B (full weekday/month names) --
+     * clock's short "%H:%M" panel format is locale-independent, but its
+     * tooltip's full "weekday, day de month de year" isn't. */
+    setlocale(LC_TIME, "");
+
     const char *rundir = getenv("XDG_RUNTIME_DIR");
     if (!rundir || !*rundir) {
         rundir = "/tmp";

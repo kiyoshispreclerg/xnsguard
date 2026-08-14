@@ -32,7 +32,11 @@ Imlib2 for image decoding -- the same dependency spirit as
   per-type minimum instead of overflowing it (see PROTOCOL.md's "Widget
   sizing").
 - A generic context-menu popup any widget can use for itself or a
-  sub-item, not just the panel as a whole.
+  sub-item, not just the panel as a whole -- glued to the panel edge and
+  aligned to the triggering item, plasmashell-style.
+- A generic hover-tooltip popup, same positioning convention, opt-in per
+  widget (`clock`: full date/weekday; `winctl`/`tasklist`: full window
+  title). Window thumbnails are a planned follow-up.
 - Basic theming: background/foreground color with alpha (real per-pixel
   transparency when a compositor provides an ARGB visual), spacing.
 - A control socket (see [PROTOCOL.md](PROTOCOL.md)) for `PING`,

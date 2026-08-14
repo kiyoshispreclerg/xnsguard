@@ -235,6 +235,19 @@ static void winctl_paint(PanelWidget *w, cairo_t *cr)
     }
 }
 
+static int winctl_get_tooltip(PanelWidget *w, int local_x, char *buf, size_t bufsz, int *anchor_x, int *anchor_w)
+{
+    (void)local_x;
+    WinctlPriv *wp = w->priv;
+    if (wp->active_win == None || !wp->title[0]) {
+        return 0;
+    }
+    snprintf(buf, bufsz, "%s", wp->title); /* wp->title is never truncated, unlike the trimmed on-panel label */
+    *anchor_x = 0;
+    *anchor_w = w->len;
+    return 1;
+}
+
 static int winctl_on_button(PanelWidget *w, int button, int local_x, int local_y, int root_x, int root_y)
 {
     (void)local_y;
@@ -278,4 +291,5 @@ const PanelWidgetOps winctl_ops = {
     .paint = winctl_paint,
     .on_button = winctl_on_button,
     .on_tick = winctl_on_tick,
+    .get_tooltip = winctl_get_tooltip,
 };

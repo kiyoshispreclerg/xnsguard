@@ -177,6 +177,40 @@ open: a click outside the menu's bounds, or Escape, dismisses it (a click
 outside is *not* re-delivered to whatever was actually underneath it --
 a known, accepted simplification; click again to interact with that).
 
+The menu is positioned glued to the panel's outer edge (below a top
+panel, above a bottom one, beside a left/right one) with its leading edge
+aligned to whichever sub-item triggered it -- e.g. right-clicking a task
+button opens the menu directly under *that button*, not at the raw click
+coordinates -- same convention plasmashell's taskbar context menus use.
+
+## Hover tooltips
+
+Any widget can opt into a hover tooltip by implementing
+`PanelWidgetOps.get_tooltip()` (optional -- widgets that don't are
+unaffected, `spacer` doesn't implement it). After the pointer sits over a
+widget (or one of its sub-items, e.g. one `tasklist` button) for ~500ms, a
+small popup appears with whatever text the widget reports -- glued to the
+panel's outer edge and aligned with that specific item, the same
+plasmashell-style positioning context menus use, so it never overlaps the
+panel itself. Unlike the context menu, it takes no pointer/keyboard grab
+and never handles clicks -- the pointer leaving the panel window is
+enough to hide it. Content refreshes about once a second while shown, so
+e.g. `clock`'s tooltip keeps ticking even if the pointer doesn't move.
+
+Currently implemented:
+
+- `clock`: full weekday + date + seconds (`strftime("%A, %d de %B de
+  %Y")` + `"%H:%M:%S"`), locale-aware (`setlocale(LC_TIME, "")` at
+  startup) -- unlike the panel's short, locale-independent `format=`.
+- `winctl`: the active window's full, untruncated title.
+- `tasklist`: the hovered task's full, untruncated title, anchored to
+  that specific button (not the whole widget). No tooltip over the
+  scroll-arrow pair.
+
+Window thumbnails (and a small close button in `tasklist`'s tooltip) are
+a planned follow-up, gated on an active compositor -- not implemented
+yet.
+
 ## Source layout
 
 Following the plan's "widgets can be added/removed/reordered, each is its
@@ -193,6 +227,7 @@ own file" structure:
   (activate/close/minimize/maximize/move), plus `_NET_WM_ICON` decoding
   and the icon/text drawing helpers built on top of it.
 - `menu.c`: the generic context-menu popup described above.
+- `tooltip.c`: the generic hover-tooltip popup described above.
 - `widgets/spacer.c`, `widgets/clock.c`, `widgets/tasklist.c`,
   `widgets/winctl.c`: one file per widget type. Adding a new type is
   "write `widgets/foo.c` defining a `PanelWidgetOps foo_ops`, declare it

@@ -42,10 +42,19 @@ typedef struct {
      * out_len. */
     void (*measure)(PanelWidget *w, int cross_axis, int *out_len, int *out_min_len);
     void (*paint)(PanelWidget *w, cairo_t *cr);
-    /* root_x/root_y: screen-absolute click position, for widgets that pop
-     * up a context menu (panel_menu_open() takes screen coordinates). */
     int (*on_button)(PanelWidget *w, int button, int local_x, int local_y, int root_x, int root_y);
     void (*on_tick)(PanelWidget *w, uint64_t now);
+    /* Optional (NULL is fine -- most widgets don't need this): fills buf
+     * with tooltip text (lines separated by '\n') to show after the
+     * pointer hovers over local_x (widget-local, main-axis) for a bit.
+     * Returns 1 if there's something to show, 0 otherwise. Also reports
+     * the specific sub-item's own local [*anchor_x, *anchor_x+*anchor_w)
+     * span (e.g. one task's button within tasklist) so the popup aligns
+     * with that item rather than the whole widget -- widgets without
+     * sub-items just report their own full [0, w->len) span. Called
+     * repeatedly (on every pointer motion, and periodically while shown,
+     * so content like a ticking clock stays current) -- keep it cheap. */
+    int (*get_tooltip)(PanelWidget *w, int local_x, char *buf, size_t bufsz, int *anchor_x, int *anchor_w);
 } PanelWidgetOps;
 
 struct PanelWidget {
@@ -132,6 +141,7 @@ void widget_get_rect(const PanelWidget *w, int *x, int *y, int *width, int *heig
 extern Atom g_atom_wm_window_type;
 extern Atom g_atom_wm_window_type_dock;
 extern Atom g_atom_wm_window_type_popup_menu;
+extern Atom g_atom_wm_window_type_tooltip;
 extern Atom g_atom_wm_strut;
 extern Atom g_atom_wm_strut_partial;
 
@@ -175,13 +185,34 @@ typedef struct {
 
 typedef void (*MenuSelectFn)(Panel *panel, PanelWidget *widget, void *ctx, int index);
 
-void panel_menu_open(Panel *owner_panel, PanelWidget *owner_widget, int screen_x, int screen_y, const MenuItem *items,
+/* anchor_x/anchor_w: the triggering item's own widget-local [anchor_x,
+ * anchor_x+anchor_w) span (e.g. one task's button within tasklist -- a
+ * widget with no sub-items just passes its own [0, w->len)). The menu is
+ * positioned glued to the panel's outer edge with its leading edge
+ * aligned to the anchor, like plasmashell's taskbar context menus --
+ * *not* at the raw click coordinates. */
+void panel_menu_open(Panel *owner_panel, PanelWidget *owner_widget, int anchor_x, int anchor_w, const MenuItem *items,
                       int n_items, void *ctx, MenuSelectFn on_select);
 void panel_menu_close(void);
 /* Returns 1 if `ev` belonged to the open menu (and was fully handled),
  * 0 otherwise -- xispanel.c's event loop dispatches to this first without
  * needing to know anything about the menu's internals. */
 int panel_menu_handle_event(const XEvent *ev);
+
+/* ---- hover tooltip (tooltip.c) ----
+ *
+ * Purely informational, no pointer/keyboard grab: positioned just outside
+ * the panel's own rectangle (below a top panel, above a bottom one, etc.,
+ * same convention plasmashell's tooltips use) so it never overlaps a
+ * panel widget and doesn't need to handle clicks itself -- the pointer
+ * leaving the panel window is all it needs to know to hide. See tooltip.c
+ * for the delay/positioning details. */
+void tooltip_notice_motion(Panel *p, int axis_pos); /* call on MotionNotify over a panel window */
+void tooltip_notice_leave(Panel *p); /* call on LeaveNotify from a panel window */
+void tooltip_tick(uint64_t now); /* advance the show-delay timer / refresh shown content */
+uint64_t tooltip_next_wake_ms(void); /* 0 = no pending timer, else fold into the main loop's timeout */
+void tooltip_close(void); /* hide immediately -- call before invalidating any Panel/PanelWidget */
+int tooltip_handle_event(const XEvent *ev); /* 1 if `ev` belonged to the tooltip popup */
 
 /* ---- widget registry: each file under widgets/ defines one of these --- */
 extern const PanelWidgetOps spacer_ops;

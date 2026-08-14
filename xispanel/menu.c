@@ -102,9 +102,10 @@ static void panel_menu_paint(void)
     XFlush(g_dpy);
 }
 
-void panel_menu_open(Panel *owner_panel, PanelWidget *owner_widget, int screen_x, int screen_y, const MenuItem *items,
+void panel_menu_open(Panel *owner_panel, PanelWidget *owner_widget, int anchor_x, int anchor_w, const MenuItem *items,
                       int n_items, void *ctx, MenuSelectFn on_select)
 {
+    (void)anchor_w; /* only the leading edge is needed for a dropdown-style menu */
     if (g_menu) {
         panel_menu_close();
     }
@@ -156,19 +157,30 @@ void panel_menu_open(Panel *owner_panel, PanelWidget *owner_widget, int screen_x
     m->width = max_w;
     m->height = m->item_h * n_items;
 
-    int screen_w = DisplayWidth(g_dpy, g_screen);
-    int screen_h = DisplayHeight(g_dpy, g_screen);
-    if (screen_x + m->width > screen_w) {
-        screen_x = screen_w - m->width;
+    /* Glued to the panel's outer edge (below a top panel, above a bottom
+     * one, beside a left/right one), leading edge aligned to the anchor
+     * item -- same convention as plasmashell's taskbar context menus,
+     * not "wherever the click happened to land". */
+    int screen_x, screen_y;
+    if (owner_panel->edge == EDGE_TOP || owner_panel->edge == EDGE_BOTTOM) {
+        screen_x = owner_panel->x + owner_widget->x + anchor_x;
+        screen_y = (owner_panel->edge == EDGE_TOP) ? (owner_panel->y + owner_panel->h) : (owner_panel->y - m->height);
+    } else {
+        screen_x = (owner_panel->edge == EDGE_LEFT) ? (owner_panel->x + owner_panel->w) : (owner_panel->x - m->width);
+        screen_y = owner_panel->y + owner_widget->x + anchor_x;
     }
-    if (screen_y + m->height > screen_h) {
-        screen_y = screen_h - m->height;
+
+    if (screen_x + m->width > owner_panel->out_x + owner_panel->out_w) {
+        screen_x = owner_panel->out_x + owner_panel->out_w - m->width;
     }
-    if (screen_x < 0) {
-        screen_x = 0;
+    if (screen_y + m->height > owner_panel->out_y + owner_panel->out_h) {
+        screen_y = owner_panel->out_y + owner_panel->out_h - m->height;
     }
-    if (screen_y < 0) {
-        screen_y = 0;
+    if (screen_x < owner_panel->out_x) {
+        screen_x = owner_panel->out_x;
+    }
+    if (screen_y < owner_panel->out_y) {
+        screen_y = owner_panel->out_y;
     }
 
     XSetWindowAttributes attrs;

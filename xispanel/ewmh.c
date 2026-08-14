@@ -17,6 +17,7 @@
 Atom g_atom_wm_window_type;
 Atom g_atom_wm_window_type_dock;
 Atom g_atom_wm_window_type_popup_menu;
+Atom g_atom_wm_window_type_tooltip;
 Atom g_atom_wm_strut;
 Atom g_atom_wm_strut_partial;
 
@@ -45,6 +46,7 @@ void ewmh_init_atoms(void)
     g_atom_wm_window_type = XInternAtom(g_dpy, "_NET_WM_WINDOW_TYPE", False);
     g_atom_wm_window_type_dock = XInternAtom(g_dpy, "_NET_WM_WINDOW_TYPE_DOCK", False);
     g_atom_wm_window_type_popup_menu = XInternAtom(g_dpy, "_NET_WM_WINDOW_TYPE_POPUP_MENU", False);
+    g_atom_wm_window_type_tooltip = XInternAtom(g_dpy, "_NET_WM_WINDOW_TYPE_TOOLTIP", False);
     g_atom_wm_strut = XInternAtom(g_dpy, "_NET_WM_STRUT", False);
     g_atom_wm_strut_partial = XInternAtom(g_dpy, "_NET_WM_STRUT_PARTIAL", False);
 

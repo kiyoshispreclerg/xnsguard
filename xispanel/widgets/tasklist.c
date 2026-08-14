@@ -225,6 +225,30 @@ static void tasklist_layout_visible(PanelWidget *w)
     tp->arrow_x = tp->scrollable ? w->len - TASKLIST_ARROW_W : -1;
 }
 
+/* Full (untruncated) title of whatever task button is under local_x, with
+ * the anchor set to that specific button's span -- not the whole widget --
+ * so the tooltip lines up with the actual task, same as on_button()'s
+ * hit-testing. No tooltip over the scroll arrows. */
+static int tasklist_get_tooltip(PanelWidget *w, int local_x, char *buf, size_t bufsz, int *anchor_x, int *anchor_w)
+{
+    TasklistPriv *tp = w->priv;
+    tasklist_layout_visible(w);
+
+    if (tp->scrollable && local_x >= tp->arrow_x) {
+        return 0;
+    }
+    for (int vi = 0; vi < tp->n_visible; vi++) {
+        if (local_x >= tp->vis_x[vi] && local_x < tp->vis_x[vi] + tp->vis_w[vi]) {
+            TaskEntry *e = &tp->tasks[tp->vis_idx[vi]];
+            snprintf(buf, bufsz, "%s", e->title);
+            *anchor_x = tp->vis_x[vi];
+            *anchor_w = tp->vis_w[vi];
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static void tasklist_paint(PanelWidget *w, cairo_t *cr)
 {
     TasklistPriv *tp = w->priv;
@@ -362,6 +386,8 @@ static void tasklist_menu_select(Panel *panel, PanelWidget *w, void *ctx, int in
 
 static int tasklist_on_button(PanelWidget *w, int button, int local_x, int local_y, int root_x, int root_y)
 {
+    (void)root_x;
+    (void)root_y;
     TasklistPriv *tp = w->priv;
     tasklist_layout_visible(w);
 
@@ -380,9 +406,12 @@ static int tasklist_on_button(PanelWidget *w, int button, int local_x, int local
     }
 
     int idx = -1;
+    int anchor_x = 0, anchor_w = w->len;
     for (int vi = 0; vi < tp->n_visible; vi++) {
         if (local_x >= tp->vis_x[vi] && local_x < tp->vis_x[vi] + tp->vis_w[vi]) {
             idx = tp->vis_idx[vi];
+            anchor_x = tp->vis_x[vi];
+            anchor_w = tp->vis_w[vi];
             break;
         }
     }
@@ -436,7 +465,7 @@ static int tasklist_on_button(PanelWidget *w, int button, int local_x, int local
         items[n].enabled = 1;
         items[n].is_separator = 0;
         n++;
-        panel_menu_open(w->panel, w, root_x, root_y, items, n, (void *)(uintptr_t)e->win, tasklist_menu_select);
+        panel_menu_open(w->panel, w, anchor_x, anchor_w, items, n, (void *)(uintptr_t)e->win, tasklist_menu_select);
         return 1;
     }
 
@@ -452,4 +481,5 @@ const PanelWidgetOps tasklist_ops = {
     .paint = tasklist_paint,
     .on_button = tasklist_on_button,
     .on_tick = tasklist_on_tick,
+    .get_tooltip = tasklist_get_tooltip,
 };
