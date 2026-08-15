@@ -50,6 +50,8 @@ typedef struct {
     int minimized_only; /* 1 = only list minimized tasks */
     int icon_padding; /* px of empty space around the icon on every side; 0 (default) = icon fills the
                         * whole button height. See icon_size_for(). */
+    int show_thumbs; /* 1 = tooltip includes a live thumbnail of the hovered task's window (see thumb.c);
+                       * no-op if xispanel was built without libXcomposite or no compositor is running. */
     TaskEntry tasks[MAX_TASKS];
     int n_tasks;
     int n_desktops;
@@ -103,6 +105,7 @@ static int tasklist_init(PanelWidget *w)
     if (tp->icon_padding < 0) {
         tp->icon_padding = 0;
     }
+    tp->show_thumbs = kv_get(w->config_kv, "show_thumbs", buf, sizeof(buf)) && strcmp(buf, "yes") == 0;
     tp->n_desktops = 1;
     w->next_tick_ms = now_ms();
     return 0;
@@ -329,6 +332,30 @@ static int tasklist_get_tooltip_mpris(PanelWidget *w, int local_x, char *out_bus
             Window win = tp->tasks[tp->vis_idx[vi]].win;
             unsigned long pid = ewmh_get_pid(win);
             return mpris_find_for_pid(pid, out_busname, bufsz, out_playing);
+        }
+    }
+    return 0;
+}
+
+/* Same re-resolve-from-local_x pattern as tasklist_get_tooltip_mpris()
+ * above -- only offers a thumbnail when show_thumbs=yes; thumb.c/
+ * tooltip.c handle the "no compositor / not built with libXcomposite"
+ * case themselves, so this doesn't need to check thumb_available() too. */
+static int tasklist_get_tooltip_thumb(PanelWidget *w, int local_x, Window *out_win)
+{
+    TasklistPriv *tp = w->priv;
+    if (!tp->show_thumbs) {
+        return 0;
+    }
+    tasklist_layout_visible(w);
+
+    if (tp->scrollable && local_x >= tp->arrow_x) {
+        return 0;
+    }
+    for (int vi = 0; vi < tp->n_visible; vi++) {
+        if (local_x >= tp->vis_x[vi] && local_x < tp->vis_x[vi] + tp->vis_w[vi]) {
+            *out_win = tp->tasks[tp->vis_idx[vi]].win;
+            return 1;
         }
     }
     return 0;
@@ -568,6 +595,7 @@ const PanelWidgetOps tasklist_ops = {
     .on_tick = tasklist_on_tick,
     .get_tooltip = tasklist_get_tooltip,
     .get_tooltip_mpris = tasklist_get_tooltip_mpris,
+    .get_tooltip_thumb = tasklist_get_tooltip_thumb,
     .tooltip_activate = tasklist_tooltip_activate,
     .tooltip_close_item = tasklist_tooltip_close_item,
 };

@@ -21,13 +21,32 @@ DBUS_CPPFLAGS :=
 $(info xispanel: dbus-1 not found via pkg-config -- building without MPRIS/tray support)
 endif
 
-CPPFLAGS := $(shell pkg-config --cflags $(PKGS)) $(DBUS_CPPFLAGS)
-LDLIBS := $(shell pkg-config --libs $(PKGS)) -lm -ldl
+# xcomposite (thumb.c's window-thumbnail capture for tasklist's
+# show_thumbs=yes tooltip) is linked normally, unlike dbus-1 -- there's
+# no runtime-dlopen equivalent for an X extension the way there is for a
+# shared library, since talking to it goes through the already-open X
+# connection. If libxcomposite-dev isn't installed, thumb_stub.c (always
+# reports "no compositor support") is linked instead -- no build-time
+# dependency in that case either. See thumb.c/thumb_stub.c.
+HAVE_XCOMPOSITE := $(shell pkg-config --exists xcomposite && echo yes)
+ifeq ($(HAVE_XCOMPOSITE),yes)
+THUMB_SRCS := thumb.c
+THUMB_CPPFLAGS := $(shell pkg-config --cflags xcomposite)
+THUMB_LDLIBS := $(shell pkg-config --libs xcomposite)
+else
+THUMB_SRCS := thumb_stub.c
+THUMB_CPPFLAGS :=
+THUMB_LDLIBS :=
+$(info xispanel: xcomposite not found via pkg-config -- building without window thumbnails)
+endif
+
+CPPFLAGS := $(shell pkg-config --cflags $(PKGS)) $(DBUS_CPPFLAGS) $(THUMB_CPPFLAGS)
+LDLIBS := $(shell pkg-config --libs $(PKGS)) $(THUMB_LDLIBS) -lm -ldl
 
 PREFIX ?= /usr/local
 BINDIR := $(PREFIX)/bin
 
-SRCS := xispanel.c ewmh.c menu.c tooltip.c pulse.c $(DBUS_SRCS) widgets/spacer.c widgets/clock.c widgets/tasklist.c widgets/winctl.c widgets/tray.c widgets/launcher.c widgets/volume.c
+SRCS := xispanel.c ewmh.c menu.c tooltip.c pulse.c $(DBUS_SRCS) $(THUMB_SRCS) widgets/spacer.c widgets/clock.c widgets/tasklist.c widgets/winctl.c widgets/tray.c widgets/launcher.c widgets/volume.c
 OBJS := $(SRCS:.c=.o)
 
 xispanel: $(OBJS)

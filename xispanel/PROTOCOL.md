@@ -158,7 +158,10 @@ Widget types implemented so far:
   `_NET_CLIENT_LIST` polling tasklist already does, not a different data
   source. `icon_padding=<px>` (default `0`) shrinks each task's icon by
   that many pixels on every side instead of it always filling the whole
-  button height.
+  button height. `show_thumbs=yes|no` (default `no`) adds a live
+  thumbnail of the hovered task's window to its tooltip (see "Window
+  thumbnails" below); clicking the thumbnail activates the window, same
+  as clicking anywhere else in a closable tooltip.
 - `winctl`: active-window icon + title, plus configurable window-control
   buttons -- similar to KDE's "Active Window Control" plasmoid. Options:
   `buttons=<comma-list>` (any of `min`, `max`, `close`, in the order given
@@ -527,6 +530,61 @@ up/down changed the real system volume (confirmed against `pactl
 get-sink-volume` before/after), click toggled real mute state, and the
 tooltip reflected both sink and source levels correctly.
 
+### Window thumbnails
+
+`tasklist`'s `show_thumbs=yes` draws a live thumbnail of the hovered
+task's window into its tooltip (`thumb.c`), via the XComposite
+extension. Two independent gates, both fail open (no thumbnail, not a
+crash) if unmet:
+
+- **Build time**: `libxcomposite-dev` availability, checked via
+  `pkg-config --exists xcomposite` in the Makefile. Unlike `dbus-1`
+  there's no dlopen-equivalent trick here (XComposite is used over the
+  already-open X connection, not a separate shared library you could
+  choose not to link), so this is a normal optional *link-time*
+  dependency: `thumb_stub.c` (always reports no thumbnail support) is
+  linked instead of `thumb.c` when the headers aren't found.
+- **Runtime**: an active compositor, detected the same way every
+  EWMH-aware compositing check does -- looking for an owner of the
+  `_NET_WM_CM_S<screen>` selection. Without a compositor, no window is
+  redirected to an offscreen pixmap at all, so there's nothing to
+  capture.
+
+Once both gate checks pass, `thumb_paint()` calls
+`XCompositeNameWindowPixmap()` on the window and wraps the result as a
+`cairo_xlib_surface`, scaled to fit a fixed-size box (200x130) preserving
+aspect ratio, never upscaled past the window's real size. Re-fetched
+fresh on every tooltip repaint (~1/s, the same cadence clock's tooltip
+already refreshes at) rather than cached, avoiding the classic
+stale-composite-pixmap pitfall where the pixmap ID silently stops
+updating across an unmap/map or resize.
+
+**Real-world gotcha, worth remembering if this is touched again:** on a
+reparenting WM, the window `_NET_CLIENT_LIST` reports is not necessarily
+the one that's actually composite-redirected -- confirmed on this repo's
+own KWin fork, where `XCompositeNameWindowPixmap()` on the raw client
+window fails with `BadMatch`, and the *client's parent's parent* (two
+`XQueryTree()` hops up) is what's actually redirected. `thumb_paint()`
+walks up the parent chain (capped at 4 hops) trying each ancestor until
+one succeeds or it hits the root, rather than assuming a fixed number of
+wrapper levels.
+
+Also discovered while building this: xispanel had **no global
+`XErrorHandler`** anywhere -- since it continuously queries arbitrary
+other processes' window properties (`tasklist`/`winctl` polling every
+open window's title/icon/state), any window closing between being listed
+and being queried raises a protocol error that Xlib's default handler
+turns into `exit()`, taking down the whole daemon over a routine,
+expected race. This surfaced as a real crash during thumbnail testing
+(`X_GetProperty`/`BadWindow` from ordinary `ewmh.c` polling, unrelated to
+`thumb.c` itself) and is now fixed process-wide: `xispanel.c` installs a
+permissive `x_error_handler()` right after `XOpenDisplay()` that logs and
+continues instead of exiting. `thumb.c` additionally swaps in its own
+temporary handler around composite-specific calls (to detect *its own*
+failures without the generic log line firing for the very common
+"window isn't the redirected one" case), always restoring the process
+handler afterward.
+
 ## Source layout
 
 Following the plan's "widgets can be added/removed/reordered, each is its
@@ -554,6 +612,9 @@ own file" structure:
 - `pulse.c`: the `pactl`-shelling volume control backend described
   above. Unconditionally compiled -- no stub pair needed, since it has no
   build-time dependency to begin with.
+- `thumb.c`: the XComposite-based window-thumbnail capture described
+  above; `thumb_stub.c` is its build-time fallback when `xcomposite`
+  isn't found via pkg-config.
 - `widgets/spacer.c`, `widgets/clock.c`, `widgets/tasklist.c`,
   `widgets/winctl.c`, `widgets/tray.c`, `widgets/launcher.c`,
   `widgets/volume.c`: one file per widget type. Adding a new type is

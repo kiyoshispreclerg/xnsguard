@@ -47,6 +47,9 @@
 #define MPRIS_BTN_SIZE 22
 #define MPRIS_BTN_GAP 4
 #define MPRIS_ROW_H (MPRIS_BTN_SIZE + TOOLTIP_PAD_Y)
+#define THUMB_W 200
+#define THUMB_H 130
+#define THUMB_MARGIN 6 /* gap between the thumbnail and whatever's drawn below it */
 
 typedef struct {
     Window win;
@@ -59,6 +62,10 @@ typedef struct {
     /* previous/play-pause/next button hit-rects, only meaningful when
      * g_has_mpris. */
     int mpris_btn_x[3], mpris_btn_y, mpris_btn_size;
+    /* y where "normal" content (text/close-icon/mpris row) starts --
+     * 0 unless g_has_thumb, in which case it's THUMB_H + THUMB_MARGIN,
+     * pushed down to make room for the thumbnail drawn at the top. */
+    int content_y0;
 } TooltipPopup;
 
 static TooltipPopup *g_popup = NULL;
@@ -82,6 +89,13 @@ static void *g_ctx = NULL;
 static int g_has_mpris = 0;
 static char g_mpris_busname[128];
 static int g_mpris_playing = 0;
+
+/* Set alongside g_text whenever the current hover target implements
+ * get_tooltip_thumb() and reports a window to draw a live thumbnail of
+ * -- see thumb.c and PanelWidgetOps.get_tooltip_thumb's doc comment in
+ * xispanel.h. */
+static int g_has_thumb = 0;
+static Window g_thumb_win = None;
 
 /* 0 = no close pending. Set on LeaveNotify from either the panel widget or
  * the popup itself; cleared on EnterNotify to either -- see the file
@@ -118,6 +132,8 @@ void tooltip_close(void)
     g_has_mpris = 0;
     g_mpris_busname[0] = 0;
     g_mpris_playing = 0;
+    g_has_thumb = 0;
+    g_thumb_win = None;
     g_close_deadline_ms = 0;
 }
 
@@ -139,6 +155,25 @@ static void query_mpris(PanelWidget *w, int local_x)
         g_has_mpris = 1;
         snprintf(g_mpris_busname, sizeof(g_mpris_busname), "%s", busname);
         g_mpris_playing = playing;
+    }
+}
+
+/* Queries get_tooltip_thumb() (if `w` implements it) for `local_x`,
+ * updating g_has_thumb/g_thumb_win. thumb_available() itself is cheap
+ * (a cached extension check + one XGetSelectionOwner), so there's no
+ * need to gate this call on anything beyond the widget implementing the
+ * optional callback at all. */
+static void query_thumb(PanelWidget *w, int local_x)
+{
+    g_has_thumb = 0;
+    g_thumb_win = None;
+    if (!w->ops->get_tooltip_thumb || !thumb_available()) {
+        return;
+    }
+    Window win = None;
+    if (w->ops->get_tooltip_thumb(w, local_x, &win)) {
+        g_has_thumb = 1;
+        g_thumb_win = win;
     }
 }
 
@@ -187,6 +222,16 @@ static void paint_popup(void)
     cairo_set_line_width(cr, 1);
     cairo_stroke(cr);
 
+    if (g_has_thumb) {
+        double thumb_x = (g_popup->width - THUMB_W) / 2.0;
+        if (!thumb_paint(cr, g_thumb_win, thumb_x, 0, THUMB_W, THUMB_H)) {
+            /* Window closed/unmapped between query_thumb() and now, or
+             * the compositor just stopped -- fall through with just the
+             * reserved blank space rather than resizing the popup
+             * mid-display. */
+        }
+    }
+
     if (g_font_face) {
         cairo_set_font_face(cr, g_font_face);
     }
@@ -196,12 +241,13 @@ static void paint_popup(void)
     int text_w, h;
     int n = measure_lines(cr, lines, &text_w, &h);
     double line_h = TOOLTIP_FONT_SIZE * 1.4;
+    int content_y0 = g_popup->content_y0;
 
     cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, p->fg_a);
     for (int i = 0; i < n; i++) {
         cairo_text_extents_t ext;
         cairo_text_extents(cr, lines[i], &ext);
-        double ty = TOOLTIP_PAD_Y + i * line_h + (line_h - ext.height) / 2.0 - ext.y_bearing;
+        double ty = content_y0 + TOOLTIP_PAD_Y + i * line_h + (line_h - ext.height) / 2.0 - ext.y_bearing;
         cairo_move_to(cr, TOOLTIP_PAD_X, ty);
         cairo_show_text(cr, lines[i]);
     }
@@ -299,23 +345,41 @@ static void show_popup(void)
 
     int close_reserve = g_closable ? (TOOLTIP_CLOSE_ICON + 6) : 0;
     pop->width = text_w + TOOLTIP_PAD_X * 2 + close_reserve;
-    pop->height = text_h;
-    if (g_closable && pop->height < TOOLTIP_CLOSE_ICON + TOOLTIP_PAD_Y * 2) {
-        pop->height = TOOLTIP_CLOSE_ICON + TOOLTIP_PAD_Y * 2;
+    /* `body_h`/`pop->height` below are relative to content_y0, i.e. they
+     * don't yet know about the thumbnail reserved above them -- that's
+     * added once, right at the end, by shifting everything down. */
+    int body_h = text_h;
+    if (g_closable && body_h < TOOLTIP_CLOSE_ICON + TOOLTIP_PAD_Y * 2) {
+        body_h = TOOLTIP_CLOSE_ICON + TOOLTIP_PAD_Y * 2;
     }
+    int close_y_in_body = (body_h - TOOLTIP_CLOSE_ICON) / 2;
 
     if (g_has_mpris) {
         int mpris_row_w = 3 * MPRIS_BTN_SIZE + 2 * MPRIS_BTN_GAP + TOOLTIP_PAD_X * 2;
         if (mpris_row_w > pop->width) {
             pop->width = mpris_row_w;
         }
-        pop->mpris_btn_y = pop->height;
-        pop->height += MPRIS_ROW_H;
+        pop->mpris_btn_y = body_h;
+        body_h += MPRIS_ROW_H;
         int row_x0 = (pop->width - (3 * MPRIS_BTN_SIZE + 2 * MPRIS_BTN_GAP)) / 2;
         for (int i = 0; i < 3; i++) {
             pop->mpris_btn_x[i] = row_x0 + i * (MPRIS_BTN_SIZE + MPRIS_BTN_GAP);
         }
         pop->mpris_btn_size = MPRIS_BTN_SIZE;
+    }
+
+    if (g_has_thumb) {
+        int thumb_row_w = THUMB_W + TOOLTIP_PAD_X * 2;
+        if (thumb_row_w > pop->width) {
+            pop->width = thumb_row_w;
+        }
+        pop->content_y0 = THUMB_H + THUMB_MARGIN;
+    } else {
+        pop->content_y0 = 0;
+    }
+    pop->height = pop->content_y0 + body_h;
+    if (g_has_mpris) {
+        pop->mpris_btn_y += pop->content_y0;
     }
 
     if (pop->width < 1) {
@@ -325,7 +389,7 @@ static void show_popup(void)
         pop->height = 1;
     }
     pop->close_x = pop->width - TOOLTIP_CLOSE_ICON - 6;
-    pop->close_y = (pop->height - (g_has_mpris ? MPRIS_ROW_H : 0) - TOOLTIP_CLOSE_ICON) / 2;
+    pop->close_y = pop->content_y0 + close_y_in_body;
     pop->close_w = TOOLTIP_CLOSE_ICON;
     pop->close_h = TOOLTIP_CLOSE_ICON;
 
@@ -402,8 +466,10 @@ static int refresh_text(void)
     int had_mpris = g_has_mpris;
     int was_playing = g_mpris_playing;
     query_mpris(g_widget, g_local_x);
-    int changed =
-        strcmp(g_text, buf) != 0 || g_closable != closable || had_mpris != g_has_mpris || was_playing != g_mpris_playing;
+    int had_thumb = g_has_thumb;
+    query_thumb(g_widget, g_local_x);
+    int changed = strcmp(g_text, buf) != 0 || g_closable != closable || had_mpris != g_has_mpris ||
+                  was_playing != g_mpris_playing || had_thumb != g_has_thumb;
     snprintf(g_text, sizeof(g_text), "%s", buf);
     g_anchor_x = ax;
     g_anchor_w = aw;
@@ -448,6 +514,7 @@ void tooltip_notice_motion(Panel *p, int axis_pos)
         int had_mpris = g_has_mpris;
         int was_playing = g_mpris_playing;
         query_mpris(hit, local_x);
+        query_thumb(hit, local_x);
         if (strcmp(g_text, buf) != 0 || g_closable != closable || had_mpris != g_has_mpris ||
             was_playing != g_mpris_playing) {
             snprintf(g_text, sizeof(g_text), "%s", buf);
@@ -470,6 +537,7 @@ void tooltip_notice_motion(Panel *p, int axis_pos)
     g_closable = closable;
     g_ctx = ctx;
     query_mpris(hit, local_x);
+    query_thumb(hit, local_x);
     snprintf(g_text, sizeof(g_text), "%s", buf);
     g_since_ms = now_ms();
 }

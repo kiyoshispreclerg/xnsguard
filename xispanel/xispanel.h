@@ -86,6 +86,18 @@ typedef struct {
      * Widgets that don't apply (clock, winctl) simply don't implement
      * this. */
     int (*get_tooltip_mpris)(PanelWidget *w, int local_x, char *out_busname, size_t bufsz, int *out_playing);
+    /* Optional, called right after a successful get_tooltip(): if the
+     * widget wants a live thumbnail of a window drawn into the tooltip
+     * (tasklist does this when its own show_thumbs=yes and the hovered
+     * task's window applies), fill *out_win and return 1 -- see
+     * thumb.c's thumb_paint(). The tooltip's existing click-to-activate
+     * mechanism (*out_closable/tooltip_activate from get_tooltip() above)
+     * already covers clicking the thumbnail itself, no separate handling
+     * needed. Never called if window thumbnails are unavailable (no
+     * compositor running, or xispanel was built without libXcomposite --
+     * see thumb.c/thumb_stub.c) since thumb_paint() itself just always
+     * reports "nothing painted" then. */
+    int (*get_tooltip_thumb)(PanelWidget *w, int local_x, Window *out_win);
 } PanelWidgetOps;
 
 struct PanelWidget {
@@ -326,6 +338,19 @@ int pulse_get_sink_state(const char *sink, int *out_pct, int *out_muted);
 int pulse_get_source_state(const char *source, int *out_pct, int *out_muted);
 void pulse_set_sink_volume_relative(const char *sink, int delta_pct); /* delta_pct may be negative */
 void pulse_toggle_sink_mute(const char *sink);
+
+/* ---- live window thumbnails: XComposite, no libpulse-style dlopen (thumb.c) ----
+ *
+ * Unlike mpris.c/sni.c's runtime dlopen(), there's no equivalent trick for
+ * an X extension (it's used over the already-open X connection, not a
+ * separate shared library) -- so this is a normal build-time-optional
+ * dependency instead: if libXcomposite wasn't found via pkg-config,
+ * thumb_stub.c is linked and thumb_available() always reports false. */
+int thumb_available(void); /* 1 if libXcomposite was built in AND a compositor is currently running */
+/* Draws win's live contents scaled to fit within [x,y,max_w,max_h]
+ * (preserving aspect ratio, never upscaled past the window's real size,
+ * centered in any leftover space), returns 1 if it painted anything. */
+int thumb_paint(cairo_t *cr, Window win, double x, double y, double max_w, double max_h);
 
 /* ---- widget registry: each file under widgets/ defines one of these --- */
 extern const PanelWidgetOps spacer_ops;
