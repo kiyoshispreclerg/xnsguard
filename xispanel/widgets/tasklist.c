@@ -72,17 +72,6 @@ typedef struct {
     int arrow_x; /* local x of the up/down arrow pair, valid iff scrollable */
 } TasklistPriv;
 
-/* icon_padding=0 (default) fills the whole button height, matching every
- * other widget's icon sizing; a positive value shrinks the icon by that
- * many pixels on every side instead, for users who want a smaller icon
- * with visible breathing room around it. Floors at 4px so a very large
- * padding relative to a thin panel can't produce a zero/negative icon. */
-static int icon_size_for(int thickness, int padding)
-{
-    int size = thickness - 2 * padding;
-    return size > 4 ? size : 4;
-}
-
 static int tasklist_find(TasklistPriv *tp, Window win)
 {
     for (int i = 0; i < tp->n_tasks; i++) {

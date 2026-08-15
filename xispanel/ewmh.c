@@ -539,6 +539,19 @@ cairo_surface_t *ewmh_get_icon_surface(Window w, int target_size)
     return surf;
 }
 
+/* icon_padding=0 (default, for whichever widget's config exposes this)
+ * fills the whole available thickness, matching every widget's original
+ * hardcoded icon sizing; a positive value shrinks the icon by that many
+ * pixels on every side instead, for users who want a smaller icon with
+ * visible breathing room around it. Floors at 4px so a very large
+ * padding relative to a thin panel can't produce a zero/negative icon.
+ * Shared by tasklist and tray rather than duplicated per widget. */
+int icon_size_for(int thickness, int padding)
+{
+    int size = thickness - 2 * padding;
+    return size > 4 ? size : 4;
+}
+
 void draw_icon_scaled(cairo_t *cr, cairo_surface_t *icon, double x, double y, double size)
 {
     if (!icon || cairo_surface_status(icon) != CAIRO_STATUS_SUCCESS) {

@@ -244,6 +244,7 @@ void ewmh_move_interactive(Window w, int root_x, int root_y);
 cairo_surface_t *ewmh_get_icon_surface(Window w, int target_size); /* NULL if no icon */
 
 /* ---- small drawing helpers built on top of the above (ewmh.c) ---- */
+int icon_size_for(int thickness, int padding); /* shared by tasklist/tray's icon_padding= */
 void draw_icon_scaled(cairo_t *cr, cairo_surface_t *icon, double x, double y, double size);
 void draw_fallback_icon(cairo_t *cr, double x, double y, double size, const char *title, double fg_r, double fg_g,
                          double fg_b);

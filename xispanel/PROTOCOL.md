@@ -205,14 +205,20 @@ Widget types implemented so far:
 - `tray`: one square icon button per active StatusNotifierItem (the
   `org.kde.StatusNotifierItem`/`org.freedesktop.StatusNotifierItem`
   DBus protocol used by every modern tray -- KDE, GNOME's legacy
-  extension, XFCE, etc.). No config keys yet. Left-click sends
-  `Activate(x,y)`, middle-click `SecondaryActivate(x,y)`, right-click
-  `ContextMenu(x,y)` (the item's own process pops up its own menu near
-  that point -- xispanel doesn't render it). Hovering shows the item's
-  `Title` (or `IconName` if `Title` is empty) as a plain tooltip. See
-  "System tray (StatusNotifierItem)" below for how registration/hosting
-  works. No dependency on `libdbus-1` at build *link* time -- see MPRIS's
-  note on optional runtime deps, same mechanism (`sni.c`).
+  extension, XFCE, etc.). `icon_padding=<px>` (default `0`, same
+  semantics as `tasklist`'s) shrinks each icon by that many pixels;
+  applied as a single shared margin around the *whole row* rather than
+  per-icon, so the gap between two adjacent icons ends up the same width
+  as the gap from an icon to the widget's own edge, not double that (a
+  naive per-icon-slot padding would count both icons' padding at every
+  internal boundary). Left-click sends `Activate(x,y)`, middle-click
+  `SecondaryActivate(x,y)`, right-click `ContextMenu(x,y)` (the item's
+  own process pops up its own menu near that point -- xispanel doesn't
+  render it). Hovering shows the item's `Title` (or `IconName` if
+  `Title` is empty) as a plain tooltip. See "System tray
+  (StatusNotifierItem)" below for how registration/hosting works. No
+  dependency on `libdbus-1` at build *link* time -- see MPRIS's note on
+  optional runtime deps, same mechanism (`sni.c`).
 - `launcher`: a single generic clickable icon -- `icon=<path>` (any
   format Imlib2 can decode; falls back to a single-letter placeholder
   derived from `name` if missing or it fails to load), `name=<text>`
