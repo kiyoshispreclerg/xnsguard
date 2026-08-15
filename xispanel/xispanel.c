@@ -1549,6 +1549,27 @@ static void handle_signal(int sig)
     g_quit = 1;
 }
 
+/* xispanel constantly queries properties/attributes of *other*
+ * processes' windows (tasklist/winctl polling every open window's
+ * title/icon/state, thumb.c's live captures, ...), any of which can
+ * close between being listed and being queried -- Xlib's default error
+ * handler calls exit() on any X protocol error, which would take down
+ * the whole panel daemon over what's actually a routine, expected race,
+ * not a bug. Every well-behaved WM/panel/taskbar installs a permissive
+ * handler for exactly this reason; this just logs and continues. thumb.c
+ * additionally swaps in its own temporary handler around composite calls
+ * (to detect *its own* failures without logging noise for the common
+ * "window isn't redirected" case), but always restores this one
+ * afterward -- this is the actual default for the rest of the process. */
+static int x_error_handler(Display *dpy, XErrorEvent *ev)
+{
+    char text[64];
+    XGetErrorText(dpy, ev->error_code, text, sizeof(text));
+    fprintf(stderr, "xispanel: ignoring X error: %s (request %d.%d, resource 0x%lx)\n", text, ev->request_code,
+            ev->minor_code, ev->resourceid);
+    return 0;
+}
+
 static Panel *find_panel_by_window(Window win, int *is_sensor)
 {
     for (int i = 0; i < MAX_PANELS; i++) {
@@ -1590,6 +1611,7 @@ static int run_as_daemon(const char *sockpath)
         fprintf(stderr, "xispanel: could not open the X display\n");
         return 1;
     }
+    XSetErrorHandler(x_error_handler);
     g_screen = DefaultScreen(g_dpy);
     g_root = RootWindow(g_dpy, g_screen);
 
