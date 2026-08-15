@@ -48,6 +48,8 @@ typedef struct {
     int same_desktop_only; /* 1 = only list tasks on the current _NET_CURRENT_DESKTOP */
     int same_output_only; /* 1 = only list tasks whose center is on this panel's own output */
     int minimized_only; /* 1 = only list minimized tasks */
+    int icon_padding; /* px of empty space around the icon on every side; 0 (default) = icon fills the
+                        * whole button height. See icon_size_for(). */
     TaskEntry tasks[MAX_TASKS];
     int n_tasks;
     int n_desktops;
@@ -68,6 +70,17 @@ typedef struct {
     int arrow_x; /* local x of the up/down arrow pair, valid iff scrollable */
 } TasklistPriv;
 
+/* icon_padding=0 (default) fills the whole button height, matching every
+ * other widget's icon sizing; a positive value shrinks the icon by that
+ * many pixels on every side instead, for users who want a smaller icon
+ * with visible breathing room around it. Floors at 4px so a very large
+ * padding relative to a thin panel can't produce a zero/negative icon. */
+static int icon_size_for(int thickness, int padding)
+{
+    int size = thickness - 2 * padding;
+    return size > 4 ? size : 4;
+}
+
 static int tasklist_find(TasklistPriv *tp, Window win)
 {
     for (int i = 0; i < tp->n_tasks; i++) {
@@ -86,6 +99,10 @@ static int tasklist_init(PanelWidget *w)
     tp->same_desktop_only = kv_get(w->config_kv, "same_desktop", buf, sizeof(buf)) && strcmp(buf, "yes") == 0;
     tp->same_output_only = kv_get(w->config_kv, "same_output", buf, sizeof(buf)) && strcmp(buf, "yes") == 0;
     tp->minimized_only = kv_get(w->config_kv, "minimized_only", buf, sizeof(buf)) && strcmp(buf, "yes") == 0;
+    tp->icon_padding = kv_get_int(w->config_kv, "icon_padding", 0);
+    if (tp->icon_padding < 0) {
+        tp->icon_padding = 0;
+    }
     tp->n_desktops = 1;
     w->next_tick_ms = now_ms();
     return 0;
@@ -119,7 +136,7 @@ static void tasklist_on_tick(PanelWidget *w, uint64_t now)
 
     TaskEntry fresh[MAX_TASKS];
     int n_fresh = 0;
-    int icon_px = w->thickness > 8 ? w->thickness - 8 : 16;
+    int icon_px = icon_size_for(w->thickness, tp->icon_padding);
     for (int i = 0; i < n; i++) {
         Window win = list[i];
         if (ewmh_skip_taskbar(win)) {
@@ -175,7 +192,7 @@ static void tasklist_measure(PanelWidget *w, int cross_axis, int *out_len, int *
 {
     TasklistPriv *tp = w->priv;
     Panel *p = w->panel;
-    int icon_px = cross_axis > 8 ? cross_axis - 8 : 16;
+    int icon_px = icon_size_for(cross_axis, tp->icon_padding);
     int cursor = 0;
     for (int i = 0; i < tp->n_tasks; i++) {
         int bw;
@@ -329,7 +346,7 @@ static void tasklist_paint(PanelWidget *w, cairo_t *cr)
     tasklist_layout_visible(w);
 
     Window active = ewmh_get_active_window();
-    int icon_px = w->thickness > 8 ? w->thickness - 8 : 16;
+    int icon_px = icon_size_for(w->thickness, tp->icon_padding);
     int icon_y = oy + (w->thickness - icon_px) / 2;
 
     for (int vi = 0; vi < tp->n_visible; vi++) {

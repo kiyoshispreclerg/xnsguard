@@ -156,7 +156,9 @@ Widget types implemented so far:
   (default `no`) restricts it to only minimized windows. All three filters
   apply independently and can be combined; each just narrows the same
   `_NET_CLIENT_LIST` polling tasklist already does, not a different data
-  source.
+  source. `icon_padding=<px>` (default `0`) shrinks each task's icon by
+  that many pixels on every side instead of it always filling the whole
+  button height.
 - `winctl`: active-window icon + title, plus configurable window-control
   buttons -- similar to KDE's "Active Window Control" plasmoid. Options:
   `buttons=<comma-list>` (any of `min`, `max`, `close`, in the order given
