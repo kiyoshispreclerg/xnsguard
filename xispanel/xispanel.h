@@ -209,6 +209,7 @@ Window ewmh_get_active_window(void);
 int ewmh_get_number_of_desktops(void);
 int ewmh_get_current_desktop(void); /* -1 if unavailable */
 int ewmh_skip_taskbar(Window w); /* 1 if a taskbar should never list this window */
+int ewmh_window_in_rect(Window w, int rx, int ry, int rw, int rh); /* 1 if w's center is inside the rect */
 unsigned long ewmh_get_pid(Window w); /* 0 if the window never set _NET_WM_PID */
 void ewmh_activate(Window w);
 void ewmh_close(Window w);

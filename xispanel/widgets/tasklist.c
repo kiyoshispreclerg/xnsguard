@@ -46,6 +46,7 @@ typedef struct {
 typedef struct {
     int compact; /* 0 = wide (icon+label), 1 = compact (icon only) */
     int same_desktop_only; /* 1 = only list tasks on the current _NET_CURRENT_DESKTOP */
+    int same_output_only; /* 1 = only list tasks whose center is on this panel's own output */
     int minimized_only; /* 1 = only list minimized tasks */
     TaskEntry tasks[MAX_TASKS];
     int n_tasks;
@@ -83,6 +84,7 @@ static int tasklist_init(PanelWidget *w)
     char buf[16];
     tp->compact = kv_get(w->config_kv, "mode", buf, sizeof(buf)) && strcmp(buf, "compact") == 0;
     tp->same_desktop_only = kv_get(w->config_kv, "same_desktop", buf, sizeof(buf)) && strcmp(buf, "yes") == 0;
+    tp->same_output_only = kv_get(w->config_kv, "same_output", buf, sizeof(buf)) && strcmp(buf, "yes") == 0;
     tp->minimized_only = kv_get(w->config_kv, "minimized_only", buf, sizeof(buf)) && strcmp(buf, "yes") == 0;
     tp->n_desktops = 1;
     w->next_tick_ms = now_ms();
@@ -129,6 +131,10 @@ static void tasklist_on_tick(PanelWidget *w, uint64_t now)
         /* current_desktop == -1 means either the filter is off, or no WM
          * ever set _NET_CURRENT_DESKTOP -- either way, don't filter. */
         if (tp->same_desktop_only && current_desktop >= 0 && desktop >= 0 && desktop != current_desktop) {
+            continue;
+        }
+        if (tp->same_output_only && !ewmh_window_in_rect(win, w->panel->out_x, w->panel->out_y, w->panel->out_w,
+                                                           w->panel->out_h)) {
             continue;
         }
         if (tp->minimized_only && !minimized) {

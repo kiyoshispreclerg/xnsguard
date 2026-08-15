@@ -144,9 +144,14 @@ Widget types implemented so far:
   up/down arrow pair (one task at a time) instead of overflowing the
   panel -- see "Widget sizing" below. `same_desktop=yes|no` (default
   `no`) restricts the list to windows on the current `_NET_CURRENT_DESKTOP`
-  (ignored if the WM never sets that property). `minimized_only=yes|no`
-  (default `no`) restricts it to only minimized windows. Both filters
-  apply independently and can be combined; either just narrows the same
+  (ignored if the WM never sets that property). `same_output=yes|no`
+  (default `no`) restricts the list to windows whose center falls on this
+  panel's own resolved output rectangle (`Panel::out_x/y/w/h`) -- useful
+  in multi-monitor setups so a per-output panel only lists that monitor's
+  windows; a no-op for `output=*` panels, since every window's center is
+  necessarily inside the full virtual screen. `minimized_only=yes|no`
+  (default `no`) restricts it to only minimized windows. All three filters
+  apply independently and can be combined; each just narrows the same
   `_NET_CLIENT_LIST` polling tasklist already does, not a different data
   source.
 - `winctl`: active-window icon + title, plus configurable window-control
@@ -157,8 +162,14 @@ Widget types implemented so far:
   `maximized`), `side=start|end` (buttons before or after the icon/title,
   *within this widget* -- default `end`). The maximize button draws as a
   single square when the active window isn't maximized and as two
-  overlapping squares (restore) when it is. Polls `_NET_ACTIVE_WINDOW`
-  every ~300ms, same tradeoff as `tasklist`'s polling.
+  overlapping squares (restore) when it is. `same_desktop=yes|no` and
+  `same_output=yes|no` (both default `no`, same semantics as `tasklist`'s
+  filters above) make the whole widget render as empty whenever the
+  active window doesn't match -- e.g. `same_output=yes` on a per-output
+  panel hides icon/title/buttons while focus is on another monitor,
+  instead of showing controls for a window this panel doesn't "own".
+  Polls `_NET_ACTIVE_WINDOW` every ~300ms, same tradeoff as `tasklist`'s
+  polling.
 
 More widget types (tray, global menu, launcher, system monitor) are later
 phases -- see the plan this tool was built from; they are not implemented

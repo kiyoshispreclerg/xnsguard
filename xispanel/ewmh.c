@@ -308,6 +308,27 @@ void ewmh_get_state_flags(Window w, int *minimized, int *maximized)
     }
 }
 
+/* 1 if `w`'s center falls within the given root-relative rectangle --
+ * used to filter tasklist/winctl entries to whatever output the panel
+ * itself is resolved onto (Panel::out_x/y/w/h), for multi-monitor
+ * same_output filtering. Returns 1 (never filters) if the window's
+ * geometry can't be queried, e.g. it closed between listing and here. */
+int ewmh_window_in_rect(Window w, int rx, int ry, int rw, int rh)
+{
+    XWindowAttributes wa;
+    if (!XGetWindowAttributes(g_dpy, w, &wa)) {
+        return 1;
+    }
+    Window child;
+    int abs_x, abs_y;
+    if (!XTranslateCoordinates(g_dpy, w, g_root, 0, 0, &abs_x, &abs_y, &child)) {
+        return 1;
+    }
+    int cx = abs_x + wa.width / 2;
+    int cy = abs_y + wa.height / 2;
+    return cx >= rx && cx < rx + rw && cy >= ry && cy < ry + rh;
+}
+
 Window ewmh_get_active_window(void)
 {
     Atom actual_type;

@@ -23,8 +23,11 @@ typedef struct {
     int n_buttons;
     int show_always; /* 0 = only while the active window is maximized, 1 = always */
     int side_start;  /* 1 = buttons before the icon/title, 0 = after (default) */
+    int same_desktop_only; /* 1 = only show controls while the active window is on this panel's desktop */
+    int same_output_only;  /* 1 = only show controls while the active window is on this panel's output */
 
     Window active_win;
+    int active_applies; /* active_win != None and passes same_desktop_only/same_output_only */
     char title[128];
     int minimized, maximized;
     cairo_surface_t *icon;
@@ -69,6 +72,8 @@ static int winctl_init(PanelWidget *w)
     char buf[16];
     wp->show_always = kv_get(w->config_kv, "show", buf, sizeof(buf)) && strcmp(buf, "always") == 0;
     wp->side_start = kv_get(w->config_kv, "side", buf, sizeof(buf)) && strcmp(buf, "start") == 0;
+    wp->same_desktop_only = kv_get(w->config_kv, "same_desktop", buf, sizeof(buf)) && strcmp(buf, "yes") == 0;
+    wp->same_output_only = kv_get(w->config_kv, "same_output", buf, sizeof(buf)) && strcmp(buf, "yes") == 0;
 
     wp->active_win = None;
     w->next_tick_ms = now_ms();
@@ -97,7 +102,21 @@ static void winctl_on_tick(PanelWidget *w, uint64_t now)
         wp->active_win = active;
     }
 
-    if (active != None) {
+    int applies = active != None;
+    if (applies && wp->same_desktop_only) {
+        int current_desktop = ewmh_get_current_desktop();
+        int win_desktop = ewmh_get_desktop(active);
+        if (current_desktop >= 0 && win_desktop >= 0 && win_desktop != current_desktop) {
+            applies = 0;
+        }
+    }
+    if (applies && wp->same_output_only &&
+        !ewmh_window_in_rect(active, w->panel->out_x, w->panel->out_y, w->panel->out_w, w->panel->out_h)) {
+        applies = 0;
+    }
+    wp->active_applies = applies;
+
+    if (applies) {
         ewmh_get_title(active, wp->title, sizeof(wp->title));
         ewmh_get_state_flags(active, &wp->minimized, &wp->maximized);
         if (!wp->icon) {
@@ -116,7 +135,7 @@ static void winctl_measure(PanelWidget *w, int cross_axis, int *out_len, int *ou
     WinctlPriv *wp = w->priv;
     Panel *p = w->panel;
 
-    if (wp->active_win == None) {
+    if (!wp->active_applies) {
         *out_len = 0;
         *out_min_len = 0;
         return;
@@ -146,7 +165,7 @@ static void winctl_measure(PanelWidget *w, int cross_axis, int *out_len, int *ou
 static void winctl_layout(PanelWidget *w)
 {
     WinctlPriv *wp = w->priv;
-    int show_buttons = wp->active_win != None && (wp->show_always || wp->maximized);
+    int show_buttons = wp->active_applies && (wp->show_always || wp->maximized);
     wp->n_visible_buttons = show_buttons ? wp->n_buttons : 0;
 
     int btn_w = w->thickness;
@@ -161,7 +180,7 @@ static void winctl_paint(PanelWidget *w, cairo_t *cr)
 {
     WinctlPriv *wp = w->priv;
     Panel *p = w->panel;
-    if (wp->active_win == None) {
+    if (!wp->active_applies) {
         wp->n_visible_buttons = 0;
         return;
     }
@@ -242,7 +261,7 @@ static int winctl_get_tooltip(PanelWidget *w, int local_x, char *buf, size_t buf
     (void)out_closable;
     (void)out_ctx;
     WinctlPriv *wp = w->priv;
-    if (wp->active_win == None || !wp->title[0]) {
+    if (!wp->active_applies || !wp->title[0]) {
         return 0;
     }
     snprintf(buf, bufsz, "%s", wp->title); /* wp->title is never truncated, unlike the trimmed on-panel label */
@@ -257,7 +276,7 @@ static int winctl_on_button(PanelWidget *w, int button, int local_x, int local_y
     (void)root_x;
     (void)root_y;
     WinctlPriv *wp = w->priv;
-    if (wp->active_win == None || button != Button1) {
+    if (!wp->active_applies || button != Button1) {
         return 0;
     }
     winctl_layout(w);
