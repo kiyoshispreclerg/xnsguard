@@ -210,6 +210,11 @@ void widget_get_rect(const PanelWidget *w, int *x, int *y, int *width, int *heig
     }
 }
 
+double panel_text_size(const Panel *p)
+{
+    return p->font_size_px > 0 ? p->font_size_px : p->thickness * 0.45;
+}
+
 /* ------------------------------------------------------------------ */
 /* config-only string helpers (not part of the widget-facing API)       */
 /* ------------------------------------------------------------------ */
@@ -368,6 +373,77 @@ static void detect_system_font_family(char *out, size_t outsz)
         }
         fclose(f);
     }
+}
+
+/* Companion to detect_system_font_family() -- same two sources, same
+ * live-read-every-time philosophy (see detect_system_colors()'s doc
+ * comment), but for the *point size* instead of the family name:
+ *   - KDE/Plasma: kdeglobals's "font=Family,POINTSIZE,weight,..." --
+ *     the second comma-separated field.
+ *   - GTK3: gtk-3.0/settings.ini's "gtk-font-name=Family [Style] SIZE" --
+ *     the same trailing numeric token detect_system_font_family() already
+ *     strips off (there for Fontconfig's family-only lookup) is the
+ *     point size here.
+ * Returns 0 (not a valid pixel size) if neither file has a parseable
+ * size -- callers keep whatever size they'd otherwise use (thickness-
+ * proportional for in-panel widget text, fixed constants for tooltip/
+ * menu popups). Converts pt to px at a flat 96 DPI (`* 96.0/72.0`) --
+ * no attempt at real per-monitor DPI, consistent with the rest of
+ * xispanel treating all size units as plain pixels. */
+static double detect_system_font_size_px(void)
+{
+    const char *home = getenv("HOME");
+    if (!home) {
+        return 0;
+    }
+    char path[PATH_MAX];
+    char line[512];
+
+    snprintf(path, sizeof(path), "%s/.config/kdeglobals", home);
+    FILE *f = fopen(path, "r");
+    if (f) {
+        int in_general = 0;
+        while (fgets(line, sizeof(line), f)) {
+            size_t len = strlen(line);
+            while (len && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+                line[--len] = 0;
+            }
+            if (line[0] == '[') {
+                in_general = (strcmp(line, "[General]") == 0);
+                continue;
+            }
+            if (in_general && strncmp(line, "font=", 5) == 0) {
+                const char *comma = strchr(line + 5, ',');
+                fclose(f);
+                if (comma && isdigit((unsigned char)comma[1])) {
+                    return atoi(comma + 1) * 96.0 / 72.0;
+                }
+                return 0;
+            }
+        }
+        fclose(f);
+    }
+
+    snprintf(path, sizeof(path), "%s/.config/gtk-3.0/settings.ini", home);
+    f = fopen(path, "r");
+    if (f) {
+        while (fgets(line, sizeof(line), f)) {
+            size_t len = strlen(line);
+            while (len && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+                line[--len] = 0;
+            }
+            if (strncmp(line, "gtk-font-name=", 14) == 0) {
+                char *sp = strrchr(line + 14, ' ');
+                fclose(f);
+                if (sp && isdigit((unsigned char)sp[1])) {
+                    return atoi(sp + 1) * 96.0 / 72.0;
+                }
+                return 0;
+            }
+        }
+        fclose(f);
+    }
+    return 0;
 }
 
 /* Reads a "R,G,B" (each 0-255) KDE color-scheme value into 0.0-1.0 doubles.
@@ -973,8 +1049,8 @@ static void panel_create_surface(Panel *p)
         cairo_set_font_face(p->cr, g_font_face);
         cairo_set_font_face(p->buf_cr, g_font_face);
     }
-    cairo_set_font_size(p->cr, p->thickness * 0.45);
-    cairo_set_font_size(p->buf_cr, p->thickness * 0.45);
+    cairo_set_font_size(p->cr, panel_text_size(p));
+    cairo_set_font_size(p->buf_cr, panel_text_size(p));
 }
 
 /* ------------------------------------------------------------------ */
@@ -1081,7 +1157,7 @@ static void panel_repaint(Panel *p)
         if (g_font_face) {
             cairo_set_font_face(p->buf_cr, g_font_face);
         }
-        cairo_set_font_size(p->buf_cr, p->thickness * 0.45);
+        cairo_set_font_size(p->buf_cr, panel_text_size(p));
     }
 
     /* Every widget paints into the offscreen buf_cr/buf_surface first. Only
@@ -1167,7 +1243,7 @@ static void panel_repaint(Panel *p)
         if (g_font_face) {
             cairo_set_font_face(p->cr, g_font_face);
         }
-        cairo_set_font_size(p->cr, p->thickness * 0.45);
+        cairo_set_font_size(p->cr, panel_text_size(p));
     }
 
     cairo_save(p->cr);
@@ -1381,6 +1457,11 @@ static Panel *alloc_panel(const char *name, const char *output)
              * whichever it didn't. A THEME line's own bg=/fg= (applied
              * later, from load_config()) always wins over either. */
             detect_system_colors(&p->bg_r, &p->bg_g, &p->bg_b, &p->fg_r, &p->fg_g, &p->fg_b);
+            /* Same THEME-overrides-detected-overrides-hardcoded layering
+             * as colors above -- 0 here means "undetected", every user of
+             * font_size_px already treats that as "fall back to my own
+             * existing size" (see the field's doc comment in xispanel.h). */
+            p->font_size_px = detect_system_font_size_px();
             p->spacing = 4;
             return p;
         }
@@ -1484,6 +1565,9 @@ static void apply_theme_kv(Panel *p, const char *kvline)
         parse_hex_color(buf, &p->fg_r, &p->fg_g, &p->fg_b, &p->fg_a);
     }
     p->spacing = kv_get_int(kvline, "spacing", p->spacing);
+    if (kv_get(kvline, "font_size", buf, sizeof(buf))) {
+        p->font_size_px = atof(buf);
+    }
     /* Optional 9-slice background image, replacing the bg_r/g/b/a color
      * above entirely once it loads (panel_load_bg_image(), called from
      * panel_activate() -- not here, since that needs Imlib2/an open X

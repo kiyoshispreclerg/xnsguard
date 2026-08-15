@@ -34,6 +34,7 @@ typedef struct {
                           * fcitx5's input-method switcher can have a dozen+ entries) */
     int n_items;
     int item_h;
+    double font_size; /* panel_text_size(owner_panel), resolved once at open time */
     int width, height;
     int hover_index;
     Panel *owner_panel;
@@ -77,7 +78,7 @@ static void panel_menu_paint(void)
     if (g_font_face) {
         cairo_set_font_face(m->cr, g_font_face);
     }
-    cairo_set_font_size(m->cr, m->item_h * 0.5);
+    cairo_set_font_size(m->cr, m->font_size);
     for (int i = 0; i < m->n_items; i++) {
         int y = i * m->item_h;
         MenuItem *it = &m->items[i];
@@ -132,6 +133,16 @@ void panel_menu_open(Panel *owner_panel, PanelWidget *owner_widget, int anchor_x
     if (m->item_h < 20) {
         m->item_h = 20;
     }
+    /* font_size_px if set (system-detected or THEME's font_size=), else
+     * the historical item_h-proportional size -- same layering
+     * panel_text_size() applies to in-panel widget text; menu.c can't
+     * just call that helper directly since it wants item_h as the
+     * fallback basis, not thickness, but the priority order is the
+     * same. */
+    m->font_size = owner_panel->font_size_px > 0 ? owner_panel->font_size_px : m->item_h * 0.5;
+    if (m->item_h < m->font_size * 1.6) {
+        m->item_h = (int)(m->font_size * 1.6); /* keep rows tall enough for a bigger-than-usual font size */
+    }
 
     /* Measure against a throwaway surface (no mapped menu window/cairo
      * context exists yet to measure against). */
@@ -140,7 +151,7 @@ void panel_menu_open(Panel *owner_panel, PanelWidget *owner_widget, int anchor_x
     if (g_font_face) {
         cairo_set_font_face(probe_cr, g_font_face);
     }
-    cairo_set_font_size(probe_cr, m->item_h * 0.5);
+    cairo_set_font_size(probe_cr, m->font_size);
     int max_w = 80;
     for (int i = 0; i < n_items; i++) {
         if (m->items[i].is_separator) {

@@ -155,6 +155,14 @@ struct Panel {
     /* theme */
     double bg_r, bg_g, bg_b, bg_a;
     double fg_r, fg_g, fg_b, fg_a;
+    /* 0 = not detected/configured -- callers fall back to their own
+     * existing size (usually thickness-proportional for in-panel widget
+     * text, or a fixed constant for tooltip/menu popups). >0 = pixel font
+     * size to use for task/window/clock labels and this panel's tooltip
+     * and context-menu text; defaults to the live system font size (see
+     * detect_system_font_size_px()) and can be overridden by THEME's
+     * own font_size=<px>. */
+    double font_size_px;
     int spacing;
     /* Optional 9-slice background image, replacing the solid bg_* color
      * entirely when it loads successfully -- see THEME's bg_image/
@@ -216,6 +224,14 @@ int kv_get_int(const char *kvline, const char *key, int defval);
  * orientation (horizontal panels lay widgets out along x, vertical panels
  * along y). */
 void widget_get_rect(const PanelWidget *w, int *x, int *y, int *width, int *height);
+/* Resolved text size for `p`'s own in-panel widget text (task/window/clock
+ * labels): p->font_size_px if set (system-detected or THEME's font_size=),
+ * else the historical thickness-proportional size. Widgets that draw their
+ * *own* independently-sized text (badges, pin dots, fallback icon letters)
+ * intentionally don't use this -- only the shared "ambient" label size set
+ * once per repaint and any widget code that needs to restore it after a
+ * temporary override (see tasklist.c's badges). */
+double panel_text_size(const Panel *p);
 /* Decodes any format Imlib2 understands (PNG, SVG if librsvg's loader is
  * present at runtime, etc.) into a premultiplied-alpha ARGB32 Cairo
  * surface, or NULL on any failure (missing file, decode error, larger

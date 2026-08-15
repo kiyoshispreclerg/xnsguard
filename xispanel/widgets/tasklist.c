@@ -577,7 +577,7 @@ static void tasklist_paint(PanelWidget *w, cairo_t *cr)
             cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.95);
             cairo_move_to(cr, bx2, by2);
             cairo_show_text(cr, badge);
-            cairo_set_font_size(cr, w->thickness * 0.45);
+            cairo_set_font_size(cr, panel_text_size(p));
         }
         if (group_count > 1) {
             /* Bottom-left of the icon -- deliberately the one corner the
@@ -597,7 +597,7 @@ static void tasklist_paint(PanelWidget *w, cairo_t *cr)
             cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.95);
             cairo_move_to(cr, bx2, by2);
             cairo_show_text(cr, badge);
-            cairo_set_font_size(cr, w->thickness * 0.45);
+            cairo_set_font_size(cr, panel_text_size(p));
         }
         cairo_pop_group_to_source(cr);
         cairo_paint_with_alpha(cr, e->minimized ? 0.55 : 1.0);

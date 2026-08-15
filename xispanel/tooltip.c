@@ -230,9 +230,21 @@ static void query_group(PanelWidget *w, int local_x)
     }
 }
 
+/* g_panel->font_size_px (system-detected or THEME's font_size=) if set,
+ * else the historical fixed constant -- same layering panel_text_size()
+ * (xispanel.c) applies to in-panel widget text, just for tooltip popups,
+ * which are always owned by a specific panel (g_panel) so can follow
+ * that same panel's setting. */
+static double tooltip_font_size(void)
+{
+    return g_panel && g_panel->font_size_px > 0 ? g_panel->font_size_px : TOOLTIP_FONT_SIZE;
+}
+
 /* Splits g_text on '\n' into up to TOOLTIP_MAX_LINES lines and measures
- * them against `cr` (which must already have the tooltip font set). */
-static int measure_lines(cairo_t *cr, char lines[TOOLTIP_MAX_LINES][128], int *out_text_w, int *out_h)
+ * them against `cr` (which must already have the tooltip font set at
+ * `font_size`). */
+static int measure_lines(cairo_t *cr, double font_size, char lines[TOOLTIP_MAX_LINES][128], int *out_text_w,
+                          int *out_h)
 {
     int n = 0;
     char buf[256];
@@ -245,7 +257,7 @@ static int measure_lines(cairo_t *cr, char lines[TOOLTIP_MAX_LINES][128], int *o
         tok = strtok_r(NULL, "\n", &save);
     }
 
-    double line_h = TOOLTIP_FONT_SIZE * 1.4;
+    double line_h = font_size * 1.4;
     int max_w = 0;
     for (int i = 0; i < n; i++) {
         cairo_text_extents_t ext;
@@ -269,7 +281,7 @@ static void paint_popup_group(void)
     if (g_font_face) {
         cairo_set_font_face(cr, g_font_face);
     }
-    cairo_set_font_size(cr, TOOLTIP_FONT_SIZE);
+    cairo_set_font_size(cr, tooltip_font_size());
 
     for (int i = 0; i < g_popup->group_shown_n; i++) {
         int ix = g_popup->group_item_x[i];
@@ -367,15 +379,16 @@ static void paint_popup(void)
         }
     }
 
+    double fsz = tooltip_font_size();
     if (g_font_face) {
         cairo_set_font_face(cr, g_font_face);
     }
-    cairo_set_font_size(cr, TOOLTIP_FONT_SIZE);
+    cairo_set_font_size(cr, fsz);
 
     char lines[TOOLTIP_MAX_LINES][128];
     int text_w, h;
-    int n = measure_lines(cr, lines, &text_w, &h);
-    double line_h = TOOLTIP_FONT_SIZE * 1.4;
+    int n = measure_lines(cr, fsz, lines, &text_w, &h);
+    double line_h = fsz * 1.4;
     int content_y0 = g_popup->content_y0;
 
     cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, p->fg_a);
@@ -462,13 +475,14 @@ static void show_popup_single_layout(TooltipPopup *pop)
      * create the real window. */
     cairo_surface_t *probe_surf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
     cairo_t *probe_cr = cairo_create(probe_surf);
+    double fsz = tooltip_font_size();
     if (g_font_face) {
         cairo_set_font_face(probe_cr, g_font_face);
     }
-    cairo_set_font_size(probe_cr, TOOLTIP_FONT_SIZE);
+    cairo_set_font_size(probe_cr, fsz);
     char lines[TOOLTIP_MAX_LINES][128];
     int text_w, text_h;
-    measure_lines(probe_cr, lines, &text_w, &text_h);
+    measure_lines(probe_cr, fsz, lines, &text_w, &text_h);
     cairo_destroy(probe_cr);
     cairo_surface_destroy(probe_surf);
 
@@ -582,7 +596,7 @@ static void show_popup_group_layout(TooltipPopup *pop)
     if (g_font_face) {
         cairo_set_font_face(probe_cr, g_font_face);
     }
-    cairo_set_font_size(probe_cr, TOOLTIP_FONT_SIZE);
+    cairo_set_font_size(probe_cr, tooltip_font_size());
 
     int cell_w, cell_h;
     if (pop->group_thumbs) {
