@@ -10,7 +10,16 @@
  * `launcher` widgets on one panel is how the user pins individual
  * shortcuts today; `.desktop`-based pinning is future launcher-phase
  * territory (see tasklist's "pin" TODO).
- */
+ *
+ * `cmd=` covers left-click; `cmd_middle=`/`cmd_right=`/`cmd_scroll_up=`/
+ * `cmd_scroll_down=` are all optional extra actions on the same icon for
+ * the other buttons and the scroll wheel (X11 reports wheel motion as
+ * ButtonPress with button 4/5, so it falls through the exact same
+ * dispatch as a click -- no separate scroll handling needed). This turns
+ * a single `launcher` into a small multi-action control -- e.g. a volume
+ * icon where scroll adjusts it and a click opens a mixer -- without
+ * needing a dedicated widget type for that shape of interaction. Any
+ * action left unset is simply a no-op for that button/direction. */
 #include "../xispanel.h"
 
 #include <X11/Xlib.h>
@@ -20,7 +29,11 @@
 
 typedef struct {
     char name[64];
-    char cmd[256];
+    char cmd[256];         /* left click */
+    char cmd_middle[256];  /* middle click */
+    char cmd_right[256];   /* right click */
+    char cmd_scroll_up[256];
+    char cmd_scroll_down[256];
     cairo_surface_t *icon; /* NULL if icon= wasn't set or failed to load */
 } LauncherPriv;
 
@@ -29,6 +42,10 @@ static int launcher_init(PanelWidget *w)
     LauncherPriv *lp = w->priv;
     kv_get(w->config_kv, "name", lp->name, sizeof(lp->name));
     kv_get(w->config_kv, "cmd", lp->cmd, sizeof(lp->cmd));
+    kv_get(w->config_kv, "cmd_middle", lp->cmd_middle, sizeof(lp->cmd_middle));
+    kv_get(w->config_kv, "cmd_right", lp->cmd_right, sizeof(lp->cmd_right));
+    kv_get(w->config_kv, "cmd_scroll_up", lp->cmd_scroll_up, sizeof(lp->cmd_scroll_up));
+    kv_get(w->config_kv, "cmd_scroll_down", lp->cmd_scroll_down, sizeof(lp->cmd_scroll_down));
 
     char icon_path[PATH_MAX];
     if (kv_get(w->config_kv, "icon", icon_path, sizeof(icon_path)) && icon_path[0]) {
@@ -98,10 +115,27 @@ static int launcher_on_button(PanelWidget *w, int button, int local_x, int local
     (void)root_x;
     (void)root_y;
     LauncherPriv *lp = w->priv;
-    if (button != Button1) {
+    const char *cmd;
+    switch (button) {
+    case Button1:
+        cmd = lp->cmd;
+        break;
+    case Button2:
+        cmd = lp->cmd_middle;
+        break;
+    case Button3:
+        cmd = lp->cmd_right;
+        break;
+    case Button4:
+        cmd = lp->cmd_scroll_up;
+        break;
+    case Button5:
+        cmd = lp->cmd_scroll_down;
+        break;
+    default:
         return 0;
     }
-    run_detached(lp->cmd);
+    run_detached(cmd);
     return 1;
 }
 

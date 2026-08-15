@@ -196,10 +196,17 @@ Widget types implemented so far:
   derived from `name` if missing or it fails to load), `name=<text>`
   (hover tooltip, and the fallback placeholder's letter), `cmd=<command>`
   (run via `sh -c` on left-click, detached -- quote it if it needs
-  spaces, e.g. `cmd="xterm -e htop"`). Deliberately not a full
-  `.desktop`-aware application launcher (no parsing, no icon-theme
-  lookup, no search) -- multiple `launcher` widgets is how the user pins
-  individual shortcuts today; that's future launcher-phase territory.
+  spaces, e.g. `cmd="xterm -e htop"`). `cmd_middle=`/`cmd_right=`/
+  `cmd_scroll_up=`/`cmd_scroll_down=` are the same shape of option for
+  middle-click, right-click, and the scroll wheel (X11 delivers wheel
+  motion as a button 4/5 press, so it's the same dispatch path as a
+  click) -- any left unset is simply a no-op for that button/direction.
+  This makes one `launcher` usable as a small multi-action control (e.g.
+  scroll to adjust something, click to open a full app for it) without a
+  dedicated widget type. Deliberately not a full `.desktop`-aware
+  application launcher (no parsing, no icon-theme lookup, no search) --
+  multiple `launcher` widgets is how the user pins individual shortcuts
+  today; that's future launcher-phase territory.
 
 More widget types (global menu, system monitor) are later phases -- see
 the plan this tool was built from; they are not implemented yet.
