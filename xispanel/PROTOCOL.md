@@ -484,16 +484,29 @@ up in:
   host, polling *that* watcher's `RegisteredStatusNotifierItems` property
   instead of tracking registrations itself.
 
-Either way, once an item is known, xispanel polls its
-`org.freedesktop.DBus.Properties.GetAll("org.kde.StatusNotifierItem")`
-for `Title`/`IconPixmap` every ~1.5s (vs. subscribing to `NewIcon`/
-`NewStatus` signals -- acceptable staleness for a tray icon, the same
-polling-over-signals tradeoff MPRIS makes). `IconPixmap` is an
-`a(iiay)` array of `(width, height, ARGB32-network-byte-order bytes)`
-structs; the largest available is picked and converted to a premultiplied
-Cairo surface the same way `_NET_WM_ICON` already is in `ewmh.c`. Items
-that never set `IconPixmap` fall back to the same single-letter
-placeholder tasklist/winctl use, keyed off `Title`/`IconName`.
+Either way, once an item is known, xispanel re-fetches its `Title`
+(targeted `org.freedesktop.DBus.Properties.Get`, not `GetAll`) every
+~1.5s poll -- cheap, a small string. `IconPixmap` is *not* re-fetched on
+that same schedule: an early implementation did (`GetAll` on the whole
+`org.kde.StatusNotifierItem` interface, dragging along `IconPixmap` and
+`ToolTip` -- both potentially tens of KB of raw pixel data -- every
+1.5s regardless of whether anything changed) and it measurably cost
+~4-5% sustained CPU with just 2-3 real tray items registered. Instead,
+xispanel adds a bus match rule for
+`type='signal',interface='org.kde.StatusNotifierItem'` at connect time
+(still no per-item `dbus_connection_add_filter()`/watch-object
+machinery -- these signals just show up in the same
+`dbus_connection_pop_message()` drain everything else uses) and only
+re-fetches `IconPixmap` (via a targeted `Properties.Get`, not `GetAll`)
+for all known items when a `NewIcon`/`NewAttentionIcon`/`NewOverlayIcon`/
+`NewStatus`/`NewTitle`/`NewToolTip` signal was seen from *any* item since
+the last poll, plus a 60s fallback in case some item's client library
+doesn't emit those signals reliably. `IconPixmap` is an `a(iiay)` array
+of `(width, height, ARGB32-network-byte-order bytes)` structs; the
+largest available is picked and converted to a premultiplied Cairo
+surface the same way `_NET_WM_ICON` already is in `ewmh.c`. Items that
+never set `IconPixmap` fall back to the same single-letter placeholder
+tasklist/winctl use, keyed off `Title`/`IconName`.
 
 Left-click sends `Activate(root_x, root_y)`, middle-click
 `SecondaryActivate(root_x, root_y)`, right-click `ContextMenu(root_x,

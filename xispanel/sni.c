@@ -32,9 +32,17 @@
  * conventional way a host announces itself, though not every item
  * actually checks for one.
  *
- * Icon fetching polls each registered item's IconPixmap property (~1.5s,
- * same tradeoff as mpris.c) instead of subscribing to NewIcon/NewStatus
- * signals -- acceptable staleness for a tray icon, much less plumbing.
+ * Title is re-fetched every ~1.5s poll (cheap, small string). IconPixmap
+ * is *not* re-fetched every poll -- a bare match rule on
+ * "type='signal',interface='org.kde.StatusNotifierItem'" (still no
+ * per-watch/timeout plumbing, just messages that show up in the same
+ * pop_message() drain as everything else) is enough to notice when some
+ * item announced a NewIcon/NewAttentionIcon/NewOverlayIcon/NewStatus/
+ * NewTitle/NewToolTip change, and only then is the (potentially tens-of-
+ * KB) IconPixmap property actually re-fetched, plus a much slower
+ * SNI_ICON_REFRESH_MS safety net for items that don't emit those signals
+ * reliably. Re-fetching that payload on every 1.5s poll regardless of
+ * whether anything changed was a real, measured CPU cost.
  */
 #include "xispanel.h"
 
@@ -46,6 +54,11 @@
 #include <unistd.h>
 
 #define SNI_POLL_MS 1500
+/* Safety-net fallback only -- IconPixmap is normally re-fetched right
+ * after a NewIcon/NewStatus/etc. signal is observed (see
+ * g_saw_change_signal), not on a fixed schedule. This just catches items
+ * whose client library doesn't emit those signals reliably. */
+#define SNI_ICON_REFRESH_MS 60000
 #define SNI_CALL_TIMEOUT_MS 200
 #define SNI_MAX_ITEMS 24
 #define SNI_WATCHER_PATH "/StatusNotifierWatcher"
@@ -62,6 +75,10 @@ typedef struct {
     char path[128];
     char title[128];
     cairo_surface_t *icon;
+    /* IconPixmap is only re-fetched every SNI_ICON_REFRESH_MS (0 forces
+     * an immediate fetch for a freshly-registered item), not on every
+     * SNI_POLL_MS tick -- see sni_poll()'s header comment. */
+    uint64_t next_icon_poll_ms;
 } SniItem;
 
 static SniItem g_items[SNI_MAX_ITEMS];
@@ -74,6 +91,9 @@ static int g_host_registered = 0;
  * startup. Both interface *and* bus name are this same string (the
  * protocol reuses the bus name as its own interface name). */
 static const char *g_watcher_name = NULL;
+/* Set by sni_handle_incoming() when any item's NewIcon/NewStatus/etc.
+ * signal arrived since the last poll; sni_poll() checks + clears it. */
+static int g_saw_change_signal = 0;
 
 static void *g_libdbus = NULL;
 static int g_load_attempted = 0;
@@ -86,6 +106,7 @@ static dbus_bool_t (*p_dbus_error_is_set)(const DBusError *);
 static DBusConnection *(*p_dbus_bus_get)(DBusBusType, DBusError *);
 static int (*p_dbus_bus_request_name)(DBusConnection *, const char *, unsigned int, DBusError *);
 static dbus_bool_t (*p_dbus_bus_name_has_owner)(DBusConnection *, const char *, DBusError *);
+static void (*p_dbus_bus_add_match)(DBusConnection *, const char *, DBusError *);
 static DBusMessage *(*p_dbus_message_new_method_call)(const char *, const char *, const char *, const char *);
 static DBusMessage *(*p_dbus_message_new_method_return)(DBusMessage *);
 static DBusMessage *(*p_dbus_message_new_error)(DBusMessage *, const char *, const char *);
@@ -127,6 +148,7 @@ static int sni_load_symbols(void)
     LOAD_SYM(dbus_bus_get);
     LOAD_SYM(dbus_bus_request_name);
     LOAD_SYM(dbus_bus_name_has_owner);
+    LOAD_SYM(dbus_bus_add_match);
     LOAD_SYM(dbus_message_new_method_call);
     LOAD_SYM(dbus_message_new_method_return);
     LOAD_SYM(dbus_message_new_error);
@@ -229,6 +251,21 @@ static int sni_ensure_connected(void)
         }
     }
 
+    /* Subscribe to every item's change signals (NewIcon/NewAttentionIcon/
+     * NewOverlayIcon/NewStatus/NewTitle/NewToolTip) so sni_poll() can skip
+     * re-fetching IconPixmap on every tick and instead only do it when
+     * something actually announced a change -- see sni_poll()'s header
+     * comment. No sender filter: items' bus names aren't known in advance
+     * (and a well-known name like "org.fcitx...StatusNotifierItem-..."
+     * doesn't match the unique ":1.NN" name signals actually arrive from
+     * anyway), so this catches signals from any item and sni_handle_incoming()
+     * treats "some item changed" as "recheck all known items" -- cheap,
+     * since it only fires on real changes rather than every poll. */
+    DBusError merr;
+    p_dbus_error_init(&merr);
+    p_dbus_bus_add_match(g_conn, "type='signal',interface='" SNI_ITEM_IFACE "'", &merr);
+    p_dbus_error_free(&merr);
+
     char hostname[64];
     snprintf(hostname, sizeof(hostname), "org.freedesktop.StatusNotifierHost-%d", (int)getpid());
     DBusError err3;
@@ -238,27 +275,6 @@ static int sni_ensure_connected(void)
     g_host_registered = (hret == 1 || hret == 4 /* ALREADY_OWNER */);
 
     return 1;
-}
-
-static DBusMessage *sni_call1s(const char *dest, const char *path, const char *iface, const char *method,
-                                const char *arg)
-{
-    DBusMessage *msg = p_dbus_message_new_method_call(dest, path, iface, method);
-    if (!msg) {
-        return NULL;
-    }
-    DBusMessageIter it;
-    p_dbus_message_iter_init_append(msg, &it);
-    p_dbus_message_iter_append_basic(&it, DBUS_TYPE_STRING, &arg);
-    DBusError err;
-    p_dbus_error_init(&err);
-    DBusMessage *reply = p_dbus_connection_send_with_reply_and_block(g_conn, msg, SNI_CALL_TIMEOUT_MS, &err);
-    p_dbus_message_unref(msg);
-    if (p_dbus_error_is_set(&err)) {
-        p_dbus_error_free(&err);
-        return NULL;
-    }
-    return reply;
 }
 
 static DBusMessage *sni_call2s(const char *dest, const char *path, const char *iface, const char *method,
@@ -299,67 +315,39 @@ static void sni_send2i(const char *dest, const char *path, const char *iface, co
     p_dbus_message_unref(msg);
 }
 
-/* Reads one string or variant<string> property value out of a GetAll
- * reply's "a{sv}" dict for `want_key`, into buf. Returns 1 if found. */
-static int extract_string_prop(DBusMessage *reply, const char *want_key, char *buf, size_t bufsz)
+/* Reads a Properties.Get reply's single top-level variant<string>, into
+ * buf. Returns 1 if found. Deliberately using targeted Get (not GetAll)
+ * for Title/IconName: GetAll also drags along ToolTip and IconPixmap,
+ * which can be tens of KB of pixel data -- wasteful for a value we
+ * re-fetch every poll (see sni_poll()'s header comment). */
+static int extract_get_string(DBusMessage *reply, char *buf, size_t bufsz)
 {
-    DBusMessageIter it, arr, entry, variant;
-    if (!p_dbus_message_iter_init(reply, &it) || p_dbus_message_iter_get_arg_type(&it) != DBUS_TYPE_ARRAY) {
+    DBusMessageIter it, variant;
+    if (!p_dbus_message_iter_init(reply, &it) || p_dbus_message_iter_get_arg_type(&it) != DBUS_TYPE_VARIANT) {
         return 0;
     }
-    p_dbus_message_iter_recurse(&it, &arr);
-    while (p_dbus_message_iter_get_arg_type(&arr) == DBUS_TYPE_DICT_ENTRY) {
-        p_dbus_message_iter_recurse(&arr, &entry);
-        const char *key = NULL;
-        if (p_dbus_message_iter_get_arg_type(&entry) == DBUS_TYPE_STRING) {
-            p_dbus_message_iter_get_basic(&entry, &key);
-        }
-        p_dbus_message_iter_next(&entry);
-        if (key && strcmp(key, want_key) == 0 && p_dbus_message_iter_get_arg_type(&entry) == DBUS_TYPE_VARIANT) {
-            p_dbus_message_iter_recurse(&entry, &variant);
-            if (p_dbus_message_iter_get_arg_type(&variant) == DBUS_TYPE_STRING) {
-                const char *val = NULL;
-                p_dbus_message_iter_get_basic(&variant, &val);
-                snprintf(buf, bufsz, "%s", val ? val : "");
-                return 1;
-            }
-        }
-        if (!p_dbus_message_iter_next(&arr)) {
-            break;
-        }
+    p_dbus_message_iter_recurse(&it, &variant);
+    if (p_dbus_message_iter_get_arg_type(&variant) != DBUS_TYPE_STRING) {
+        return 0;
     }
-    return 0;
+    const char *val = NULL;
+    p_dbus_message_iter_get_basic(&variant, &val);
+    snprintf(buf, bufsz, "%s", val ? val : "");
+    return 1;
 }
 
-/* Same shape as extract_string_prop() but for IconPixmap's "a(iiay)" value:
- * an array of (width,height,ARGB32-network-byte-order pixel bytes) structs.
- * Picks the largest available and returns a premultiplied cairo surface,
- * or NULL if the property is absent/empty. */
-static cairo_surface_t *extract_icon_pixmap(DBusMessage *reply)
+/* Same shape as extract_get_string() but for a targeted Properties.Get on
+ * IconPixmap: variant<"a(iiay)">, an array of (width,height,ARGB32-
+ * network-byte-order pixel bytes) structs. Picks the largest available and
+ * returns a premultiplied cairo surface, or NULL if absent/empty. */
+static cairo_surface_t *extract_get_icon_pixmap(DBusMessage *reply)
 {
-    DBusMessageIter it, arr, entry, variant, icons, icon_s, byte_arr;
-    if (!p_dbus_message_iter_init(reply, &it) || p_dbus_message_iter_get_arg_type(&it) != DBUS_TYPE_ARRAY) {
+    DBusMessageIter it, variant, icons, icon_s, byte_arr;
+    if (!p_dbus_message_iter_init(reply, &it) || p_dbus_message_iter_get_arg_type(&it) != DBUS_TYPE_VARIANT) {
         return NULL;
     }
-    p_dbus_message_iter_recurse(&it, &arr);
-    int found_variant = 0;
-    while (p_dbus_message_iter_get_arg_type(&arr) == DBUS_TYPE_DICT_ENTRY) {
-        p_dbus_message_iter_recurse(&arr, &entry);
-        const char *key = NULL;
-        if (p_dbus_message_iter_get_arg_type(&entry) == DBUS_TYPE_STRING) {
-            p_dbus_message_iter_get_basic(&entry, &key);
-        }
-        p_dbus_message_iter_next(&entry);
-        if (key && strcmp(key, "IconPixmap") == 0 && p_dbus_message_iter_get_arg_type(&entry) == DBUS_TYPE_VARIANT) {
-            p_dbus_message_iter_recurse(&entry, &variant);
-            found_variant = 1;
-            break;
-        }
-        if (!p_dbus_message_iter_next(&arr)) {
-            break;
-        }
-    }
-    if (!found_variant || p_dbus_message_iter_get_arg_type(&variant) != DBUS_TYPE_ARRAY) {
+    p_dbus_message_iter_recurse(&it, &variant);
+    if (p_dbus_message_iter_get_arg_type(&variant) != DBUS_TYPE_ARRAY) {
         return NULL;
     }
     p_dbus_message_iter_recurse(&variant, &icons);
@@ -464,22 +452,30 @@ static void sni_register_item(const char *arg)
     fprintf(stderr, "xispanel: sni: tray item registered: %s%s\n", busname, path);
 }
 
-/* Handles whatever incoming messages are waiting for us, if we're acting
- * as the watcher: RegisterStatusNotifierItem (the only method real tray
- * items actually call on us), plus best-effort Properties.Get(All) and
- * Introspect so a strict client doesn't just hang/log errors. Every
- * method call gets *some* reply if one was expected, even if just an
- * error -- an unanswered method call is the one thing that can visibly
- * misbehave a well-written DBus client. */
+/* Handles whatever incoming messages are waiting for us: our NewIcon/
+ * NewStatus/etc. match rule (see sni_ensure_connected()) delivers signals
+ * regardless of watcher role, so this always drains the queue -- not just
+ * when g_is_watcher -- setting g_saw_change_signal for sni_poll() to pick
+ * up. Method calls (RegisterStatusNotifierItem, the odd Properties.Get(All)
+ * / Introspect probe) are only ever sent to us when we *are* the watcher,
+ * so that handling stays gated. Every method call that expects a reply
+ * gets *some* reply, even if just an error -- an unanswered one is the one
+ * thing that can visibly misbehave a well-written DBus client. */
 static void sni_handle_incoming(void)
 {
-    if (!g_is_watcher) {
-        return;
-    }
     p_dbus_connection_read_write(g_conn, 0);
     DBusMessage *msg;
     while ((msg = p_dbus_connection_pop_message(g_conn)) != NULL) {
-        if (p_dbus_message_get_type(msg) != DBUS_MESSAGE_TYPE_METHOD_CALL) {
+        int mtype = p_dbus_message_get_type(msg);
+        if (mtype == DBUS_MESSAGE_TYPE_SIGNAL) {
+            const char *siface = p_dbus_message_get_interface(msg);
+            if (siface && strcmp(siface, SNI_ITEM_IFACE) == 0) {
+                g_saw_change_signal = 1;
+            }
+            p_dbus_message_unref(msg);
+            continue;
+        }
+        if (!g_is_watcher || mtype != DBUS_MESSAGE_TYPE_METHOD_CALL) {
             p_dbus_message_unref(msg);
             continue;
         }
@@ -542,9 +538,11 @@ static void sni_handle_incoming(void)
 }
 
 /* Refreshes g_items[] from whichever watcher owns g_watcher_name (be it
- * us or another process), then re-fetches each item's Title/IconPixmap.
- * Also drains+handles incoming requests if we're the watcher. Called at
- * most once every SNI_POLL_MS from the main loop. */
+ * us or another process), then re-fetches each item's Title (always) and
+ * IconPixmap (only on a change signal or the SNI_ICON_REFRESH_MS safety
+ * net -- see below). Also drains+handles incoming requests, answering
+ * them if we're the watcher. Called at most once every SNI_POLL_MS from
+ * the main loop. */
 void sni_poll(uint64_t now)
 {
     if (now < g_next_poll_ms) {
@@ -597,14 +595,32 @@ void sni_poll(uint64_t now)
 
     /* Refresh Title + icon for every currently-tracked item, dropping any
      * that stopped answering (process exited without us seeing it leave
-     * the bus). */
+     * the bus). Title uses a targeted Properties.Get every poll (cheap,
+     * small string); IconPixmap is fetched the same way but only when
+     * g_saw_change_signal is set (a NewIcon/NewAttentionIcon/NewOverlayIcon/
+     * NewStatus/NewTitle/NewToolTip signal arrived from *some* item since
+     * the last poll -- see the match rule in sni_ensure_connected()) or the
+     * SNI_ICON_REFRESH_MS safety net elapsed. A GetAll-every-1.5s of a
+     * property that can carry tens of KB of raw pixel data per item,
+     * regardless of whether anything changed, was the actual cause of
+     * xispanel's tray-widget CPU cost -- this way the expensive fetch only
+     * happens when there's reason to think it changed. Liveness is judged
+     * from the Title call alone so an item that's merely between icon
+     * refreshes doesn't get dropped. Not attributing the signal to a
+     * specific item (its sender is a unique :1.N name we don't necessarily
+     * have on file) means one item's change causes all items to
+     * re-fetch -- fine since this only fires on genuine change bursts, not
+     * every tick. */
+    int refresh_icons_this_poll = g_saw_change_signal;
+    g_saw_change_signal = 0;
     int n_alive = 0;
     SniItem alive[SNI_MAX_ITEMS];
     for (int i = 0; i < g_n_items; i++) {
         SniItem *it = &g_items[i];
-        DBusMessage *reply =
-            sni_call1s(it->busname, it->path, "org.freedesktop.DBus.Properties", "GetAll", SNI_ITEM_IFACE);
-        if (!reply) {
+
+        DBusMessage *treply =
+            sni_call2s(it->busname, it->path, "org.freedesktop.DBus.Properties", "Get", SNI_ITEM_IFACE, "Title");
+        if (!treply) {
             if (it->icon) {
                 cairo_surface_destroy(it->icon);
             }
@@ -612,21 +628,35 @@ void sni_poll(uint64_t now)
         }
         char title[128];
         title[0] = 0;
-        extract_string_prop(reply, "Title", title, sizeof(title));
+        extract_get_string(treply, title, sizeof(title));
+        p_dbus_message_unref(treply);
         if (!title[0]) {
-            extract_string_prop(reply, "IconName", title, sizeof(title));
+            DBusMessage *nreply = sni_call2s(it->busname, it->path, "org.freedesktop.DBus.Properties", "Get",
+                                              SNI_ITEM_IFACE, "IconName");
+            if (nreply) {
+                extract_get_string(nreply, title, sizeof(title));
+                p_dbus_message_unref(nreply);
+            }
         }
-        cairo_surface_t *icon = extract_icon_pixmap(reply);
-        p_dbus_message_unref(reply);
 
         SniItem *dst = &alive[n_alive++];
         *dst = *it;
         snprintf(dst->title, sizeof(dst->title), "%s", title);
-        if (icon) {
-            if (dst->icon) {
-                cairo_surface_destroy(dst->icon);
+
+        if (refresh_icons_this_poll || now >= dst->next_icon_poll_ms) {
+            dst->next_icon_poll_ms = now + SNI_ICON_REFRESH_MS;
+            DBusMessage *ireply = sni_call2s(it->busname, it->path, "org.freedesktop.DBus.Properties", "Get",
+                                              SNI_ITEM_IFACE, "IconPixmap");
+            if (ireply) {
+                cairo_surface_t *icon = extract_get_icon_pixmap(ireply);
+                p_dbus_message_unref(ireply);
+                if (icon) {
+                    if (dst->icon) {
+                        cairo_surface_destroy(dst->icon);
+                    }
+                    dst->icon = icon;
+                }
             }
-            dst->icon = icon;
         }
     }
     memcpy(g_items, alive, sizeof(SniItem) * (size_t)n_alive);
