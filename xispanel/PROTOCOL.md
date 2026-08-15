@@ -53,8 +53,19 @@ configured by editing the config file directly and sending `RELOAD`.
 ## Config file
 
 `$XDG_CONFIG_HOME/xispanel.conf` (fallback `~/.config/xispanel.conf`),
-read at startup and on `RELOAD`. Not currently written by the daemon
-itself -- hand-edit it (or generate it from a future `xisconf` tab).
+read at startup and on `RELOAD`. Not otherwise written by the daemon
+itself -- hand-edit it (or generate it from a future `xisconf` tab) --
+except once, on first run: if the file doesn't exist yet at all, the
+daemon writes a minimal default (rather than silently starting with zero
+panels, which looks exactly like it isn't working) -- one panel at the
+bottom edge of the RandR primary output (or `*`, the whole virtual
+screen, if no primary is set -- equivalent on a single-monitor session
+anyway), with `launcher`+`tasklist` on the left and `tray`+`clock` pushed
+to the right by a `spacer` in between. Deliberately no `THEME` line and
+no font in that generated file: colors/font aren't copied in at
+generation time (which would just go stale the next time the system
+theme changes) -- see "Colors and font default to the live system theme"
+below.
 
 Three record types, one per line, fields separated by tabs. Blank lines
 and lines starting with `#` are ignored.
@@ -330,6 +341,27 @@ THEME	top	bg=#202020cc	fg=#eeeeee	spacing=6
   Ignored if `bg_image` isn't set or didn't load. Missing/unreadable just
   means every inset defaults to 0 (a plain full-image stretch), not an
   error.
+
+### Colors and font default to the live system theme
+
+A panel with no `THEME` line at all, or one that doesn't set `bg=`/`fg=`,
+doesn't fall straight to a hardcoded gray -- `alloc_panel()` first tries
+reading the *current* KDE/Plasma color scheme
+(`~/.config/kdeglobals`'s `[Colors:Window]` `BackgroundNormal=R,G,B` /
+`ForegroundNormal=R,G,B`, each channel 0-255) and only falls back to the
+hardcoded default for whichever of bg/fg it didn't find there. Font
+detection (`~/.config/kdeglobals`'s `[General]` `font=`, falling back to
+`~/.config/gtk-3.0/settings.ini`'s `gtk-font-name=`) already worked this
+way from an earlier session. Both are read fresh every time a panel's
+defaults are computed (config load or `RELOAD`), not cached/copied into
+`xispanel.conf` -- so a later system theme change just takes effect on
+the next `RELOAD` rather than requiring `xispanel.conf` to be
+regenerated or hand-edited to match. An explicit `bg=`/`fg=` in a
+`THEME` line always overrides this regardless of what the system theme
+says. GTK has no equivalent simple flat-file color key the way it does
+for fonts (GTK themes are CSS, not `key=value`), so this only actually
+finds anything on a KDE/Plasma-configured system today -- a known gap,
+not worth a CSS parser for.
 
 ## PNG bitmap themes
 

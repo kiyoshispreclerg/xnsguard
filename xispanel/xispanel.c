@@ -370,6 +370,76 @@ static void detect_system_font_family(char *out, size_t outsz)
     }
 }
 
+/* Reads a "R,G,B" (each 0-255) KDE color-scheme value into 0.0-1.0 doubles.
+ * Returns 0 (leaving *r/*g/*b untouched) if `val` isn't exactly that shape
+ * -- callers treat that as "key present but unparseable", same as "key
+ * absent" (fall through to the next source). */
+static int parse_kde_rgb(const char *val, double *r, double *g, double *b)
+{
+    int ri, gi, bi;
+    if (sscanf(val, "%d,%d,%d", &ri, &gi, &bi) != 3) {
+        return 0;
+    }
+    *r = ri / 255.0;
+    *g = gi / 255.0;
+    *b = bi / 255.0;
+    return 1;
+}
+
+/* Live counterpart to detect_system_font_family(): reads the desktop's
+ * *actual current* panel-background/foreground colors, for whenever a
+ * THEME line doesn't set bg=/fg= itself (explicit config always wins --
+ * see apply_theme_kv(), called after this). Deliberately not cached/copied
+ * into xispanel.conf at config-generation time (see
+ * write_default_config_if_missing()'s doc comment) -- reads the files
+ * fresh every time a panel's colors need a default, so a later system
+ * theme change or RELOAD picks it up automatically.
+ *
+ *   - KDE/Plasma: ~/.config/kdeglobals, [Colors:Window]
+ *                 BackgroundNormal=R,G,B / ForegroundNormal=R,G,B
+ *   - GTK3: no equivalent simple key -- GTK themes are CSS, not a flat
+ *     key=value color list, so there's no cheap file to read here the way
+ *     gtk-font-name works for fonts. Left as a known gap rather than
+ *     something worth a CSS parser for.
+ *
+ * Returns 1 if at least one of bg/fg was found and written, 0 if nothing
+ * was (caller keeps its own hardcoded default in that case). */
+static int detect_system_colors(double *bg_r, double *bg_g, double *bg_b, double *fg_r, double *fg_g, double *fg_b)
+{
+    const char *home = getenv("HOME");
+    if (!home) {
+        return 0;
+    }
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/.config/kdeglobals", home);
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        return 0;
+    }
+    int in_window = 0, found = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[--len] = 0;
+        }
+        if (line[0] == '[') {
+            in_window = (strcmp(line, "[Colors:Window]") == 0);
+            continue;
+        }
+        if (!in_window) {
+            continue;
+        }
+        if (!strncmp(line, "BackgroundNormal=", 17) && parse_kde_rgb(line + 17, bg_r, bg_g, bg_b)) {
+            found = 1;
+        } else if (!strncmp(line, "ForegroundNormal=", 17) && parse_kde_rgb(line + 17, fg_r, fg_g, fg_b)) {
+            found = 1;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
 static int init_font(const char *family_hint)
 {
     if (FT_Init_FreeType(&g_ft_lib) != 0) {
@@ -431,6 +501,73 @@ static int resolve_output_geometry(const char *name, int *ox, int *oy, int *ow, 
     }
     XRRFreeScreenResources(res);
     return found;
+}
+
+/* Name of the RandR-designated primary output (xrandr --output X --primary),
+ * or 0 if none is set/RandR is unavailable -- used only when writing a
+ * first-run default config (see write_default_config_if_missing()), so a
+ * multi-monitor session's default panel lands on the right screen instead
+ * of spanning every monitor combined ("*"). */
+static int get_primary_output_name(char *out, size_t outsz)
+{
+    RROutput primary = XRRGetOutputPrimary(g_dpy, g_root);
+    if (!primary) {
+        return 0;
+    }
+    XRRScreenResources *res = XRRGetScreenResourcesCurrent(g_dpy, g_root);
+    if (!res) {
+        return 0;
+    }
+    int found = 0;
+    XRROutputInfo *oi = XRRGetOutputInfo(g_dpy, res, primary);
+    if (oi && oi->connection == RR_Connected) {
+        snprintf(out, outsz, "%s", oi->name);
+        found = 1;
+    }
+    if (oi) {
+        XRRFreeOutputInfo(oi);
+    }
+    XRRFreeScreenResources(res);
+    return found;
+}
+
+/* First run (no $XDG_CONFIG_HOME/xispanel.conf yet): rather than the
+ * daemon silently running with zero panels -- which looks exactly like
+ * xispanel isn't working at all -- write a minimal but usable default:
+ * one panel at the bottom edge of the primary output (or "*", the whole
+ * virtual screen, if RandR has no primary set -- equivalent on a
+ * single-monitor session anyway), with launcher+tasklist on the left and
+ * tray+clock pushed to the right edge by a spacer in between.
+ * Deliberately no THEME line and no font here: colors/font are meant to
+ * be read live from the user's Qt/GTK config whenever they're *not*
+ * explicitly set in xispanel.conf (see detect_system_colors() and
+ * detect_system_font_family()) rather than baked into a copy at
+ * generation time, which would just go stale the next time the user
+ * changes their system theme. */
+static void write_default_config_if_missing(void)
+{
+    if (access(g_configpath, F_OK) == 0) {
+        return;
+    }
+    char output[64];
+    if (!get_primary_output_name(output, sizeof(output))) {
+        snprintf(output, sizeof(output), "*");
+    }
+    FILE *f = fopen(g_configpath, "w");
+    if (!f) {
+        fprintf(stderr, "xispanel: could not write default config to %s: %s\n", g_configpath, strerror(errno));
+        return;
+    }
+    fprintf(f,
+            "PANEL\tmain\t%s\tedge=bottom\tpct=100\tthickness=32\tmode=dock\n"
+            "WIDGET\tmain\t0\tlauncher\n"
+            "WIDGET\tmain\t1\ttasklist\tmode=wide\n"
+            "WIDGET\tmain\t2\tspacer\n"
+            "WIDGET\tmain\t3\ttray\n"
+            "WIDGET\tmain\t4\tclock\n",
+            output);
+    fclose(f);
+    fprintf(stderr, "xispanel: no config found, wrote a default panel to %s\n", g_configpath);
 }
 
 static void panel_resolve_geometry(Panel *p)
@@ -1238,6 +1375,12 @@ static Panel *alloc_panel(const char *name, const char *output)
             p->bg_a = 0.85;
             p->fg_r = p->fg_g = p->fg_b = 0.93;
             p->fg_a = 1.0;
+            /* Live system-theme colors, if any -- overwrites just the
+             * channels detect_system_colors() actually found (bg and/or
+             * fg independently), leaving the hardcoded fallback above for
+             * whichever it didn't. A THEME line's own bg=/fg= (applied
+             * later, from load_config()) always wins over either. */
+            detect_system_colors(&p->bg_r, &p->bg_g, &p->bg_b, &p->fg_r, &p->fg_g, &p->fg_b);
             p->spacing = 4;
             return p;
         }
@@ -1665,6 +1808,7 @@ static int run_as_daemon(const char *sockpath)
     fcntl(listenfd, F_SETFD, FD_CLOEXEC);
     fcntl(ConnectionNumber(g_dpy), F_SETFD, FD_CLOEXEC);
 
+    write_default_config_if_missing();
     reload_all_panels();
     XFlush(g_dpy);
 
