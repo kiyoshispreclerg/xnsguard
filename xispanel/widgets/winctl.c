@@ -14,6 +14,7 @@
 #include <X11/Xlib.h>
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define WINCTL_MAX_BUTTONS 3
@@ -25,9 +26,10 @@ typedef struct {
     int side_start;  /* 1 = buttons before the icon/title, 0 = after (default) */
     int same_desktop_only; /* 1 = only show controls while the active window is on this panel's desktop */
     int same_output_only;  /* 1 = only show controls while the active window is on this panel's output */
-    int fixed_width; /* 0 = auto (grows/shrinks with title length and button visibility, old behavior);
-                       * >0 = always exactly this wide -- title is ellipsized to fit instead, including
-                       * shrinking further when the buttons show/hide, so neighboring widgets never shift. */
+    int fixed_width;     /* width= in raw pixels; 0 if unset or width= was a percentage instead */
+    int fixed_width_pct; /* width= as "NN%"; 0 if unset or width= was raw pixels instead. Re-resolved
+                           * against the panel's current main-axis length on every measure() call (not
+                           * cached in pixels), so it tracks RandR/output geometry changes automatically. */
 
     Window active_win;
     int active_applies; /* active_win != None and passes same_desktop_only/same_output_only */
@@ -77,7 +79,18 @@ static int winctl_init(PanelWidget *w)
     wp->side_start = kv_get(w->config_kv, "side", buf, sizeof(buf)) && strcmp(buf, "start") == 0;
     wp->same_desktop_only = kv_get(w->config_kv, "same_desktop", buf, sizeof(buf)) && strcmp(buf, "yes") == 0;
     wp->same_output_only = kv_get(w->config_kv, "same_output", buf, sizeof(buf)) && strcmp(buf, "yes") == 0;
-    wp->fixed_width = kv_get_int(w->config_kv, "width", 0);
+
+    char width_buf[16];
+    if (kv_get(w->config_kv, "width", width_buf, sizeof(width_buf)) && width_buf[0]) {
+        size_t wlen = strlen(width_buf);
+        if (width_buf[wlen - 1] == '%') {
+            width_buf[wlen - 1] = 0;
+            int pct = atoi(width_buf);
+            wp->fixed_width_pct = pct < 1 ? 1 : (pct > 100 ? 100 : pct);
+        } else {
+            wp->fixed_width = atoi(width_buf);
+        }
+    }
 
     wp->active_win = None;
     w->next_tick_ms = now_ms();
@@ -145,12 +158,21 @@ static void winctl_measure(PanelWidget *w, int cross_axis, int *out_len, int *ou
         return;
     }
 
-    if (wp->fixed_width > 0) {
+    int fixed = wp->fixed_width;
+    if (wp->fixed_width_pct > 0) {
+        /* Resolved fresh every measure() (not cached) against the panel's
+         * current main-axis length, so a RandR/output geometry change
+         * that resizes the panel keeps the percentage accurate instead of
+         * freezing it at whatever it resolved to at startup. */
+        int main_axis_len = (p->edge == EDGE_TOP || p->edge == EDGE_BOTTOM) ? p->w : p->h;
+        fixed = (main_axis_len * wp->fixed_width_pct) / 100;
+    }
+    if (fixed > 0) {
         /* Always exactly this wide regardless of title length or
          * whether the buttons are currently shown -- winctl_paint()
          * ellipsizes the title into whatever room that leaves instead. */
-        *out_len = wp->fixed_width;
-        *out_min_len = wp->fixed_width;
+        *out_len = fixed;
+        *out_min_len = fixed;
         return;
     }
 
