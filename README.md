@@ -13,3 +13,7 @@ A lightweight wallpaper tool for X11 servers.
 ### XisConf
 
 A Python tool for configuring various XiS and other X11 servers' settings.
+
+### XisPanel
+
+A lightweight desktop panel/taskbar for X11 servers.
