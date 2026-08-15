@@ -192,24 +192,46 @@ widget (or one of its sub-items, e.g. one `tasklist` button) for ~500ms, a
 small popup appears with whatever text the widget reports -- glued to the
 panel's outer edge and aligned with that specific item, the same
 plasmashell-style positioning context menus use, so it never overlaps the
-panel itself. Unlike the context menu, it takes no pointer/keyboard grab
-and never handles clicks -- the pointer leaving the panel window is
-enough to hide it. Content refreshes about once a second while shown, so
-e.g. `clock`'s tooltip keeps ticking even if the pointer doesn't move.
+panel itself. Content refreshes about once a second while shown, so e.g.
+`clock`'s tooltip keeps ticking even if the pointer doesn't move.
+
+Unlike the context menu, the tooltip takes no pointer/keyboard grab --
+it's meant to coexist with normal desktop interaction, not take it over.
+Every tooltip (whether interactive or not) shares one hover-intent
+dismissal rule: leaving the source widget starts a ~200ms grace period
+before it actually closes, cancelled if the pointer enters the popup
+itself (there's no gap between panel and popup, so that's one continuous
+motion) -- this lets an interactive tooltip's contents actually be
+reachable with the mouse instead of vanishing the instant the pointer
+leaves the panel.
+
+A widget can additionally make its tooltip clickable by reporting
+`*out_closable = 1` (+ an opaque `*out_ctx`) from `get_tooltip()` and
+implementing `tooltip_activate()`/`tooltip_close_item()`: clicking the
+popup's body then calls `tooltip_activate()` (e.g. focus the window it
+describes), and a small close icon drawn in its corner calls
+`tooltip_close_item()` (e.g. close that window) -- both close the popup
+right after, mirroring `menu.c`'s select-and-close pattern. Widgets that
+never touch `*out_closable` just get a plain read-only tooltip with no
+close icon.
 
 Currently implemented:
 
 - `clock`: full weekday + date + seconds (`strftime("%A, %d de %B de
   %Y")` + `"%H:%M:%S"`), locale-aware (`setlocale(LC_TIME, "")` at
-  startup) -- unlike the panel's short, locale-independent `format=`.
-- `winctl`: the active window's full, untruncated title.
+  startup) -- unlike the panel's short, locale-independent `format=`. Not
+  clickable.
+- `winctl`: the active window's full, untruncated title. Not clickable
+  (the panel itself already has minimize/maximize/close buttons).
 - `tasklist`: the hovered task's full, untruncated title, anchored to
-  that specific button (not the whole widget). No tooltip over the
-  scroll-arrow pair.
+  that specific button (not the whole widget, and never over the
+  scroll-arrow pair). Clickable: clicking the tooltip body activates that
+  window (`ewmh_activate`), the close icon closes it (`ewmh_close`) --
+  same actions the button's own click/context-menu already expose, just
+  reachable from the tooltip too, like plasmashell's taskbar tooltips.
 
-Window thumbnails (and a small close button in `tasklist`'s tooltip) are
-a planned follow-up, gated on an active compositor -- not implemented
-yet.
+Window thumbnails are a planned follow-up, gated on an active compositor
+-- not implemented yet.
 
 ## Source layout
 

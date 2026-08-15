@@ -36,7 +36,9 @@ Imlib2 for image decoding -- the same dependency spirit as
   aligned to the triggering item, plasmashell-style.
 - A generic hover-tooltip popup, same positioning convention, opt-in per
   widget (`clock`: full date/weekday; `winctl`/`tasklist`: full window
-  title). Window thumbnails are a planned follow-up.
+  title). `tasklist`'s is also clickable: click it to activate the
+  window, or its corner close icon to close it. Window thumbnails are a
+  planned follow-up.
 - Basic theming: background/foreground color with alpha (real per-pixel
   transparency when a compositor provides an ARGB visual), spacing.
 - A control socket (see [PROTOCOL.md](PROTOCOL.md)) for `PING`,

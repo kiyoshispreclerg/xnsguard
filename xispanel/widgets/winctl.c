@@ -235,9 +235,12 @@ static void winctl_paint(PanelWidget *w, cairo_t *cr)
     }
 }
 
-static int winctl_get_tooltip(PanelWidget *w, int local_x, char *buf, size_t bufsz, int *anchor_x, int *anchor_w)
+static int winctl_get_tooltip(PanelWidget *w, int local_x, char *buf, size_t bufsz, int *anchor_x, int *anchor_w,
+                               int *out_closable, void **out_ctx)
 {
     (void)local_x;
+    (void)out_closable;
+    (void)out_ctx;
     WinctlPriv *wp = w->priv;
     if (wp->active_win == None || !wp->title[0]) {
         return 0;

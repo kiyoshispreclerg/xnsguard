@@ -46,9 +46,12 @@ static void clock_measure(PanelWidget *w, int cross_axis, int *out_len, int *out
     *out_min_len = *out_len; /* a clipped clock is worse than useless -- don't shrink it */
 }
 
-static int clock_get_tooltip(PanelWidget *w, int local_x, char *buf, size_t bufsz, int *anchor_x, int *anchor_w)
+static int clock_get_tooltip(PanelWidget *w, int local_x, char *buf, size_t bufsz, int *anchor_x, int *anchor_w,
+                              int *out_closable, void **out_ctx)
 {
     (void)local_x;
+    (void)out_closable;
+    (void)out_ctx;
     time_t t = time(NULL);
     struct tm tmv;
     localtime_r(&t, &tmv);

@@ -53,8 +53,25 @@ typedef struct {
      * with that item rather than the whole widget -- widgets without
      * sub-items just report their own full [0, w->len) span. Called
      * repeatedly (on every pointer motion, and periodically while shown,
-     * so content like a ticking clock stays current) -- keep it cheap. */
-    int (*get_tooltip)(PanelWidget *w, int local_x, char *buf, size_t bufsz, int *anchor_x, int *anchor_w);
+     * so content like a ticking clock stays current) -- keep it cheap.
+     *
+     * If the tooltip should also be clickable (e.g. click it to activate
+     * the task it describes, like plasmashell's taskbar tooltips), also
+     * set *out_closable = 1 and *out_ctx to whatever tooltip_activate()/
+     * tooltip_close_item() below need -- both start out 0/NULL, so a
+     * widget that doesn't care just never touches them and gets a
+     * read-only tooltip with no close icon. Every tooltip (closable or
+     * not) uses the same hover-intent popup behavior -- see tooltip.c. */
+    int (*get_tooltip)(PanelWidget *w, int local_x, char *buf, size_t bufsz, int *anchor_x, int *anchor_w,
+                        int *out_closable, void **out_ctx);
+    /* Only called for a tooltip that reported *out_closable = 1: click on
+     * the tooltip's body (not its close icon) -- e.g. activate the window
+     * it describes. The tooltip closes right after. */
+    void (*tooltip_activate)(PanelWidget *w, void *ctx);
+    /* Click on the tooltip's small close icon (only drawn when
+     * *out_closable = 1) -- e.g. close the window it describes. The
+     * tooltip closes right after. */
+    void (*tooltip_close_item)(PanelWidget *w, void *ctx);
 } PanelWidgetOps;
 
 struct PanelWidget {

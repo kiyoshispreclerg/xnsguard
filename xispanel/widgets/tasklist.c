@@ -228,8 +228,11 @@ static void tasklist_layout_visible(PanelWidget *w)
 /* Full (untruncated) title of whatever task button is under local_x, with
  * the anchor set to that specific button's span -- not the whole widget --
  * so the tooltip lines up with the actual task, same as on_button()'s
- * hit-testing. No tooltip over the scroll arrows. */
-static int tasklist_get_tooltip(PanelWidget *w, int local_x, char *buf, size_t bufsz, int *anchor_x, int *anchor_w)
+ * hit-testing. No tooltip over the scroll arrows. Clickable: the window's
+ * XID is packed into *out_ctx the same way tasklist_on_button()'s context
+ * menu already does, for tooltip_activate()/tooltip_close_item() below. */
+static int tasklist_get_tooltip(PanelWidget *w, int local_x, char *buf, size_t bufsz, int *anchor_x, int *anchor_w,
+                                 int *out_closable, void **out_ctx)
 {
     TasklistPriv *tp = w->priv;
     tasklist_layout_visible(w);
@@ -243,10 +246,28 @@ static int tasklist_get_tooltip(PanelWidget *w, int local_x, char *buf, size_t b
             snprintf(buf, bufsz, "%s", e->title);
             *anchor_x = tp->vis_x[vi];
             *anchor_w = tp->vis_w[vi];
+            *out_closable = 1;
+            *out_ctx = (void *)(uintptr_t)e->win;
             return 1;
         }
     }
     return 0;
+}
+
+static void tasklist_tooltip_activate(PanelWidget *w, void *ctx)
+{
+    (void)w;
+    Window win = (Window)(uintptr_t)ctx;
+    ewmh_activate(win);
+    XFlush(g_dpy);
+}
+
+static void tasklist_tooltip_close_item(PanelWidget *w, void *ctx)
+{
+    (void)w;
+    Window win = (Window)(uintptr_t)ctx;
+    ewmh_close(win);
+    XFlush(g_dpy);
 }
 
 static void tasklist_paint(PanelWidget *w, cairo_t *cr)
@@ -482,4 +503,6 @@ const PanelWidgetOps tasklist_ops = {
     .on_button = tasklist_on_button,
     .on_tick = tasklist_on_tick,
     .get_tooltip = tasklist_get_tooltip,
+    .tooltip_activate = tasklist_tooltip_activate,
+    .tooltip_close_item = tasklist_tooltip_close_item,
 };
