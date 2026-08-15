@@ -28,9 +28,11 @@ Imlib2 for image decoding -- the same dependency spirit as
   greedy/fill), `clock`, `tasklist` (EWMH-based, wide/compact modes,
   per-window context menu with minimize/maximize/move/close/pin, shrinks
   to a scrollable strip with an up/down arrow pair when it doesn't fit),
-  and `winctl` (active window's icon/title + configurable
+  `winctl` (active window's icon/title + configurable
   minimize/maximize/close buttons, similar to KDE's Active Window Control
-  -- see [PROTOCOL.md](PROTOCOL.md)).
+  -- see [PROTOCOL.md](PROTOCOL.md)), and `tray` (StatusNotifierItem
+  system tray -- xispanel becomes the `StatusNotifierWatcher` if none
+  exists yet, or coexists as a second host if one already does).
 - Widgets that don't fit the panel's available space shrink toward a
   per-type minimum instead of overflowing it (see PROTOCOL.md's "Widget
   sizing").
@@ -52,11 +54,11 @@ Imlib2 for image decoding -- the same dependency spirit as
 - A control socket (see [PROTOCOL.md](PROTOCOL.md)) for `PING`,
   `GET_STATUS`, `RELOAD`, `QUIT`.
 
-Everything else this tool is meant to eventually do -- system tray,
-global menu, window thumbnails, media controls, application launcher,
-system monitor -- is **not implemented yet**. See the phased plan this
-was built from, and [PROTOCOL.md](PROTOCOL.md)'s "Source layout" section
-for how a new widget type gets added.
+Everything else this tool is meant to eventually do -- global menu,
+window thumbnails, application launcher, system monitor -- is **not
+implemented yet**. See the phased plan this was built from, and
+[PROTOCOL.md](PROTOCOL.md)'s "Source layout" section for how a new widget
+type gets added.
 
 ### Dependencies
 
@@ -70,12 +72,14 @@ On Debian/Ubuntu: `libx11-dev libxrandr-dev libcairo2-dev libimlib2-dev
 libfreetype6-dev libfontconfig1-dev libdbus-1-dev`.
 
 MPRIS media controls (previous/play-pause/next buttons in `tasklist`'s
-tooltip for whatever window owns an active media player) are the one
-optional *runtime* dependency: `libdbus-1-dev` is needed to **build**
-xispanel (for `<dbus/dbus.h>`'s types), but `libdbus-1.so.3` is never
-linked -- it's `dlopen()`'d at runtime, so a system without it installed
-still runs xispanel fine, just without those buttons. See
-[PROTOCOL.md](PROTOCOL.md)'s "MPRIS media controls" section.
+tooltip for whatever window owns an active media player) and the `tray`
+widget (StatusNotifierItem system tray) are the two optional *runtime*
+dependencies: `libdbus-1-dev` is needed to **build** xispanel (for
+`<dbus/dbus.h>`'s types), but `libdbus-1.so.3` is never linked -- it's
+`dlopen()`'d at runtime, so a system without it installed still runs
+xispanel fine, just without those buttons/the tray. See
+[PROTOCOL.md](PROTOCOL.md)'s "MPRIS media controls" and "System tray
+(StatusNotifierItem)" sections.
 
 ### How to Compile and Install
 

@@ -282,10 +282,28 @@ void mpris_play_pause(const char *busname);
 void mpris_next(const char *busname);
 void mpris_previous(const char *busname);
 
+/* ---- system tray: StatusNotifierItem/Watcher client+host (sni.c) ----
+ *
+ * Same optional-dlopen'd-libdbus-1 philosophy as mpris.c above -- every
+ * function here is always safe to call and just reports zero items if
+ * libdbus-1 (or a session bus) isn't available. Unlike mpris.c, xispanel
+ * also acts as the StatusNotifierWatcher/Host service other processes'
+ * tray icons register with (falling back to just reading another
+ * process's watcher if one already exists) -- see sni.c for how that's
+ * done without pulling DBus watch/timeout objects into the select() loop. */
+void sni_poll(uint64_t now); /* call periodically from the main loop */
+int sni_count(void);
+const char *sni_title(int idx); /* "" if idx out of range */
+cairo_surface_t *sni_icon(int idx); /* NULL if unknown/idx out of range */
+void sni_activate(int idx, int x, int y); /* left click */
+void sni_secondary_activate(int idx, int x, int y); /* middle click */
+void sni_context_menu(int idx, int x, int y); /* right click */
+
 /* ---- widget registry: each file under widgets/ defines one of these --- */
 extern const PanelWidgetOps spacer_ops;
 extern const PanelWidgetOps clock_ops;
 extern const PanelWidgetOps tasklist_ops;
 extern const PanelWidgetOps winctl_ops;
+extern const PanelWidgetOps tray_ops;
 
 #endif

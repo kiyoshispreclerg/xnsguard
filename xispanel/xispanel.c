@@ -250,6 +250,7 @@ static const PanelWidgetOps *g_widget_registry[] = {
     &clock_ops,
     &tasklist_ops,
     &winctl_ops,
+    &tray_ops,
     NULL,
 };
 
@@ -1652,6 +1653,7 @@ static int run_as_daemon(const char *sockpath)
         now = now_ms();
         tooltip_tick(now);
         mpris_poll(now);
+        sni_poll(now);
         for (int i = 0; i < MAX_PANELS; i++) {
             Panel *p = &g_panels[i];
             if (!p->in_use) {

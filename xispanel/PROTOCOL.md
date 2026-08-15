@@ -170,8 +170,19 @@ Widget types implemented so far:
   instead of showing controls for a window this panel doesn't "own".
   Polls `_NET_ACTIVE_WINDOW` every ~300ms, same tradeoff as `tasklist`'s
   polling.
+- `tray`: one square icon button per active StatusNotifierItem (the
+  `org.kde.StatusNotifierItem`/`org.freedesktop.StatusNotifierItem`
+  DBus protocol used by every modern tray -- KDE, GNOME's legacy
+  extension, XFCE, etc.). No config keys yet. Left-click sends
+  `Activate(x,y)`, middle-click `SecondaryActivate(x,y)`, right-click
+  `ContextMenu(x,y)` (the item's own process pops up its own menu near
+  that point -- xispanel doesn't render it). Hovering shows the item's
+  `Title` (or `IconName` if `Title` is empty) as a plain tooltip. See
+  "System tray (StatusNotifierItem)" below for how registration/hosting
+  works. No dependency on `libdbus-1` at build *link* time -- see MPRIS's
+  note on optional runtime deps, same mechanism (`sni.c`).
 
-More widget types (tray, global menu, launcher, system monitor) are later
+More widget types (global menu, launcher, system monitor) are later
 phases -- see the plan this tool was built from; they are not implemented
 yet.
 
@@ -354,6 +365,66 @@ async DBus main-loop integration for a best-effort feature.
 Window thumbnails are a planned follow-up, gated on an active compositor
 -- not implemented yet.
 
+### System tray (StatusNotifierItem)
+
+The `tray` widget implements the `org.freedesktop.StatusNotifierItem`
+protocol (aka "SNI", aka KDE's tray spec -- what every modern tray icon
+speaks today, including apps that only know the older `org.kde.*` names,
+which are interface-compatible aliases of the same protocol). Same
+optional-runtime-dependency mechanism as MPRIS above: `sni.c` `dlopen()`s
+`libdbus-1.so.3` and never links it (`ldd xispanel` shows no `libdbus`
+there either) -- no libdbus-1 at runtime just means an empty tray, not a
+crash or startup failure.
+
+Unlike MPRIS (a pure DBus *client*), a tray also has to act as a DBus
+*service*: other processes' tray icons call `RegisterStatusNotifierItem`
+on whichever process owns the well-known name
+`org.freedesktop.StatusNotifierWatcher`. On startup xispanel tries to
+claim that name (`DBUS_NAME_FLAG_DO_NOT_QUEUE` -- fail immediately rather
+than silently becoming a backup owner) and logs which role it ended up
+in:
+
+- **No other watcher running** (the common case, e.g. replacing
+  plasmashell/liquidshell entirely): xispanel becomes the watcher itself.
+  It then has to *receive* `RegisterStatusNotifierItem` calls from other
+  processes, which -- rather than pulling `libdbus-1`'s watch/timeout
+  objects into xispanel's `select()` loop (flagged as the fiddliest part
+  of DBus integration in the original phased plan) -- is handled by
+  polling too: every `sni_poll()` tick (~1.5s, same cadence as MPRIS)
+  drains any pending incoming messages with a zero-timeout
+  `dbus_connection_read_write()` + `dbus_connection_pop_message()` loop
+  and answers whatever's there by hand (no
+  `dbus_connection_register_object_path()`/vtable machinery needed for
+  the handful of methods anything actually calls on us: mainly
+  `RegisterStatusNotifierItem`, plus best-effort stubs for
+  `Properties.Get(All)`/`Introspect` so a strict client doesn't hang
+  waiting on a reply that never comes).
+- **Another watcher already running** (some other tray host coexisting):
+  xispanel doesn't fight over the name -- it just becomes a second host,
+  polling *that* watcher's `RegisteredStatusNotifierItems` property
+  instead of tracking registrations itself.
+
+Either way, once an item is known, xispanel polls its
+`org.freedesktop.DBus.Properties.GetAll("org.kde.StatusNotifierItem")`
+for `Title`/`IconPixmap` every ~1.5s (vs. subscribing to `NewIcon`/
+`NewStatus` signals -- acceptable staleness for a tray icon, the same
+polling-over-signals tradeoff MPRIS makes). `IconPixmap` is an
+`a(iiay)` array of `(width, height, ARGB32-network-byte-order bytes)`
+structs; the largest available is picked and converted to a premultiplied
+Cairo surface the same way `_NET_WM_ICON` already is in `ewmh.c`. Items
+that never set `IconPixmap` fall back to the same single-letter
+placeholder tasklist/winctl use, keyed off `Title`/`IconName`.
+
+Left-click sends `Activate(root_x, root_y)`, middle-click
+`SecondaryActivate(root_x, root_y)`, right-click `ContextMenu(root_x,
+root_y)` -- all fire-and-forget, per spec. xispanel never renders the
+item's context menu itself; that's the item's own process's job (it's
+usually backed by DBusMenu, a later/separate phase from the plan). Tested
+end-to-end against a throwaway Python (`dbus-python`) fake tray item:
+registration, icon fetch, left/middle/right click dispatch, and tooltip
+all confirmed working, and `ldd`/`strings` confirm no build-time link to
+`libdbus`.
+
 ## Source layout
 
 Following the plan's "widgets can be added/removed/reordered, each is its
@@ -373,10 +444,12 @@ own file" structure:
 - `tooltip.c`: the generic hover-tooltip popup described above.
 - `mpris.c`: the optional (dlopen'd libdbus-1) MPRIS2 client described
   above.
+- `sni.c`: the optional (dlopen'd libdbus-1) StatusNotifierItem tray
+  client+host described above.
 - `widgets/spacer.c`, `widgets/clock.c`, `widgets/tasklist.c`,
-  `widgets/winctl.c`: one file per widget type. Adding a new type is
-  "write `widgets/foo.c` defining a `PanelWidgetOps foo_ops`, declare it
-  `extern` in `xispanel.h`, add it to
+  `widgets/winctl.c`, `widgets/tray.c`: one file per widget type. Adding a
+  new type is "write `widgets/foo.c` defining a `PanelWidgetOps foo_ops`,
+  declare it `extern` in `xispanel.h`, add it to
   the registry array in `xispanel.c`" -- no other file needs to change.
 
 ## Design notes
