@@ -75,18 +75,28 @@ type gets added.
 - Cairo with the `cairo-xlib` backend
 - Imlib2
 - FreeType2, Fontconfig
-- dbus-1 (build-time headers only -- see below)
+- dbus-1 (optional, build-time headers only -- see below)
 
 On Debian/Ubuntu: `libx11-dev libxrandr-dev libcairo2-dev libimlib2-dev
-libfreetype6-dev libfontconfig1-dev libdbus-1-dev`.
+libfreetype6-dev libfontconfig1-dev`, plus `libdbus-1-dev` if you want
+MPRIS/tray support.
 
 MPRIS media controls (previous/play-pause/next buttons in `tasklist`'s
 tooltip for whatever window owns an active media player) and the `tray`
-widget (StatusNotifierItem system tray) are the two optional *runtime*
-dependencies: `libdbus-1-dev` is needed to **build** xispanel (for
-`<dbus/dbus.h>`'s types), but `libdbus-1.so.3` is never linked -- it's
-`dlopen()`'d at runtime, so a system without it installed still runs
-xispanel fine, just without those buttons/the tray. See
+widget (StatusNotifierItem system tray) are both **fully optional**, at
+both build time and runtime -- `xispanel` compiles and runs fine on a
+system with none of `libdbus-1-dev`/`libdbus-1.so.3` installed at all,
+it just silently doesn't offer those two features:
+
+- **Build time**: the Makefile checks `pkg-config --exists dbus-1` and,
+  if it's missing, links `mpris_stub.c`/`sni_stub.c` (harmless no-ops
+  with identical signatures) instead of `mpris.c`/`sni.c` -- no
+  `<dbus/dbus.h>` ever gets `#include`'d, so `libdbus-1-dev` isn't
+  needed to build at all in that case.
+- **Runtime**: even when `mpris.c`/`sni.c` *are* built (dbus-1-dev was
+  present), neither links `libdbus-1.so.3` directly -- both `dlopen()`
+  it, so a system with the dev headers at build time but no
+  `libdbus-1.so.3` installed at runtime still runs fine too. See
 [PROTOCOL.md](PROTOCOL.md)'s "MPRIS media controls" and "System tray
 (StatusNotifierItem)" sections.
 

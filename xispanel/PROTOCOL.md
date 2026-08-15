@@ -353,17 +353,21 @@ hovered window's PID (`_NET_WM_PID`) matches an active
 plasmashell's taskbar tooltips showing media controls for whichever app
 happens to be playing something.
 
-This is the one place in xispanel that talks to DBus, and it's an
-**optional runtime dependency**: `mpris.c` `dlopen()`s `libdbus-1.so.3`
-and resolves every symbol it needs via `dlsym()` -- it is never linked at
-build time (`ldd xispanel` shows no `libdbus`). A system with the
-`dbus-1` dev headers available at build time (needed for `mpris.c` to
-compile against `<dbus/dbus.h>`'s types) but no `libdbus-1.so.3`
-installed at runtime just runs fine with MPRIS support silently
-unavailable -- no crash, no startup failure, `tasklist`'s tooltip simply
-never shows the extra buttons. Volume/mute control (PulseAudio/PipeWire)
-is a separate, heavier dependency decision, deliberately not part of
-this -- see the project notes.
+This is fully **optional at both build time and runtime**. At build
+time, the Makefile checks `pkg-config --exists dbus-1`; if it's missing,
+`mpris_stub.c` (identical function signatures, every one a no-op) is
+compiled and linked instead of `mpris.c`, so `libdbus-1-dev` isn't even
+needed to build xispanel in that case -- `<dbus/dbus.h>` is never
+`#include`'d. When `mpris.c` *is* built (dbus-1-dev was present), it's
+still an optional *runtime* dependency: it `dlopen()`s `libdbus-1.so.3`
+and resolves every symbol it needs via `dlsym()`, never linked at build
+time (`ldd xispanel` shows no `libdbus` either way). A system with the
+dev headers at build time but no `libdbus-1.so.3` installed at runtime
+just runs fine with MPRIS support silently unavailable -- no crash, no
+startup failure, `tasklist`'s tooltip simply never shows the extra
+buttons. Volume/mute control (PulseAudio/PipeWire) is a separate,
+heavier dependency decision, deliberately not part of this -- see the
+project notes.
 
 Player discovery polls the bus every ~1.5s (`mpris_poll()`, called from
 the main loop) rather than subscribing to DBus signals or folding
@@ -382,10 +386,12 @@ The `tray` widget implements the `org.freedesktop.StatusNotifierItem`
 protocol (aka "SNI", aka KDE's tray spec -- what every modern tray icon
 speaks today, including apps that only know the older `org.kde.*` names,
 which are interface-compatible aliases of the same protocol). Same
-optional-runtime-dependency mechanism as MPRIS above: `sni.c` `dlopen()`s
-`libdbus-1.so.3` and never links it (`ldd xispanel` shows no `libdbus`
-there either) -- no libdbus-1 at runtime just means an empty tray, not a
-crash or startup failure.
+optional-at-build-and-runtime mechanism as MPRIS above: no `dbus-1`
+pkg-config at build time links `sni_stub.c` instead of `sni.c` (no tray
+items, ever, but the widget still builds/registers normally); when
+`sni.c` is built, it `dlopen()`s `libdbus-1.so.3` and never links it
+(`ldd xispanel` shows no `libdbus` either way) -- no libdbus-1 at runtime
+just means an empty tray, not a crash or startup failure.
 
 Unlike MPRIS (a pure DBus *client*), a tray also has to act as a DBus
 *service*: other processes' tray icons call `RegisterStatusNotifierItem`
@@ -463,9 +469,12 @@ own file" structure:
 - `menu.c`: the generic context-menu popup described above.
 - `tooltip.c`: the generic hover-tooltip popup described above.
 - `mpris.c`: the optional (dlopen'd libdbus-1) MPRIS2 client described
-  above.
+  above; `mpris_stub.c` is its build-time fallback (identical API,
+  every function a no-op) when `dbus-1` isn't found via pkg-config --
+  the Makefile links exactly one of the two.
 - `sni.c`: the optional (dlopen'd libdbus-1) StatusNotifierItem tray
-  client+host described above.
+  client+host described above; `sni_stub.c` is its equivalent build-time
+  fallback.
 - `widgets/spacer.c`, `widgets/clock.c`, `widgets/tasklist.c`,
   `widgets/winctl.c`, `widgets/tray.c`, `widgets/launcher.c`: one file per
   widget type. Adding a new type is "write `widgets/foo.c` defining a
