@@ -179,7 +179,34 @@ Widget types implemented so far:
   button height. `show_thumbs=yes|no` (default `no`) adds a live
   thumbnail of the hovered task's window to its tooltip (see "Window
   thumbnails" below); clicking the thumbnail activates the window, same
-  as clicking anywhere else in a closable tooltip.
+  as clicking anywhere else in a closable tooltip. `group=yes|no` (default
+  `no`) collapses windows sharing the same `WM_CLASS` (the general
+  "which application" half of it, `res_class` -- not the per-instance
+  name) into a single button, with a small count badge (bottom-left of
+  the icon, the one corner the pin dot and desktop badge never use).
+  Grouping is applied *after* `same_desktop`/`same_output`/
+  `minimized_only` already narrowed the list down, so it only ever
+  collapses buttons that would otherwise already sit side by side on this
+  panel -- never reaches across a filter to pull in a window this panel
+  wouldn't otherwise show. This is the same signal simple non-Plasma
+  taskbars (xfce4-panel, tint2) group by; KWin itself doesn't group
+  windows -- that's Plasma's Task Manager applet, which prefers a
+  window's `.desktop`-file match (`StartupWMClass`) over raw `WM_CLASS`
+  when one's known. xispanel has no `.desktop`-matching yet (launcher-
+  phase territory), so `WM_CLASS` is the whole story for now. The button
+  shown for a group displays whichever member is currently active (or the
+  first member found, if none is); left/right-click always act on that
+  representative window, same as an ungrouped button -- picking a
+  *different* member is done via the tooltip (see below), not a separate
+  click target. Hovering a grouped button shows every member: a row of
+  live thumbnails with title + close icon under each if a compositor is
+  running, or a stacked list of title + close icon per row otherwise
+  (wraps into more columns rather than growing past the output's height);
+  either way every entry activates its window on click and closes it via
+  its own close icon, independent of the others. If there isn't room for
+  every member even after wrapping, the grid caps out with a trailing
+  "+N mais" cell rather than silently dropping members with no
+  indication more exist.
 - `winctl`: active-window icon + title, plus configurable window-control
   buttons -- similar to KDE's "Active Window Control" plasmoid. Options:
   `buttons=<comma-list>` (any of `min`, `max`, `close`, in the order given

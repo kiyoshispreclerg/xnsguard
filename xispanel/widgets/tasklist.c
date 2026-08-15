@@ -53,10 +53,22 @@ typedef struct {
     int show_thumbs; /* 1 = tooltip includes a live thumbnail of the hovered task's window (see thumb.c);
                        * no-op if xispanel was built without libXcomposite or no compositor is running. */
     int show_desktop_badge; /* 1 = draw the task's virtual-desktop number on its icon; 0 (default) = don't. */
+    int group_apps; /* 1 = collapse same-app windows (matched by WM_CLASS) into one button; 0 (default) = don't. */
     TaskEntry tasks[MAX_TASKS];
     int n_tasks;
     int n_desktops;
-    int btn_w[MAX_TASKS]; /* natural (unclipped) width of each task's button */
+    int btn_w[MAX_TASKS]; /* natural (unclipped) width of each *display slot*'s button -- see display_repr[] */
+
+    /* One display slot per taskbar button actually drawn: with group_apps
+     * off, this is a 1:1 mirror of tasks[] (n_display == n_tasks,
+     * display_repr[d] == d); with it on, tasks[] sharing a WM_CLASS
+     * collapse into a single slot. Built fresh by tasklist_build_display()
+     * every tasklist_measure() call (tasks[] itself only actually changes
+     * once per ~800ms tick, same staleness tradeoff btn_w[] already makes
+     * between ticks). */
+    int display_repr[MAX_TASKS]; /* tasks[] index of the slot's representative window */
+    int display_count[MAX_TASKS]; /* how many tasks[] windows this slot represents (>=1) */
+    int n_display;
 
     /* Visible window into `tasks`, recomputed by tasklist_layout_visible()
      * from the widget's *actual* allotted w->len (which panel_layout() may
@@ -97,6 +109,7 @@ static int tasklist_init(PanelWidget *w)
     }
     tp->show_thumbs = kv_get(w->config_kv, "show_thumbs", buf, sizeof(buf)) && strcmp(buf, "yes") == 0;
     tp->show_desktop_badge = kv_get(w->config_kv, "show_desktop_badge", buf, sizeof(buf)) && strcmp(buf, "yes") == 0;
+    tp->group_apps = kv_get(w->config_kv, "group", buf, sizeof(buf)) && strcmp(buf, "yes") == 0;
     tp->n_desktops = 1;
     w->next_tick_ms = now_ms();
     return 0;
@@ -182,33 +195,103 @@ static void tasklist_on_tick(PanelWidget *w, uint64_t now)
     tp->n_desktops = ewmh_get_number_of_desktops();
 }
 
+/* Groups tasks[] entries sharing the same WM_CLASS (res_class -- the
+ * general "which application" half of WM_CLASS, not the per-instance
+ * name) into display slots, applied *after* same_desktop/same_output/
+ * minimized_only already narrowed tasks[] down to what this panel would
+ * show ungrouped -- grouping only ever collapses buttons that would
+ * otherwise already be visible side by side here, never reaches across
+ * that filtering. A window with no WM_CLASS at all (rare, but not
+ * unheard of) never groups with anything, including other classless
+ * windows, since there's no shared identity to group by. This is the
+ * same signal simple non-Plasma taskbars (xfce4-panel, tint2) group by;
+ * KWin itself doesn't group windows at all -- that's Plasma's Task
+ * Manager applet layered on top, and it prefers a window's .desktop-file
+ * match (StartupWMClass) over raw WM_CLASS when one's known, falling
+ * back to WM_CLASS otherwise. xispanel has no .desktop-matching yet (that's
+ * launcher-phase territory), so WM_CLASS is both the fallback and, for
+ * now, the whole story.
+ *
+ * The group's representative (whose icon/title the collapsed button
+ * shows) is the group's currently-active window if it has one, else
+ * simply the first member found -- so focusing a different window of an
+ * already-grouped app updates what the button displays. */
+static void tasklist_build_display(TasklistPriv *tp)
+{
+    Window active = tp->group_apps ? ewmh_get_active_window() : None;
+    int assigned[MAX_TASKS] = {0};
+    tp->n_display = 0;
+
+    for (int i = 0; i < tp->n_tasks && tp->n_display < MAX_TASKS; i++) {
+        if (assigned[i]) {
+            continue;
+        }
+        assigned[i] = 1;
+        int repr = i;
+        int count = 1;
+        if (tp->group_apps && tp->tasks[i].wm_class[0]) {
+            for (int j = i + 1; j < tp->n_tasks; j++) {
+                if (!assigned[j] && strcmp(tp->tasks[i].wm_class, tp->tasks[j].wm_class) == 0) {
+                    assigned[j] = 1;
+                    count++;
+                    if (tp->tasks[j].win == active) {
+                        repr = j;
+                    }
+                }
+            }
+        }
+        tp->display_repr[tp->n_display] = repr;
+        tp->display_count[tp->n_display] = count;
+        tp->n_display++;
+    }
+}
+
+/* All tasks[] indices belonging to the same group as tasks[repr_idx] --
+ * same WM_CLASS-matching rule tasklist_build_display() used to form the
+ * group in the first place. Used when opening the group member-list popup
+ * and when building a grouped tooltip, both of which need every member,
+ * not just the representative tasklist_build_display() picked. */
+static int tasklist_group_members(TasklistPriv *tp, int repr_idx, int *out_idx, int max)
+{
+    int n = 0;
+    const char *cls = tp->tasks[repr_idx].wm_class;
+    for (int i = 0; i < tp->n_tasks && n < max; i++) {
+        if (i == repr_idx || (cls[0] && strcmp(tp->tasks[i].wm_class, cls) == 0)) {
+            out_idx[n++] = i;
+        }
+    }
+    return n;
+}
+
 static void tasklist_measure(PanelWidget *w, int cross_axis, int *out_len, int *out_min_len)
 {
     TasklistPriv *tp = w->priv;
     Panel *p = w->panel;
     int icon_px = icon_size_for(cross_axis, tp->icon_padding);
+    tasklist_build_display(tp);
     int cursor = 0;
-    for (int i = 0; i < tp->n_tasks; i++) {
+    for (int d = 0; d < tp->n_display; d++) {
+        TaskEntry *e = &tp->tasks[tp->display_repr[d]];
         int bw;
         if (tp->compact) {
             bw = icon_px + 8;
         } else {
             cairo_text_extents_t ext;
-            cairo_text_extents(p->cr, tp->tasks[i].title, &ext);
+            cairo_text_extents(p->cr, e->title, &ext);
             bw = icon_px + 8 + (int)ext.x_advance + 8;
             if (bw > TASKLIST_WIDE_MAXW) {
                 bw = TASKLIST_WIDE_MAXW;
             }
         }
-        tp->btn_w[i] = bw;
+        tp->btn_w[d] = bw;
         cursor += bw + TASKLIST_BTN_GAP;
     }
-    *out_len = tp->n_tasks > 0 ? cursor - TASKLIST_BTN_GAP : 0;
+    *out_len = tp->n_display > 0 ? cursor - TASKLIST_BTN_GAP : 0;
 
     /* Minimum: room for exactly one task button (compact-sized, since that's
      * the smallest a button can usefully be) plus the up/down arrow pair
      * that tasklist_layout_visible() reserves once scrolling kicks in. */
-    *out_min_len = tp->n_tasks > 0 ? (icon_px + 8 + TASKLIST_ARROW_W + TASKLIST_ARROW_GAP) : 0;
+    *out_min_len = tp->n_display > 0 ? (icon_px + 8 + TASKLIST_ARROW_W + TASKLIST_ARROW_GAP) : 0;
 }
 
 /* Recomputes which tasks are visible (tp->vis_*) from the widget's actual
@@ -221,7 +304,7 @@ static void tasklist_layout_visible(PanelWidget *w)
     TasklistPriv *tp = w->priv;
 
     int natural_total = 0;
-    for (int i = 0; i < tp->n_tasks; i++) {
+    for (int i = 0; i < tp->n_display; i++) {
         natural_total += tp->btn_w[i] + (i > 0 ? TASKLIST_BTN_GAP : 0);
     }
 
@@ -231,8 +314,8 @@ static void tasklist_layout_visible(PanelWidget *w)
         content_avail = 0;
     }
 
-    if (tp->scroll_offset >= tp->n_tasks) {
-        tp->scroll_offset = tp->n_tasks > 0 ? tp->n_tasks - 1 : 0;
+    if (tp->scroll_offset >= tp->n_display) {
+        tp->scroll_offset = tp->n_display > 0 ? tp->n_display - 1 : 0;
     }
     if (tp->scroll_offset < 0) {
         tp->scroll_offset = 0;
@@ -240,7 +323,10 @@ static void tasklist_layout_visible(PanelWidget *w)
 
     int cursor = 0;
     tp->n_visible = 0;
-    for (int i = tp->scroll_offset; i < tp->n_tasks && tp->n_visible < MAX_TASKS; i++) {
+    /* tp->vis_idx[] now stores *display-slot* indices (0..n_display-1),
+     * not raw tasks[] indices -- resolve via tp->display_repr[] wherever
+     * the actual TaskEntry is needed. */
+    for (int i = tp->scroll_offset; i < tp->n_display && tp->n_visible < MAX_TASKS; i++) {
         int bw = tp->btn_w[i];
         int gap = tp->n_visible > 0 ? TASKLIST_BTN_GAP : 0;
         if (tp->n_visible > 0 && cursor + gap + bw > content_avail) {
@@ -263,9 +349,13 @@ static void tasklist_layout_visible(PanelWidget *w)
 /* Full (untruncated) title of whatever task button is under local_x, with
  * the anchor set to that specific button's span -- not the whole widget --
  * so the tooltip lines up with the actual task, same as on_button()'s
- * hit-testing. No tooltip over the scroll arrows. Clickable: the window's
- * XID is packed into *out_ctx the same way tasklist_on_button()'s context
- * menu already does, for tooltip_activate()/tooltip_close_item() below. */
+ * hit-testing. No tooltip over the scroll arrows. A single (ungrouped, or
+ * group of one) task is clickable exactly as before: the window's XID is
+ * packed into *out_ctx for tooltip_activate()/tooltip_close_item() below.
+ * A grouped button (count > 1) instead lists every member's title, one per
+ * line, and isn't clickable -- which member "the click" should mean is
+ * ambiguous from a tooltip; click the button itself for the selection
+ * popup (see tasklist_on_button()). */
 static int tasklist_get_tooltip(PanelWidget *w, int local_x, char *buf, size_t bufsz, int *anchor_x, int *anchor_w,
                                  int *out_closable, void **out_ctx)
 {
@@ -277,12 +367,28 @@ static int tasklist_get_tooltip(PanelWidget *w, int local_x, char *buf, size_t b
     }
     for (int vi = 0; vi < tp->n_visible; vi++) {
         if (local_x >= tp->vis_x[vi] && local_x < tp->vis_x[vi] + tp->vis_w[vi]) {
-            TaskEntry *e = &tp->tasks[tp->vis_idx[vi]];
-            snprintf(buf, bufsz, "%s", e->title);
+            int d = tp->vis_idx[vi];
+            int repr = tp->display_repr[d];
+            if (tp->display_count[d] > 1) {
+                int members[MAX_TASKS];
+                int n = tasklist_group_members(tp, repr, members, MAX_TASKS);
+                size_t used = 0;
+                for (int m = 0; m < n && used < bufsz; m++) {
+                    int wrote = snprintf(buf + used, bufsz - used, "%s%s", m > 0 ? "\n" : "", tp->tasks[members[m]].title);
+                    if (wrote < 0) {
+                        break;
+                    }
+                    used += (size_t)wrote;
+                }
+                *out_closable = 0;
+                *out_ctx = NULL;
+            } else {
+                snprintf(buf, bufsz, "%s", tp->tasks[repr].title);
+                *out_closable = 1;
+                *out_ctx = (void *)(uintptr_t)tp->tasks[repr].win;
+            }
             *anchor_x = tp->vis_x[vi];
             *anchor_w = tp->vis_w[vi];
-            *out_closable = 1;
-            *out_ctx = (void *)(uintptr_t)e->win;
             return 1;
         }
     }
@@ -320,7 +426,11 @@ static int tasklist_get_tooltip_mpris(PanelWidget *w, int local_x, char *out_bus
     }
     for (int vi = 0; vi < tp->n_visible; vi++) {
         if (local_x >= tp->vis_x[vi] && local_x < tp->vis_x[vi] + tp->vis_w[vi]) {
-            Window win = tp->tasks[tp->vis_idx[vi]].win;
+            int d = tp->vis_idx[vi];
+            if (tp->display_count[d] > 1) {
+                return 0; /* which member's player? -- ambiguous while grouped */
+            }
+            Window win = tp->tasks[tp->display_repr[d]].win;
             unsigned long pid = ewmh_get_pid(win);
             return mpris_find_for_pid(pid, out_busname, bufsz, out_playing);
         }
@@ -345,7 +455,46 @@ static int tasklist_get_tooltip_thumb(PanelWidget *w, int local_x, Window *out_w
     }
     for (int vi = 0; vi < tp->n_visible; vi++) {
         if (local_x >= tp->vis_x[vi] && local_x < tp->vis_x[vi] + tp->vis_w[vi]) {
-            *out_win = tp->tasks[tp->vis_idx[vi]].win;
+            int d = tp->vis_idx[vi];
+            if (tp->display_count[d] > 1) {
+                return 0; /* which member's window to preview? -- ambiguous while grouped */
+            }
+            *out_win = tp->tasks[tp->display_repr[d]].win;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Same re-resolve-from-local_x pattern as the other get_tooltip_* callbacks
+ * -- fills every member window of the hovered *grouped* button (count > 1)
+ * so tooltip.c can render its multi-window layout; returns 0 for anything
+ * else (no button under local_x, or an ungrouped one, which
+ * tasklist_get_tooltip_thumb() above already handles on its own). */
+static int tasklist_get_tooltip_group(PanelWidget *w, int local_x, TooltipGroupItem *out_items, int max_items,
+                                       int *out_n)
+{
+    TasklistPriv *tp = w->priv;
+    tasklist_layout_visible(w);
+
+    if (tp->scrollable && local_x >= tp->arrow_x) {
+        return 0;
+    }
+    for (int vi = 0; vi < tp->n_visible; vi++) {
+        if (local_x >= tp->vis_x[vi] && local_x < tp->vis_x[vi] + tp->vis_w[vi]) {
+            int d = tp->vis_idx[vi];
+            if (tp->display_count[d] <= 1) {
+                return 0;
+            }
+            int members[MAX_TASKS];
+            int n = tasklist_group_members(tp, tp->display_repr[d], members, MAX_TASKS);
+            int n_out = 0;
+            for (int m = 0; m < n && n_out < max_items; m++) {
+                out_items[n_out].win = tp->tasks[members[m]].win;
+                snprintf(out_items[n_out].title, sizeof(out_items[0].title), "%s", tp->tasks[members[m]].title);
+                n_out++;
+            }
+            *out_n = n_out;
             return 1;
         }
     }
@@ -374,7 +523,9 @@ static void tasklist_paint(PanelWidget *w, cairo_t *cr)
     int horiz = (p->edge == EDGE_TOP || p->edge == EDGE_BOTTOM);
 
     for (int vi = 0; vi < tp->n_visible; vi++) {
-        TaskEntry *e = &tp->tasks[tp->vis_idx[vi]];
+        int d = tp->vis_idx[vi];
+        int group_count = tp->display_count[d];
+        TaskEntry *e = &tp->tasks[tp->display_repr[d]];
         int bx = ox + tp->vis_x[vi];
         int bw = tp->vis_w[vi];
 
@@ -428,6 +579,26 @@ static void tasklist_paint(PanelWidget *w, cairo_t *cr)
             cairo_show_text(cr, badge);
             cairo_set_font_size(cr, w->thickness * 0.45);
         }
+        if (group_count > 1) {
+            /* Bottom-left of the icon -- deliberately the one corner the
+             * pin dot (top-right) and desktop badge (bottom-right) never
+             * use, so all three can be shown at once without overlapping. */
+            char badge[16];
+            snprintf(badge, sizeof(badge), "%d", group_count);
+            double badge_fs = w->thickness * 0.28;
+            cairo_set_font_size(cr, badge_fs);
+            cairo_text_extents_t bext;
+            cairo_text_extents(cr, badge, &bext);
+            double bx2 = bx + 2;
+            double by2 = icon_y + icon_px;
+            cairo_set_source_rgba(cr, 0, 0, 0, 0.55);
+            cairo_rectangle(cr, bx2 - 2, by2 - bext.height - 1, bext.width + 4, bext.height + 3);
+            cairo_fill(cr);
+            cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.95);
+            cairo_move_to(cr, bx2, by2);
+            cairo_show_text(cr, badge);
+            cairo_set_font_size(cr, w->thickness * 0.45);
+        }
         cairo_pop_group_to_source(cr);
         cairo_paint_with_alpha(cr, e->minimized ? 0.55 : 1.0);
     }
@@ -436,7 +607,7 @@ static void tasklist_paint(PanelWidget *w, cairo_t *cr)
         int ax = ox + tp->arrow_x;
         int half = w->thickness / 2;
         int can_up = tp->scroll_offset > 0;
-        int can_down = tp->vis_idx[tp->n_visible - 1] < tp->n_tasks - 1;
+        int can_down = tp->vis_idx[tp->n_visible - 1] < tp->n_display - 1;
         double cx = ax + TASKLIST_ARROW_W / 2.0;
 
         cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, can_up ? 0.85 : 0.25);
@@ -512,7 +683,7 @@ static int tasklist_on_button(PanelWidget *w, int button, int local_x, int local
                 tp->scroll_offset--;
             }
         } else {
-            if (tp->n_visible > 0 && tp->vis_idx[tp->n_visible - 1] < tp->n_tasks - 1) {
+            if (tp->n_visible > 0 && tp->vis_idx[tp->n_visible - 1] < tp->n_display - 1) {
                 tp->scroll_offset++;
             }
         }
@@ -524,7 +695,7 @@ static int tasklist_on_button(PanelWidget *w, int button, int local_x, int local
     int anchor_x = 0, anchor_w = w->len;
     for (int vi = 0; vi < tp->n_visible; vi++) {
         if (local_x >= tp->vis_x[vi] && local_x < tp->vis_x[vi] + tp->vis_w[vi]) {
-            idx = tp->vis_idx[vi];
+            idx = tp->display_repr[tp->vis_idx[vi]];
             anchor_x = tp->vis_x[vi];
             anchor_w = tp->vis_w[vi];
             break;
@@ -533,6 +704,11 @@ static int tasklist_on_button(PanelWidget *w, int button, int local_x, int local
     if (idx < 0) {
         return 0;
     }
+    /* Both left- and right-click always act on the group's representative
+     * window (whatever the button is currently showing) -- picking a
+     * *different* member of a grouped button is done by hovering for the
+     * tooltip's per-window list instead (see tasklist_get_tooltip_group()),
+     * not by a separate click target here. */
     TaskEntry *e = &tp->tasks[idx];
 
     if (button == Button1) {
@@ -599,6 +775,7 @@ const PanelWidgetOps tasklist_ops = {
     .get_tooltip = tasklist_get_tooltip,
     .get_tooltip_mpris = tasklist_get_tooltip_mpris,
     .get_tooltip_thumb = tasklist_get_tooltip_thumb,
+    .get_tooltip_group = tasklist_get_tooltip_group,
     .tooltip_activate = tasklist_tooltip_activate,
     .tooltip_close_item = tasklist_tooltip_close_item,
 };

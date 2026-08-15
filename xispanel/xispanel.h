@@ -26,6 +26,13 @@ enum autohide_state { AH_HIDDEN, AH_SHOWING, AH_SHOWN, AH_HIDING };
 typedef struct PanelWidget PanelWidget;
 typedef struct Panel Panel;
 
+/* One entry of a grouped-item tooltip -- see PanelWidgetOps.get_tooltip_group. */
+#define TOOLTIP_GROUP_MAX_ITEMS 24
+typedef struct {
+    Window win;
+    char title[128];
+} TooltipGroupItem;
+
 typedef struct {
     const char *type_name; /* "spacer", "clock", "tasklist", ... -- used in config */
     size_t priv_size; /* per-instance state, zeroed on creation */
@@ -98,6 +105,17 @@ typedef struct {
      * see thumb.c/thumb_stub.c) since thumb_paint() itself just always
      * reports "nothing painted" then. */
     int (*get_tooltip_thumb)(PanelWidget *w, int local_x, Window *out_win);
+    /* Optional, called right after a successful get_tooltip(): for a
+     * *grouped* item representing more than one window (tasklist's
+     * group=yes), fill up to max_items entries of *out_items and set
+     * *out_n, return 1. tooltip.c then renders a multi-window layout
+     * instead of the normal single-item text/thumb/mpris one -- a row of
+     * thumbnails if a compositor is available (thumb_available()),
+     * otherwise a stacked list of titles -- each entry individually
+     * clickable to activate that window, with its own close icon. Return
+     * 0 (e.g. the hovered item isn't actually grouped) to fall back to
+     * the normal single-item tooltip. */
+    int (*get_tooltip_group)(PanelWidget *w, int local_x, TooltipGroupItem *out_items, int max_items, int *out_n);
 } PanelWidgetOps;
 
 struct PanelWidget {

@@ -51,6 +51,20 @@
 #define THUMB_H 130
 #define THUMB_MARGIN 6 /* gap between the thumbnail and whatever's drawn below it */
 
+/* Grouped-item (tasklist group=yes) tooltip layout -- a completely separate
+ * rendering mode from the single-item text/thumb/mpris one above, see the
+ * g_has_group branches in show_popup()/paint_popup()/handle_popup_click().
+ * Cells are arranged in a row-major grid, wrapping to a new row once the
+ * output's width is exhausted and capping the row count once its height
+ * is too -- see compute_group_grid(). */
+#define GROUP_THUMB_W 110
+#define GROUP_THUMB_H 70
+#define GROUP_CELL_GAP 8
+#define GROUP_TITLE_H 16
+#define GROUP_TITLE_MAXW 150 /* text-mode cell content width cap before ellipsis */
+#define GROUP_ROW_GAP 6
+#define GROUP_SCREEN_MARGIN 24 /* stay this far from the output's edges */
+
 typedef struct {
     Window win;
     cairo_surface_t *surface;
@@ -66,6 +80,14 @@ typedef struct {
      * 0 unless g_has_thumb, in which case it's THUMB_H + THUMB_MARGIN,
      * pushed down to make room for the thumbnail drawn at the top. */
     int content_y0;
+
+    /* Only meaningful when g_has_group -- see the comment above. */
+    int group_shown_n; /* items actually laid out (<= g_group_n) */
+    int group_more; /* items folded into the trailing "+N mais" cell, 0 if none */
+    int group_thumbs; /* 1 = thumbnail grid cells, 0 = plain text rows */
+    int group_item_x[TOOLTIP_GROUP_MAX_ITEMS], group_item_y[TOOLTIP_GROUP_MAX_ITEMS];
+    int group_item_w[TOOLTIP_GROUP_MAX_ITEMS], group_item_h[TOOLTIP_GROUP_MAX_ITEMS]; /* whole cell, click = activate */
+    int group_close_x[TOOLTIP_GROUP_MAX_ITEMS], group_close_y[TOOLTIP_GROUP_MAX_ITEMS];
 } TooltipPopup;
 
 static TooltipPopup *g_popup = NULL;
@@ -96,6 +118,15 @@ static int g_mpris_playing = 0;
  * xispanel.h. */
 static int g_has_thumb = 0;
 static Window g_thumb_win = None;
+
+/* Set alongside g_text whenever the current hover target implements
+ * get_tooltip_group() and reports a grouped (count > 1) item -- see
+ * PanelWidgetOps.get_tooltip_group's doc comment in xispanel.h. When set,
+ * this entirely replaces the normal text/close/mpris/thumb rendering
+ * with a multi-window grid (see TooltipPopup's group_* fields). */
+static int g_has_group = 0;
+static TooltipGroupItem g_group_items[TOOLTIP_GROUP_MAX_ITEMS];
+static int g_group_n = 0;
 
 /* 0 = no close pending. Set on LeaveNotify from either the panel widget or
  * the popup itself; cleared on EnterNotify to either -- see the file
@@ -134,6 +165,8 @@ void tooltip_close(void)
     g_mpris_playing = 0;
     g_has_thumb = 0;
     g_thumb_win = None;
+    g_has_group = 0;
+    g_group_n = 0;
     g_close_deadline_ms = 0;
 }
 
@@ -177,6 +210,22 @@ static void query_thumb(PanelWidget *w, int local_x)
     }
 }
 
+/* Queries get_tooltip_group() (if `w` implements it) for `local_x`,
+ * updating g_has_group/g_group_items/g_group_n. */
+static void query_group(PanelWidget *w, int local_x)
+{
+    g_has_group = 0;
+    g_group_n = 0;
+    if (!w->ops->get_tooltip_group) {
+        return;
+    }
+    int n = 0;
+    if (w->ops->get_tooltip_group(w, local_x, g_group_items, TOOLTIP_GROUP_MAX_ITEMS, &n)) {
+        g_has_group = 1;
+        g_group_n = n;
+    }
+}
+
 /* Splits g_text on '\n' into up to TOOLTIP_MAX_LINES lines and measures
  * them against `cr` (which must already have the tooltip font set). */
 static int measure_lines(cairo_t *cr, char lines[TOOLTIP_MAX_LINES][128], int *out_text_w, int *out_h)
@@ -206,6 +255,77 @@ static int measure_lines(cairo_t *cr, char lines[TOOLTIP_MAX_LINES][128], int *o
     return n;
 }
 
+/* Draws every laid-out cell from show_popup_group_layout() -- thumbnail
+ * or plain title, plus a per-item close icon -- and the trailing "+N
+ * mais" note if the grid had to cap how many members fit on screen. */
+static void paint_popup_group(void)
+{
+    Panel *p = g_panel;
+    cairo_t *cr = g_popup->cr;
+    if (g_font_face) {
+        cairo_set_font_face(cr, g_font_face);
+    }
+    cairo_set_font_size(cr, TOOLTIP_FONT_SIZE * 0.85);
+
+    for (int i = 0; i < g_popup->group_shown_n; i++) {
+        int ix = g_popup->group_item_x[i];
+        int iy = g_popup->group_item_y[i];
+        int ih = g_popup->group_item_h[i];
+        char title[128];
+        snprintf(title, sizeof(title), "%s", g_group_items[i].title);
+
+        if (g_popup->group_thumbs) {
+            if (!thumb_paint(cr, g_group_items[i].win, ix, iy, GROUP_THUMB_W, GROUP_THUMB_H)) {
+                /* Window closed/unmapped, or compositor just stopped -- same
+                 * graceful fallback as the single-window thumbnail: leave
+                 * the reserved space blank rather than resizing mid-display. */
+            }
+            cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.95);
+            trim_to_width(cr, title, sizeof(title), GROUP_THUMB_W);
+            cairo_text_extents_t ext;
+            cairo_text_extents(cr, title, &ext);
+            double tx = ix + (GROUP_THUMB_W - ext.width) / 2.0 - ext.x_bearing;
+            double ty = iy + GROUP_THUMB_H + 4 - ext.y_bearing;
+            cairo_move_to(cr, tx, ty);
+            cairo_show_text(cr, title);
+        } else {
+            cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.95);
+            trim_to_width(cr, title, sizeof(title), GROUP_TITLE_MAXW);
+            cairo_text_extents_t ext;
+            cairo_text_extents(cr, title, &ext);
+            double ty = iy + (ih - ext.height) / 2.0 - ext.y_bearing;
+            cairo_move_to(cr, ix, ty);
+            cairo_show_text(cr, title);
+        }
+
+        double cx = g_popup->group_close_x[i], cy = g_popup->group_close_y[i];
+        double s = TOOLTIP_CLOSE_ICON;
+        cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.85);
+        cairo_set_line_width(cr, 1.4);
+        cairo_move_to(cr, cx + 3, cy + 3);
+        cairo_line_to(cr, cx + s - 3, cy + s - 3);
+        cairo_stroke(cr);
+        cairo_move_to(cr, cx + 3, cy + s - 3);
+        cairo_line_to(cr, cx + s - 3, cy + 3);
+        cairo_stroke(cr);
+    }
+
+    if (g_popup->group_more > 0) {
+        int i = g_popup->group_shown_n; /* the trailing reserved cell */
+        char more[32];
+        snprintf(more, sizeof(more), "+%d mais", g_popup->group_more);
+        cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.6);
+        cairo_text_extents_t ext;
+        cairo_text_extents(cr, more, &ext);
+        int ix = g_popup->group_item_x[i], iy = g_popup->group_item_y[i];
+        int iw = g_popup->group_item_w[i], ih = g_popup->group_item_h[i];
+        double tx = ix + (iw - ext.width) / 2.0 - ext.x_bearing;
+        double ty = iy + (ih - ext.height) / 2.0 - ext.y_bearing;
+        cairo_move_to(cr, tx, ty);
+        cairo_show_text(cr, more);
+    }
+}
+
 static void paint_popup(void)
 {
     if (!g_popup || !g_panel) {
@@ -221,6 +341,13 @@ static void paint_popup(void)
     cairo_rectangle(cr, 0.5, 0.5, g_popup->width - 1, g_popup->height - 1);
     cairo_set_line_width(cr, 1);
     cairo_stroke(cr);
+
+    if (g_has_group) {
+        paint_popup_group();
+        cairo_surface_flush(g_popup->surface);
+        XFlush(g_dpy);
+        return;
+    }
 
     if (g_has_thumb) {
         double thumb_x = (g_popup->width - THUMB_W) / 2.0;
@@ -317,18 +444,12 @@ static void paint_popup(void)
     XFlush(g_dpy);
 }
 
-static void show_popup(void)
+/* Original single-item layout (text + optional close icon/mpris row/
+ * thumbnail) -- unchanged from before grouped tooltips existed, just
+ * extracted so show_popup() can pick between this and
+ * show_popup_group_layout() below. */
+static void show_popup_single_layout(TooltipPopup *pop)
 {
-    if (!g_panel || !g_widget || !g_text[0]) {
-        return;
-    }
-    destroy_popup();
-
-    TooltipPopup *pop = calloc(1, sizeof(TooltipPopup));
-    if (!pop) {
-        return;
-    }
-
     /* Measure against a throwaway surface first -- need width/height to
      * create the real window. */
     cairo_surface_t *probe_surf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
@@ -392,6 +513,162 @@ static void show_popup(void)
     pop->close_y = pop->content_y0 + close_y_in_body;
     pop->close_w = TOOLTIP_CLOSE_ICON;
     pop->close_h = TOOLTIP_CLOSE_ICON;
+}
+
+/* Splits n_items cells of cell_w x cell_h (plus GROUP_CELL_GAP/
+ * GROUP_ROW_GAP between them) into a row-major grid that fits within
+ * avail_w x avail_h: as many columns as fit the width, wrapping to more
+ * rows for the rest -- capped at as many rows as fit the height too. If
+ * even that isn't enough for every item, the last cell of the capped grid
+ * is reserved for a "+N mais" note instead of silently dropping items with
+ * no indication more exist. */
+static void compute_group_grid(int n_items, int cell_w, int cell_h, int avail_w, int avail_h, int *out_cols,
+                                int *out_rows, int *out_shown, int *out_more)
+{
+    int cols = avail_w / (cell_w + GROUP_CELL_GAP);
+    if (cols < 1) {
+        cols = 1;
+    }
+    if (cols > n_items) {
+        cols = n_items > 0 ? n_items : 1;
+    }
+    int rows_for_all = (n_items + cols - 1) / cols;
+    int max_rows = avail_h / (cell_h + GROUP_ROW_GAP);
+    if (max_rows < 1) {
+        max_rows = 1;
+    }
+
+    if (rows_for_all <= max_rows) {
+        *out_cols = cols;
+        *out_rows = rows_for_all;
+        *out_shown = n_items;
+        *out_more = 0;
+        return;
+    }
+
+    int max_cells = cols * max_rows;
+    int shown = max_cells - 1;
+    if (shown < 1) {
+        shown = 1;
+    }
+    if (shown >= n_items) {
+        shown = n_items > 1 ? n_items - 1 : 0;
+    }
+    *out_cols = cols;
+    *out_rows = max_rows;
+    *out_shown = shown;
+    *out_more = n_items - shown;
+}
+
+/* Grouped-item layout: a grid of thumbnails (if a compositor's running) or
+ * plain title rows (if not), wrapped/capped to fit the output rectangle --
+ * see compute_group_grid()'s doc comment for the overflow behavior. */
+static void show_popup_group_layout(TooltipPopup *pop)
+{
+    Panel *p = g_panel;
+    pop->group_thumbs = thumb_available();
+    pop->content_y0 = 0;
+
+    cairo_surface_t *probe_surf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
+    cairo_t *probe_cr = cairo_create(probe_surf);
+    if (g_font_face) {
+        cairo_set_font_face(probe_cr, g_font_face);
+    }
+    cairo_set_font_size(probe_cr, TOOLTIP_FONT_SIZE * 0.85);
+
+    int cell_w, cell_h;
+    if (pop->group_thumbs) {
+        cell_w = GROUP_THUMB_W;
+        cell_h = GROUP_THUMB_H + GROUP_TITLE_H;
+    } else {
+        /* Widest title across every member (capped), so every row's close
+         * icon lines up in the same column. */
+        int max_tw = 0;
+        for (int i = 0; i < g_group_n; i++) {
+            char t[128];
+            snprintf(t, sizeof(t), "%s", g_group_items[i].title);
+            trim_to_width(probe_cr, t, sizeof(t), GROUP_TITLE_MAXW);
+            cairo_text_extents_t ext;
+            cairo_text_extents(probe_cr, t, &ext);
+            if ((int)ext.x_advance > max_tw) {
+                max_tw = (int)ext.x_advance;
+            }
+        }
+        cell_w = max_tw + 10 + TOOLTIP_CLOSE_ICON + 6;
+        cell_h = TOOLTIP_CLOSE_ICON + 6;
+    }
+    cairo_destroy(probe_cr);
+    cairo_surface_destroy(probe_surf);
+
+    int avail_w = p->out_w - 2 * GROUP_SCREEN_MARGIN;
+    int avail_h = p->out_h - 2 * GROUP_SCREEN_MARGIN;
+    if (avail_w < cell_w) {
+        avail_w = cell_w;
+    }
+    if (avail_h < cell_h) {
+        avail_h = cell_h;
+    }
+
+    int cols, rows, shown, more;
+    compute_group_grid(g_group_n, cell_w, cell_h, avail_w, avail_h, &cols, &rows, &shown, &more);
+    pop->group_shown_n = shown;
+    pop->group_more = more;
+
+    int total_cells = shown + (more > 0 ? 1 : 0);
+    for (int i = 0; i < total_cells && i < TOOLTIP_GROUP_MAX_ITEMS; i++) {
+        int row = i / cols;
+        int col = i % cols;
+        int ix = TOOLTIP_PAD_X + col * (cell_w + GROUP_CELL_GAP);
+        int iy = TOOLTIP_PAD_Y + row * (cell_h + GROUP_ROW_GAP);
+        pop->group_item_x[i] = ix;
+        pop->group_item_y[i] = iy;
+        pop->group_item_w[i] = cell_w;
+        pop->group_item_h[i] = cell_h;
+        if (pop->group_thumbs) {
+            pop->group_close_x[i] = ix + cell_w - TOOLTIP_CLOSE_ICON - 2;
+            pop->group_close_y[i] = iy + 2;
+        } else {
+            pop->group_close_x[i] = ix + cell_w - TOOLTIP_CLOSE_ICON;
+            pop->group_close_y[i] = iy + (cell_h - TOOLTIP_CLOSE_ICON) / 2;
+        }
+    }
+
+    int used_cols = total_cells < cols ? total_cells : cols;
+    if (used_cols < 1) {
+        used_cols = 1;
+    }
+    int used_rows = (total_cells + cols - 1) / cols;
+    if (used_rows < 1) {
+        used_rows = 1;
+    }
+    (void)rows;
+    pop->width = TOOLTIP_PAD_X * 2 + used_cols * cell_w + (used_cols - 1) * GROUP_CELL_GAP;
+    pop->height = TOOLTIP_PAD_Y * 2 + used_rows * cell_h + (used_rows - 1) * GROUP_ROW_GAP;
+    if (pop->width < 1) {
+        pop->width = 1;
+    }
+    if (pop->height < 1) {
+        pop->height = 1;
+    }
+}
+
+static void show_popup(void)
+{
+    if (!g_panel || !g_widget || (!g_has_group && !g_text[0])) {
+        return;
+    }
+    destroy_popup();
+
+    TooltipPopup *pop = calloc(1, sizeof(TooltipPopup));
+    if (!pop) {
+        return;
+    }
+
+    if (g_has_group) {
+        show_popup_group_layout(pop);
+    } else {
+        show_popup_single_layout(pop);
+    }
 
     /* Glued to the panel's outer edge, centered on the anchor item --
      * plasmashell-style, never overlapping the panel itself. */
@@ -468,8 +745,10 @@ static int refresh_text(void)
     query_mpris(g_widget, g_local_x);
     int had_thumb = g_has_thumb;
     query_thumb(g_widget, g_local_x);
+    int had_group = g_has_group;
+    query_group(g_widget, g_local_x);
     int changed = strcmp(g_text, buf) != 0 || g_closable != closable || had_mpris != g_has_mpris ||
-                  was_playing != g_mpris_playing || had_thumb != g_has_thumb;
+                  was_playing != g_mpris_playing || had_thumb != g_has_thumb || had_group != g_has_group;
     snprintf(g_text, sizeof(g_text), "%s", buf);
     g_anchor_x = ax;
     g_anchor_w = aw;
@@ -515,12 +794,15 @@ void tooltip_notice_motion(Panel *p, int axis_pos)
         int was_playing = g_mpris_playing;
         query_mpris(hit, local_x);
         query_thumb(hit, local_x);
+        int had_group = g_has_group;
+        int had_group_n = g_group_n;
+        query_group(hit, local_x);
         if (strcmp(g_text, buf) != 0 || g_closable != closable || had_mpris != g_has_mpris ||
-            was_playing != g_mpris_playing) {
+            was_playing != g_mpris_playing || had_group != g_has_group || had_group_n != g_group_n) {
             snprintf(g_text, sizeof(g_text), "%s", buf);
             g_closable = closable;
             if (g_shown) {
-                paint_popup();
+                show_popup(); /* size may have changed (group membership) -- not just a repaint */
             }
         }
         return;
@@ -538,6 +820,7 @@ void tooltip_notice_motion(Panel *p, int axis_pos)
     g_ctx = ctx;
     query_mpris(hit, local_x);
     query_thumb(hit, local_x);
+    query_group(hit, local_x);
     snprintf(g_text, sizeof(g_text), "%s", buf);
     g_since_ms = now_ms();
 }
@@ -575,7 +858,7 @@ void tooltip_tick(uint64_t now)
     if (now - g_last_refresh_ms >= TOOLTIP_REFRESH_MS) {
         g_last_refresh_ms = now;
         if (refresh_text()) {
-            paint_popup();
+            show_popup(); /* size may have changed (e.g. group membership), not just content */
         }
     }
 }
@@ -602,6 +885,34 @@ uint64_t tooltip_next_wake_ms(void)
 static void handle_popup_click(int local_x, int local_y)
 {
     if (!g_widget) {
+        tooltip_close();
+        return;
+    }
+
+    if (g_has_group && g_popup) {
+        for (int i = 0; i < g_popup->group_shown_n; i++) {
+            int ix = g_popup->group_item_x[i], iy = g_popup->group_item_y[i];
+            int iw = g_popup->group_item_w[i], ih = g_popup->group_item_h[i];
+            if (local_x < ix || local_x >= ix + iw || local_y < iy || local_y >= iy + ih) {
+                continue;
+            }
+            Window win = g_group_items[i].win;
+            int on_close = local_x >= g_popup->group_close_x[i] &&
+                            local_x < g_popup->group_close_x[i] + TOOLTIP_CLOSE_ICON &&
+                            local_y >= g_popup->group_close_y[i] &&
+                            local_y < g_popup->group_close_y[i] + TOOLTIP_CLOSE_ICON;
+            tooltip_close();
+            if (on_close) {
+                ewmh_close(win);
+            } else {
+                ewmh_activate(win);
+            }
+            XFlush(g_dpy);
+            return;
+        }
+        /* Click landed on the popup but not on any item cell (e.g. the
+         * "+N mais" note, or the padding around the grid) -- just dismiss,
+         * same as clicking a non-closable single-item tooltip's body. */
         tooltip_close();
         return;
     }
