@@ -570,7 +570,15 @@ void sni_poll(uint64_t now)
                 p_dbus_message_iter_recurse(&it, &variant);
                 if (p_dbus_message_iter_get_arg_type(&variant) == DBUS_TYPE_ARRAY) {
                     p_dbus_message_iter_recurse(&variant, &arr);
-                    g_n_items = 0;
+                    /* Deliberately *not* resetting g_n_items to 0 here:
+                     * sni_register_item() already dedups against the
+                     * current list via sni_find(), so re-parsing the same
+                     * mostly-unchanged array every poll only appends
+                     * genuinely new items instead of re-logging/
+                     * re-adding everything every ~1.5s. Items that drop
+                     * out of the watcher's list get pruned naturally by
+                     * the GetAll-failure loop below once their bus name
+                     * actually stops answering. */
                     while (p_dbus_message_iter_get_arg_type(&arr) == DBUS_TYPE_STRING && g_n_items < SNI_MAX_ITEMS) {
                         const char *s = NULL;
                         p_dbus_message_iter_get_basic(&arr, &s);
