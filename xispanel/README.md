@@ -9,6 +9,13 @@ Pango/GLib) for vector rendering and text via FreeType/Fontconfig, and
 Imlib2 for image decoding -- the same dependency spirit as
 [XisBack](../xisback) and [XisGuard](../xisguard).
 
+Text uses whatever font family the desktop itself is configured with --
+`~/.config/kdeglobals`'s `[General] font=` on Plasma, falling back to
+`~/.config/gtk-3.0/settings.ini`'s `gtk-font-name=` on GTK-based desktops,
+and finally Fontconfig's own `sans-serif` default if neither file exists
+-- read directly (no Qt/GTK linked) once at startup. See
+[PROTOCOL.md](PROTOCOL.md)'s "Design notes" section.
+
 ### Status
 
 **Early.** What works right now:

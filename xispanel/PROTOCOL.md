@@ -474,6 +474,22 @@ own file" structure:
 
 ## Design notes
 
+- Text uses whatever font family the desktop is actually configured
+  with, not Fontconfig's `sans-serif` generic alias (a distro-wide
+  default, often not what the user picked in System Settings).
+  `detect_system_font_family()` in `xispanel.c` reads, in order:
+  `~/.config/kdeglobals`'s `[General] font=Family,size,...` (Plasma),
+  then `~/.config/gtk-3.0/settings.ini`'s `gtk-font-name=Family size`
+  (GTK-based desktops), falling back to Fontconfig's own default if
+  neither file exists or has the key. Plain text-file parsing, no Qt/GTK
+  linked -- same "read the config file directly" approach as everything
+  else in this tool. Only the family is taken from either source; the
+  point size in `kdeglobals`/`gtk-font-name` is ignored on purpose --
+  panel text is sized off panel thickness (`p->thickness * 0.45`, see
+  `panel_repaint()`), not a fixed point size, so it always fits whatever
+  `thickness=` the panel is configured with. Read once at startup, not
+  re-read on `RELOAD` -- font changes are rare enough that restarting
+  xispanel is an acceptable way to pick up a new one for now.
 - `overlay`/`autohide` panel windows are `override-redirect`: xispanel
   manages their own position/stacking rather than asking a window manager
   to, which is what makes the autohide slide animation reliable. `dock`

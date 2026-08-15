@@ -64,6 +64,7 @@
 #include <ft2build.h>
 #include FT_FREETYPE_H
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -282,6 +283,91 @@ static const PanelWidgetOps *find_widget_ops(const char *type_name)
 /* ------------------------------------------------------------------ */
 /* font setup                                                           */
 /* ------------------------------------------------------------------ */
+
+/* Reads whichever desktop's own "default UI font" setting is present, so
+ * xispanel's text matches the rest of the session instead of whatever
+ * fontconfig's generic "sans-serif" alias happens to resolve to (often a
+ * different font than what the user picked in System Settings, since
+ * that alias is a distro-wide default, not a per-user one). No Qt/GTK
+ * linked -- just the same two plain config files those toolkits
+ * themselves read, checked in order:
+ *
+ *   - KDE/Plasma: ~/.config/kdeglobals, [General] font=Family,size,...
+ *   - GTK3:       ~/.config/gtk-3.0/settings.ini, [Settings]
+ *                 gtk-font-name=Family size
+ *
+ * Falls back to fontconfig's "sans-serif" default (via init_font()'s own
+ * fallback) if neither file exists or has the key -- most likely a
+ * minimal/non-desktop X session, where there's nothing more specific to
+ * honor anyway. */
+static void detect_system_font_family(char *out, size_t outsz)
+{
+    out[0] = 0;
+    const char *home = getenv("HOME");
+    if (!home) {
+        return;
+    }
+    char path[PATH_MAX];
+    char line[512];
+
+    snprintf(path, sizeof(path), "%s/.config/kdeglobals", home);
+    FILE *f = fopen(path, "r");
+    if (f) {
+        int in_general = 0;
+        while (fgets(line, sizeof(line), f)) {
+            size_t len = strlen(line);
+            while (len && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+                line[--len] = 0;
+            }
+            if (line[0] == '[') {
+                in_general = (strcmp(line, "[General]") == 0);
+                continue;
+            }
+            if (in_general && strncmp(line, "font=", 5) == 0) {
+                const char *val = line + 5;
+                const char *comma = strchr(val, ',');
+                size_t flen = comma ? (size_t)(comma - val) : strlen(val);
+                if (flen >= outsz) {
+                    flen = outsz - 1;
+                }
+                memcpy(out, val, flen);
+                out[flen] = 0;
+                break;
+            }
+        }
+        fclose(f);
+        if (out[0]) {
+            return;
+        }
+    }
+
+    snprintf(path, sizeof(path), "%s/.config/gtk-3.0/settings.ini", home);
+    f = fopen(path, "r");
+    if (f) {
+        while (fgets(line, sizeof(line), f)) {
+            size_t len = strlen(line);
+            while (len && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+                line[--len] = 0;
+            }
+            if (strncmp(line, "gtk-font-name=", 14) == 0) {
+                char buf[256];
+                snprintf(buf, sizeof(buf), "%s", line + 14);
+                /* gtk-font-name is "Family [Style] size" -- drop the
+                 * trailing numeric size token, Fontconfig only needs the
+                 * family here (panel text is sized off panel thickness,
+                 * not a fixed point size -- see the callers of
+                 * init_font()). */
+                char *sp = strrchr(buf, ' ');
+                if (sp && isdigit((unsigned char)sp[1])) {
+                    *sp = 0;
+                }
+                snprintf(out, outsz, "%s", buf);
+                break;
+            }
+        }
+        fclose(f);
+    }
+}
 
 static int init_font(const char *family_hint)
 {
@@ -1512,8 +1598,12 @@ static int run_as_daemon(const char *sockpath)
     imlib_context_set_anti_alias(1);
     imlib_context_set_dither(1);
 
-    if (init_font(NULL) != 0) {
+    char sys_font[128];
+    detect_system_font_family(sys_font, sizeof(sys_font));
+    if (init_font(sys_font) != 0) {
         fprintf(stderr, "xispanel: could not resolve a default font via fontconfig\n");
+    } else if (sys_font[0]) {
+        fprintf(stderr, "xispanel: using system font '%s'\n", sys_font);
     }
 
     ewmh_init_atoms();
