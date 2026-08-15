@@ -13,11 +13,23 @@
 
 #include <X11/Xlib.h>
 
+#include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 #define WINCTL_MAX_BUTTONS 3
+
+enum winctl_fallback {
+    FALLBACK_NONE = 0,
+    FALLBACK_CLOCK,
+    FALLBACK_USERNAME,
+    FALLBACK_OS,
+    FALLBACK_OS_VERSION,
+    FALLBACK_TEXT,
+};
 
 typedef struct {
     char buttons[WINCTL_MAX_BUTTONS]; /* 'i'=minimize, 'a'=maximize, 'x'=close */
@@ -31,8 +43,19 @@ typedef struct {
                            * against the panel's current main-axis length on every measure() call (not
                            * cached in pixels), so it tracks RandR/output geometry changes automatically. */
 
+    /* What to show instead of icon+title+buttons when there's no
+     * applicable active window -- only relevant when width=/width=NN% is
+     * set (fixed_width/fixed_width_pct > 0), since otherwise the widget
+     * just collapses to zero width as before. FALLBACK_CLOCK's text is
+     * computed fresh every paint(); the rest are resolved once at init()
+     * into fallback_static since they can't change at runtime. */
+    enum winctl_fallback fallback;
+    char fallback_format[32]; /* strftime format, FALLBACK_CLOCK only */
+    char fallback_static[128];
+
     Window active_win;
-    int active_applies; /* active_win != None and passes same_desktop_only/same_output_only */
+    int active_applies; /* active_win != None, isn't a desktop/dock/skip-taskbar window, and passes
+                          * same_desktop_only/same_output_only */
     char title[128];
     int minimized, maximized;
     cairo_surface_t *icon;
@@ -69,6 +92,72 @@ static void parse_buttons(const char *kvline, char *out, int *out_n)
     *out_n = n;
 }
 
+/* Strips one matching pair of surrounding double quotes, if present --
+ * /etc/os-release values are usually (not always) quoted. */
+static void strip_quotes(const char *in, char *out, size_t outsz)
+{
+    size_t len = strlen(in);
+    if (len >= 2 && in[0] == '"' && in[len - 1] == '"') {
+        in++;
+        len -= 2;
+    }
+    if (len >= outsz) {
+        len = outsz - 1;
+    }
+    memcpy(out, in, len);
+    out[len] = 0;
+}
+
+/* FALLBACK_OS uses NAME= (e.g. "Ubuntu"); FALLBACK_OS_VERSION uses
+ * PRETTY_NAME= instead (e.g. "Ubuntu 22.04.3 LTS"), which already
+ * includes the version -- no need to separately read VERSION= and
+ * concatenate it. "Linux" if the file is missing or has neither key. */
+static void read_os_release(int with_version, char *out, size_t outsz)
+{
+    snprintf(out, outsz, "Linux");
+    FILE *f = fopen("/etc/os-release", "r");
+    if (!f) {
+        return;
+    }
+    char line[256];
+    char name[128] = "";
+    char pretty[128] = "";
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[--len] = 0;
+        }
+        if (!strncmp(line, "NAME=", 5)) {
+            strip_quotes(line + 5, name, sizeof(name));
+        } else if (!strncmp(line, "PRETTY_NAME=", 12)) {
+            strip_quotes(line + 12, pretty, sizeof(pretty));
+        }
+    }
+    fclose(f);
+    const char *src = with_version ? (pretty[0] ? pretty : name) : (name[0] ? name : pretty);
+    if (src[0]) {
+        snprintf(out, outsz, "%s", src);
+    }
+}
+
+/* Fills `out` with whatever winctl should show in place of icon+title
+ * when there's no applicable active window. FALLBACK_CLOCK is the only
+ * mode computed here rather than cached in fallback_static at init(),
+ * since it has to change every call. */
+static void winctl_fallback_text(WinctlPriv *wp, char *out, size_t outsz)
+{
+    if (wp->fallback == FALLBACK_CLOCK) {
+        time_t t = time(NULL);
+        struct tm tmv;
+        localtime_r(&t, &tmv);
+        if (strftime(out, outsz, wp->fallback_format, &tmv) == 0) {
+            out[0] = 0;
+        }
+        return;
+    }
+    snprintf(out, outsz, "%s", wp->fallback_static);
+}
+
 static int winctl_init(PanelWidget *w)
 {
     WinctlPriv *wp = w->priv;
@@ -90,6 +179,49 @@ static int winctl_init(PanelWidget *w)
         } else {
             wp->fixed_width = atoi(width_buf);
         }
+    }
+
+    char fallback_buf[16];
+    if (kv_get(w->config_kv, "fallback", fallback_buf, sizeof(fallback_buf))) {
+        if (!strcmp(fallback_buf, "clock")) {
+            wp->fallback = FALLBACK_CLOCK;
+        } else if (!strcmp(fallback_buf, "username")) {
+            wp->fallback = FALLBACK_USERNAME;
+        } else if (!strcmp(fallback_buf, "os")) {
+            wp->fallback = FALLBACK_OS;
+        } else if (!strcmp(fallback_buf, "os_version")) {
+            wp->fallback = FALLBACK_OS_VERSION;
+        } else if (!strcmp(fallback_buf, "text")) {
+            wp->fallback = FALLBACK_TEXT;
+        } else {
+            fprintf(stderr, "xispanel: winctl: unknown fallback '%s', ignoring\n", fallback_buf);
+        }
+    }
+    if (!kv_get(w->config_kv, "fallback_format", wp->fallback_format, sizeof(wp->fallback_format)) ||
+        !wp->fallback_format[0]) {
+        snprintf(wp->fallback_format, sizeof(wp->fallback_format), "%%H:%%M");
+    }
+    switch (wp->fallback) {
+    case FALLBACK_USERNAME: {
+        const char *u = getenv("USER");
+        if (!u || !u[0]) {
+            struct passwd *pw = getpwuid(getuid());
+            u = pw ? pw->pw_name : "?";
+        }
+        snprintf(wp->fallback_static, sizeof(wp->fallback_static), "%s", u);
+        break;
+    }
+    case FALLBACK_OS:
+        read_os_release(0, wp->fallback_static, sizeof(wp->fallback_static));
+        break;
+    case FALLBACK_OS_VERSION:
+        read_os_release(1, wp->fallback_static, sizeof(wp->fallback_static));
+        break;
+    case FALLBACK_TEXT:
+        kv_get(w->config_kv, "fallback_text", wp->fallback_static, sizeof(wp->fallback_static));
+        break;
+    default:
+        break;
     }
 
     wp->active_win = None;
@@ -119,7 +251,11 @@ static void winctl_on_tick(PanelWidget *w, uint64_t now)
         wp->active_win = active;
     }
 
-    int applies = active != None;
+    /* _NET_ACTIVE_WINDOW can briefly point at a desktop/dock/skip-taskbar
+     * window (e.g. clicking the desktop itself, or another panel) --
+     * tasklist already excludes these from its own list, winctl should
+     * likewise never show controls for one. */
+    int applies = active != None && !ewmh_skip_taskbar(active);
     if (applies && wp->same_desktop_only) {
         int current_desktop = ewmh_get_current_desktop();
         int win_desktop = ewmh_get_desktop(active);
@@ -152,12 +288,6 @@ static void winctl_measure(PanelWidget *w, int cross_axis, int *out_len, int *ou
     WinctlPriv *wp = w->priv;
     Panel *p = w->panel;
 
-    if (!wp->active_applies) {
-        *out_len = 0;
-        *out_min_len = 0;
-        return;
-    }
-
     int fixed = wp->fixed_width;
     if (wp->fixed_width_pct > 0) {
         /* Resolved fresh every measure() (not cached) against the panel's
@@ -167,6 +297,20 @@ static void winctl_measure(PanelWidget *w, int cross_axis, int *out_len, int *ou
         int main_axis_len = (p->edge == EDGE_TOP || p->edge == EDGE_BOTTOM) ? p->w : p->h;
         fixed = (main_axis_len * wp->fixed_width_pct) / 100;
     }
+
+    if (!wp->active_applies) {
+        /* No active window to show -- keep reserving the configured
+         * width (winctl_paint() renders `fallback` into it instead of
+         * icon+title+buttons) rather than collapsing to zero, so nothing
+         * else in the panel shifts just because focus moved to a window
+         * this instance doesn't apply to. Auto width (fixed == 0) still
+         * collapses, same as before -- there's no natural width to
+         * reserve without an active window's title to measure. */
+        *out_len = fixed > 0 ? fixed : 0;
+        *out_min_len = *out_len;
+        return;
+    }
+
     if (fixed > 0) {
         /* Always exactly this wide regardless of title length or
          * whether the buttons are currently shown -- winctl_paint()
@@ -217,6 +361,24 @@ static void winctl_paint(PanelWidget *w, cairo_t *cr)
     Panel *p = w->panel;
     if (!wp->active_applies) {
         wp->n_visible_buttons = 0;
+        if (w->len <= 0 || wp->fallback == FALLBACK_NONE) {
+            return;
+        }
+        char text[160];
+        winctl_fallback_text(wp, text, sizeof(text));
+        if (!text[0]) {
+            return;
+        }
+        int ox, oy, owidth, oheight;
+        widget_get_rect(w, &ox, &oy, &owidth, &oheight);
+        (void)oheight;
+        cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.95);
+        trim_to_width(cr, text, sizeof(text), owidth - 16);
+        cairo_text_extents_t ext;
+        cairo_text_extents(cr, text, &ext);
+        cairo_move_to(cr, ox + (owidth - ext.width) / 2.0 - ext.x_bearing,
+                      oy + (w->thickness - ext.height) / 2.0 - ext.y_bearing);
+        cairo_show_text(cr, text);
         return;
     }
 

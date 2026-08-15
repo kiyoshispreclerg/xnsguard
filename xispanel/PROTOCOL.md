@@ -169,23 +169,36 @@ Widget types implemented so far:
   single square when the active window isn't maximized and as two
   overlapping squares (restore) when it is. `same_desktop=yes|no` and
   `same_output=yes|no` (both default `no`, same semantics as `tasklist`'s
-  filters above) make the whole widget render as empty whenever the
-  active window doesn't match -- e.g. `same_output=yes` on a per-output
-  panel hides icon/title/buttons while focus is on another monitor,
-  instead of showing controls for a window this panel doesn't "own".
-  `width=<px>` or `width=<pct>%` (default unset -- auto width, the widget
-  grows with the title's length up to 220px, then grows again when the
-  buttons become visible) pins the widget to always exactly that wide
-  instead, in raw pixels or as a percentage of the panel's own main-axis
-  length (re-resolved against the panel's *current* size on every
-  `measure()`, so it tracks RandR/output geometry changes rather than
-  freezing at whatever it resolved to at startup): the title is
+  filters above) make the whole widget render as empty (or `fallback=`
+  content, see below) whenever the active window doesn't match -- e.g.
+  `same_output=yes` on a per-output panel hides icon/title/buttons while
+  focus is on another monitor, instead of showing controls for a window
+  this panel doesn't "own". `_NET_ACTIVE_WINDOW` pointing at a desktop/
+  dock/skip-taskbar window (same categories `tasklist` already excludes
+  from its own list -- e.g. clicking the desktop itself) never applies
+  either. `width=<px>` or `width=<pct>%` (default unset -- auto width,
+  the widget grows with the title's length up to 220px, then grows again
+  when the buttons become visible) pins the widget to always exactly
+  that wide instead, in raw pixels or as a percentage of the panel's own
+  main-axis length (re-resolved against the panel's *current* size on
+  every `measure()`, so it tracks RandR/output geometry changes rather
+  than freezing at whatever it resolved to at startup): the title is
   ellipsized into whatever room icon+buttons leave, and shows nothing at
   all if there's no room left, rather than ever resizing the widget
   itself -- keeps whatever's drawn after `winctl` in the panel from
   shifting position every time the active window or its maximized state
-  changes. Polls `_NET_ACTIVE_WINDOW` every ~300ms, same
-  tradeoff as `tasklist`'s polling.
+  changes. When `width=`/`width=NN%` is set *and* there's no applicable
+  active window, the widget keeps reserving that same space (instead of
+  collapsing to zero, which is what it still does without a fixed width)
+  and renders `fallback=<mode>` into it: `clock` (current time, format
+  from `fallback_format=<strftime format>`, default `%H:%M`), `username`
+  (`$USER`, falling back to the passwd entry), `os` (`/etc/os-release`'s
+  `NAME=`, e.g. "Ubuntu"), `os_version` (`PRETTY_NAME=` instead, e.g.
+  "Ubuntu 22.04.3 LTS" -- already includes the version, no separate
+  concatenation needed), or `text` (literal `fallback_text=<string>`,
+  quote it if it needs spaces). Default `fallback` is unset, meaning
+  nothing is drawn in the reserved space. Polls `_NET_ACTIVE_WINDOW`
+  every ~300ms, same tradeoff as `tasklist`'s polling.
 - `tray`: one square icon button per active StatusNotifierItem (the
   `org.kde.StatusNotifierItem`/`org.freedesktop.StatusNotifierItem`
   DBus protocol used by every modern tray -- KDE, GNOME's legacy
