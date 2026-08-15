@@ -1,0 +1,9 @@
+# 9-slice measurements for template.png, in source-image pixels.
+# left/top/right/bottom are how many pixels from each edge stay unscaled
+# (the corners); everything inside those margins stretches to fill
+# whatever's left of the actual panel. See PROTOCOL.md's "PNG bitmap
+# themes" section.
+left=12
+top=12
+right=12
+bottom=12

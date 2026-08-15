@@ -13,6 +13,7 @@
 
 #include <X11/Xlib.h>
 #include <cairo/cairo.h>
+#include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -125,6 +126,16 @@ struct Panel {
     double bg_r, bg_g, bg_b, bg_a;
     double fg_r, fg_g, fg_b, fg_a;
     int spacing;
+    /* Optional 9-slice background image, replacing the solid bg_* color
+     * entirely when it loads successfully -- see THEME's bg_image/
+     * bg_slice keys and panel_load_bg_image() in xispanel.c. Path fields
+     * are the raw config values (kept so reload can retry); *_surface is
+     * NULL whenever there's no image or it failed to load, in which case
+     * panel_repaint() just falls back to bg_r/g/b/a as always. */
+    char bg_image_path[PATH_MAX];
+    char bg_slice_path[PATH_MAX];
+    int bg_slice_l, bg_slice_t, bg_slice_r, bg_slice_b;
+    cairo_surface_t *bg_image_surface;
 
     /* resolved output geometry */
     int out_x, out_y, out_w, out_h;

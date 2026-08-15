@@ -529,6 +529,182 @@ static Window panel_create_sensor(Panel *p)
     return win;
 }
 
+/* ------------------------------------------------------------------ */
+/* 9-slice PNG background theme                                        */
+/* ------------------------------------------------------------------ */
+
+/* Decodes `path` via Imlib2 into a premultiplied-alpha cairo ARGB32
+ * surface (Imlib2's DATA32 pixels are straight, not premultiplied --same
+ * conversion ewmh_get_icon_surface() does for _NET_WM_ICON). NULL on any
+ * failure (missing file, unreadable, decode error) -- callers treat that
+ * as "no image", not a fatal error: THEME's bg_image is meant to
+ * gracefully fall back to the plain bg_r/g/b/a color whenever it can't be
+ * loaded. */
+static cairo_surface_t *load_png_argb(const char *path)
+{
+    Imlib_Image img = imlib_load_image(path);
+    if (!img) {
+        return NULL;
+    }
+    imlib_context_set_image(img);
+    int iw = imlib_image_get_width();
+    int ih = imlib_image_get_height();
+    if (iw <= 0 || ih <= 0 || iw > 4096 || ih > 4096) {
+        imlib_free_image();
+        return NULL;
+    }
+    DATA32 *src = imlib_image_get_data_for_reading_only();
+    if (!src) {
+        imlib_free_image();
+        return NULL;
+    }
+
+    cairo_surface_t *surf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, iw, ih);
+    if (cairo_surface_status(surf) != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(surf);
+        imlib_free_image();
+        return NULL;
+    }
+    unsigned char *dst = cairo_image_surface_get_data(surf);
+    int stride = cairo_image_surface_get_stride(surf);
+    for (int y = 0; y < ih; y++) {
+        uint32_t *row = (uint32_t *)(void *)(dst + y * stride);
+        for (int x = 0; x < iw; x++) {
+            uint32_t argb = src[y * iw + x];
+            uint8_t a = (uint8_t)((argb >> 24) & 0xff);
+            uint8_t r = (uint8_t)((argb >> 16) & 0xff);
+            uint8_t g = (uint8_t)((argb >> 8) & 0xff);
+            uint8_t b = (uint8_t)(argb & 0xff);
+            r = (uint8_t)((r * a) / 255);
+            g = (uint8_t)((g * a) / 255);
+            b = (uint8_t)((b * a) / 255);
+            row[x] = ((uint32_t)a << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+        }
+    }
+    cairo_surface_mark_dirty(surf);
+    imlib_free_image();
+    return surf;
+}
+
+/* Sidecar "measurements" file for a 9-slice bg_image: plain key=value
+ * lines (left/top/right/bottom, pixels in the *source image*), same
+ * spirit as the rest of this program's config format. Missing file or
+ * missing keys just default that inset to 0 -- a 0-everywhere slice
+ * degrades to a plain full-image stretch, not an error, so a theme author
+ * can start simple. */
+static void load_slice_file(const char *path, int *l, int *t, int *r, int *b)
+{
+    *l = *t = *r = *b = 0;
+    if (!path[0]) {
+        return;
+    }
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "xispanel: could not open bg_slice file '%s', using 0-inset (full stretch)\n", path);
+        return;
+    }
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        int v;
+        if (sscanf(line, "left=%d", &v) == 1) {
+            *l = v;
+        } else if (sscanf(line, "top=%d", &v) == 1) {
+            *t = v;
+        } else if (sscanf(line, "right=%d", &v) == 1) {
+            *r = v;
+        } else if (sscanf(line, "bottom=%d", &v) == 1) {
+            *b = v;
+        }
+    }
+    fclose(f);
+}
+
+/* Loads (or reloads) p's bg_image_surface + slice insets from its
+ * currently configured bg_image_path/bg_slice_path. Called once from
+ * panel_activate() -- config paths don't change without a full RELOAD,
+ * which tears down and re-activates every panel anyway. */
+static void panel_load_bg_image(Panel *p)
+{
+    if (p->bg_image_surface) {
+        cairo_surface_destroy(p->bg_image_surface);
+        p->bg_image_surface = NULL;
+    }
+    if (!p->bg_image_path[0]) {
+        return;
+    }
+    p->bg_image_surface = load_png_argb(p->bg_image_path);
+    if (!p->bg_image_surface) {
+        fprintf(stderr, "xispanel: panel '%s': could not load bg_image '%s', falling back to bg color\n", p->name,
+                p->bg_image_path);
+        return;
+    }
+    load_slice_file(p->bg_slice_path, &p->bg_slice_l, &p->bg_slice_t, &p->bg_slice_r, &p->bg_slice_b);
+}
+
+/* Paints one source sub-rectangle [sx,sy,sw,sh] of `src` into one
+ * destination rectangle [dx,dy,dw,dh] of `cr`, scaling to fit -- the one
+ * building block every corner/edge/center region of a 9-slice draw
+ * reduces to (corners just happen to have dw==sw, dh==sh, i.e. no
+ * scaling). */
+static void draw_slice_region(cairo_t *cr, cairo_surface_t *src, int sx, int sy, int sw, int sh, double dx, double dy,
+                               double dw, double dh)
+{
+    if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) {
+        return;
+    }
+    cairo_save(cr);
+    cairo_translate(cr, dx, dy);
+    cairo_scale(cr, dw / (double)sw, dh / (double)sh);
+    cairo_set_source_surface(cr, src, -sx, -sy);
+    cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_BILINEAR);
+    cairo_rectangle(cr, 0, 0, sw, sh);
+    cairo_clip(cr);
+    cairo_paint(cr);
+    cairo_restore(cr);
+}
+
+/* Draws `src` (sw x sh) into `cr`'s current (0,0)-(dw,dh) rect as a
+ * 9-slice: the l/t/r/b-pixel corners are copied unscaled, the four edge
+ * strips stretch along one axis, and the center stretches on both --
+ * standard border-image technique, letting one theme image cover any
+ * panel thickness/length instead of looking stretched-blurry at the
+ * corners. Insets are silently clamped if they don't fit inside the
+ * source image (a theme author's slice file shouldn't be able to corrupt
+ * rendering, just look wrong). */
+static void draw_9slice(cairo_t *cr, cairo_surface_t *src, int sw, int sh, int l, int t, int r, int b, double dw,
+                         double dh)
+{
+    if (l + r > sw) {
+        l = r = 0;
+    }
+    if (t + b > sh) {
+        t = b = 0;
+    }
+    int cw = sw - l - r; /* source center width/height */
+    int ch = sh - t - b;
+    double dcw = dw - l - r; /* dest center width/height (may go negative on a tiny panel) */
+    double dch = dh - t - b;
+    if (dcw < 0) {
+        dcw = 0;
+    }
+    if (dch < 0) {
+        dch = 0;
+    }
+
+    /* corners: unscaled */
+    draw_slice_region(cr, src, 0, 0, l, t, 0, 0, l, t);
+    draw_slice_region(cr, src, sw - r, 0, r, t, dw - r, 0, r, t);
+    draw_slice_region(cr, src, 0, sh - b, l, b, 0, dh - b, l, b);
+    draw_slice_region(cr, src, sw - r, sh - b, r, b, dw - r, dh - b, r, b);
+    /* edges: stretched along one axis */
+    draw_slice_region(cr, src, l, 0, cw, t, l, 0, dcw, t);
+    draw_slice_region(cr, src, l, sh - b, cw, b, l, dh - b, dcw, b);
+    draw_slice_region(cr, src, 0, t, l, ch, 0, t, l, dch);
+    draw_slice_region(cr, src, sw - r, t, r, ch, dw - r, t, r, dch);
+    /* center: stretched on both axes */
+    draw_slice_region(cr, src, l, t, cw, ch, l, t, dcw, dch);
+}
+
 static void panel_create_surface(Panel *p)
 {
     p->surface = cairo_xlib_surface_create(g_dpy, p->win, p->visual, p->w, p->h);
@@ -660,8 +836,22 @@ static void panel_repaint(Panel *p)
      * every ~800ms poll tick even with nothing visibly different). */
     cairo_save(p->buf_cr);
     cairo_set_operator(p->buf_cr, CAIRO_OPERATOR_SOURCE);
-    cairo_set_source_rgba(p->buf_cr, p->bg_r, p->bg_g, p->bg_b, p->bg_a);
-    cairo_paint(p->buf_cr);
+    if (p->bg_image_surface) {
+        /* Clear first: the 9-slice draw below is itself CAIRO_OPERATOR_SOURCE
+         * per region, but only actually covers the panel rect once (no
+         * overlap/gaps by construction), so no separate clear is needed --
+         * kept anyway for a defined background on any 1px seam from
+         * floating-point scaling error. */
+        cairo_set_source_rgba(p->buf_cr, 0, 0, 0, 0);
+        cairo_paint(p->buf_cr);
+        int sw = cairo_image_surface_get_width(p->bg_image_surface);
+        int sh = cairo_image_surface_get_height(p->bg_image_surface);
+        draw_9slice(p->buf_cr, p->bg_image_surface, sw, sh, p->bg_slice_l, p->bg_slice_t, p->bg_slice_r,
+                    p->bg_slice_b, p->w, p->h);
+    } else {
+        cairo_set_source_rgba(p->buf_cr, p->bg_r, p->bg_g, p->bg_b, p->bg_a);
+        cairo_paint(p->buf_cr);
+    }
     cairo_restore(p->buf_cr);
 
     cairo_set_operator(p->buf_cr, CAIRO_OPERATOR_OVER);
@@ -830,6 +1020,10 @@ static void panel_destroy_widgets(Panel *p)
 static void panel_deactivate(Panel *p)
 {
     panel_destroy_widgets(p);
+    if (p->bg_image_surface) {
+        cairo_surface_destroy(p->bg_image_surface);
+        p->bg_image_surface = NULL;
+    }
     if (p->buf_cr) {
         cairo_destroy(p->buf_cr);
         p->buf_cr = NULL;
@@ -864,6 +1058,7 @@ static void panel_activate(Panel *p)
 {
     panel_resolve_geometry(p);
     panel_pick_visual(p);
+    panel_load_bg_image(p);
 
     int start_x = p->x, start_y = p->y;
     p->ah_state = AH_HIDDEN;
@@ -1026,6 +1221,14 @@ static void apply_theme_kv(Panel *p, const char *kvline)
         parse_hex_color(buf, &p->fg_r, &p->fg_g, &p->fg_b, &p->fg_a);
     }
     p->spacing = kv_get_int(kvline, "spacing", p->spacing);
+    /* Optional 9-slice background image, replacing the bg_r/g/b/a color
+     * above entirely once it loads (panel_load_bg_image(), called from
+     * panel_activate() -- not here, since that needs Imlib2/an open X
+     * display that may not exist yet while just parsing config text).
+     * bg_slice is the (also optional) sidecar measurements file; missing
+     * it just means a plain full-image stretch, not an error. */
+    kv_get(kvline, "bg_image", p->bg_image_path, sizeof(p->bg_image_path));
+    kv_get(kvline, "bg_slice", p->bg_slice_path, sizeof(p->bg_slice_path));
 }
 
 static void load_config(void)

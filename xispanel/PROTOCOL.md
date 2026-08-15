@@ -183,6 +183,56 @@ THEME	top	bg=#202020cc	fg=#eeeeee	spacing=6
   for the context menu and hover tooltip popups (see below) -- there's
   one color scheme per panel, not a separate one for its popups.
 - `spacing`: pixels of gap between adjacent widgets (default `4`).
+- `bg_image`: path to a PNG to use as the panel's background instead of
+  the solid `bg` color, sliced 9-slice-style (see "PNG bitmap themes"
+  below). If the file doesn't exist or fails to decode, xispanel logs a
+  warning and falls back to the plain `bg`/`fg` color scheme -- a missing
+  or broken theme file is never a startup-blocking error.
+- `bg_slice`: path to that image's (optional) measurements sidecar file.
+  Ignored if `bg_image` isn't set or didn't load. Missing/unreadable just
+  means every inset defaults to 0 (a plain full-image stretch), not an
+  error.
+
+## PNG bitmap themes
+
+`bg_image` replaces a panel's solid background color with a PNG,
+9-slice-sliced to fit any panel thickness/length without looking
+stretched-blurry at the corners: the image's four corners (sized by
+`bg_slice`'s `left`/`top`/`right`/`bottom`, in source-image pixels) are
+copied unscaled, the four edge strips between them stretch along one axis
+each, and the middle stretches on both -- standard border-image
+technique, also used by tint2, GTK, and CSS `border-image`. Real
+per-pixel alpha in the PNG works exactly like `bg`'s `#RRGGBBAA` does:
+visible transparency wherever a compositor is running, fully opaque
+otherwise.
+
+`bg_slice` is a tiny standalone text file (not part of `xispanel.conf`,
+so a PNG + its measurements travel together as a shareable pair):
+
+```
+left=12
+top=12
+right=12
+bottom=12
+```
+
+Any key can be omitted (defaults to `0`, meaning that side has no fixed
+corner/edge -- a 0-everywhere file is equivalent to a plain stretch, no
+9-slicing at all). Unknown lines are ignored.
+
+[`themes/template.png`](themes/template.png) +
+[`themes/template.slice`](themes/template.slice) are a starting point: a
+48x48 image with clearly color-coded, semi-transparent corner/edge/center
+regions and thin red guide lines exactly on the slice boundaries, so the
+9 regions are visible at a glance. Paint over it (or start fresh at
+whatever resolution you like) and delete the guide lines once you have a
+real theme -- `bg_slice`'s numbers, not the image's actual size, are what
+xispanel goes by, so the source image can be any resolution/aspect ratio.
+
+Only the panel background is themeable this way for now -- widget/popup
+chrome (buttons, tasklist rows, menu items) still draws with Cairo using
+the panel's `fg`/`bg` colors, not bitmap art. Extending 9-slice theming
+to those is a possible follow-up, not implemented yet.
 
 ## Context menus
 

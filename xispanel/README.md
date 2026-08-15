@@ -43,7 +43,12 @@ Imlib2 for image decoding -- the same dependency spirit as
   window, or its corner close icon to close it. Window thumbnails are a
   planned follow-up.
 - Basic theming: background/foreground color with alpha (real per-pixel
-  transparency when a compositor provides an ARGB visual), spacing.
+  transparency when a compositor provides an ARGB visual), spacing. A
+  panel's background can also be a 9-slice PNG instead of a solid color
+  (`bg_image=`/`bg_slice=` -- see [themes/](themes/) for a starting
+  template and [PROTOCOL.md](PROTOCOL.md)'s "PNG bitmap themes"), falling
+  back to the plain color scheme if the image is missing or fails to
+  load.
 - A control socket (see [PROTOCOL.md](PROTOCOL.md)) for `PING`,
   `GET_STATUS`, `RELOAD`, `QUIT`.
 
