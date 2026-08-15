@@ -33,7 +33,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define TOOLTIP_DELAY_MS 500
+/* Show-delay is per-panel and configurable (PANEL's tooltip_delay=<ms>,
+ * default 500, 0 = instant) -- see Panel::tooltip_delay_ms. */
 #define TOOLTIP_REFRESH_MS 1000 /* how often to re-poll get_tooltip() while shown */
 #define TOOLTIP_CLOSE_GRACE_MS 200 /* hover-intent window before an actual close */
 #define TOOLTIP_GAP 0 /* no dead zone between panel and popup, so the pointer
@@ -56,7 +57,8 @@ typedef struct {
 
 static TooltipPopup *g_popup = NULL;
 
-/* Hover target currently pending (waiting out TOOLTIP_DELAY_MS) or shown. */
+/* Hover target currently pending (waiting out its panel's tooltip_delay_ms)
+ * or shown. */
 static Panel *g_panel = NULL;
 static PanelWidget *g_widget = NULL;
 static int g_local_x = 0;
@@ -134,15 +136,16 @@ static int measure_lines(cairo_t *cr, char lines[TOOLTIP_MAX_LINES][128], int *o
 
 static void paint_popup(void)
 {
-    if (!g_popup) {
+    if (!g_popup || !g_panel) {
         return;
     }
+    Panel *p = g_panel;
     cairo_t *cr = g_popup->cr;
     cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
-    cairo_set_source_rgba(cr, 0.12, 0.12, 0.12, 0.97);
+    cairo_set_source_rgba(cr, p->bg_r, p->bg_g, p->bg_b, p->bg_a);
     cairo_paint(cr);
     cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
-    cairo_set_source_rgba(cr, 1, 1, 1, 0.15);
+    cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.15);
     cairo_rectangle(cr, 0.5, 0.5, g_popup->width - 1, g_popup->height - 1);
     cairo_set_line_width(cr, 1);
     cairo_stroke(cr);
@@ -157,7 +160,7 @@ static void paint_popup(void)
     int n = measure_lines(cr, lines, &text_w, &h);
     double line_h = TOOLTIP_FONT_SIZE * 1.4;
 
-    cairo_set_source_rgba(cr, 0.93, 0.93, 0.93, 1.0);
+    cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, p->fg_a);
     for (int i = 0; i < n; i++) {
         cairo_text_extents_t ext;
         cairo_text_extents(cr, lines[i], &ext);
@@ -169,7 +172,7 @@ static void paint_popup(void)
     if (g_closable) {
         double cx = g_popup->close_x, cy = g_popup->close_y;
         double s = TOOLTIP_CLOSE_ICON;
-        cairo_set_source_rgba(cr, 1, 1, 1, 0.85);
+        cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.85);
         cairo_set_line_width(cr, 1.4);
         cairo_move_to(cr, cx + 3, cy + 3);
         cairo_line_to(cr, cx + s - 3, cy + s - 3);
@@ -387,7 +390,7 @@ void tooltip_tick(uint64_t now)
         return;
     }
     if (!g_shown) {
-        if (now - g_since_ms >= TOOLTIP_DELAY_MS) {
+        if (now - g_since_ms >= (uint64_t)g_panel->tooltip_delay_ms) {
             show_popup();
         }
         return;
@@ -407,7 +410,8 @@ uint64_t tooltip_next_wake_ms(void)
         wake = g_close_deadline_ms;
     }
     if (g_widget) {
-        uint64_t w2 = g_shown ? (g_last_refresh_ms + TOOLTIP_REFRESH_MS) : (g_since_ms + TOOLTIP_DELAY_MS);
+        uint64_t w2 = g_shown ? (g_last_refresh_ms + TOOLTIP_REFRESH_MS)
+                               : (g_since_ms + (uint64_t)g_panel->tooltip_delay_ms);
         if (wake == 0 || w2 < wake) {
             wake = w2;
         }

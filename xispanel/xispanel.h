@@ -104,6 +104,9 @@ struct Panel {
      * upside down; 90/270 on a top panel turns its (normally wide/short)
      * content sideways to fit the same footprint. See panel_repaint(). */
     int rotate;
+    /* ms of hover over a widget before its tooltip appears (0 = instant).
+     * See tooltip.c. */
+    int tooltip_delay_ms;
 
     /* theme */
     double bg_r, bg_g, bg_b, bg_a;

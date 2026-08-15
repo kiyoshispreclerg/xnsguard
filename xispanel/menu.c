@@ -68,8 +68,9 @@ static void panel_menu_paint(void)
     if (!m) {
         return;
     }
+    Panel *p = m->owner_panel;
     cairo_set_operator(m->cr, CAIRO_OPERATOR_SOURCE);
-    cairo_set_source_rgba(m->cr, 0.15, 0.15, 0.15, 0.97);
+    cairo_set_source_rgba(m->cr, p->bg_r, p->bg_g, p->bg_b, p->bg_a);
     cairo_paint(m->cr);
     cairo_set_operator(m->cr, CAIRO_OPERATOR_OVER);
     if (g_font_face) {
@@ -80,7 +81,7 @@ static void panel_menu_paint(void)
         int y = i * m->item_h;
         MenuItem *it = &m->items[i];
         if (it->is_separator) {
-            cairo_set_source_rgba(m->cr, 1, 1, 1, 0.15);
+            cairo_set_source_rgba(m->cr, p->fg_r, p->fg_g, p->fg_b, 0.15);
             cairo_move_to(m->cr, 6, y + m->item_h / 2.0);
             cairo_line_to(m->cr, m->width - 6, y + m->item_h / 2.0);
             cairo_set_line_width(m->cr, 1);
@@ -88,11 +89,11 @@ static void panel_menu_paint(void)
             continue;
         }
         if (i == m->hover_index && it->enabled) {
-            cairo_set_source_rgba(m->cr, 1, 1, 1, 0.12);
+            cairo_set_source_rgba(m->cr, p->fg_r, p->fg_g, p->fg_b, 0.12);
             cairo_rectangle(m->cr, 0, y, m->width, m->item_h);
             cairo_fill(m->cr);
         }
-        cairo_set_source_rgba(m->cr, 1, 1, 1, it->enabled ? 0.95 : 0.4);
+        cairo_set_source_rgba(m->cr, p->fg_r, p->fg_g, p->fg_b, it->enabled ? 0.95 : 0.4);
         cairo_text_extents_t ext;
         cairo_text_extents(m->cr, it->label, &ext);
         cairo_move_to(m->cr, 10, y + (m->item_h - ext.height) / 2.0 - ext.y_bearing);

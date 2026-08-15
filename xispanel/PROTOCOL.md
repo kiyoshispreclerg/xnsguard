@@ -98,6 +98,9 @@ PANEL	top	*	edge=top	pct=100	thickness=32	mode=dock
   horizontal panel would draw, just rotated a quarter turn. Popups
   (context menu, tooltip) are never rotated -- they render normally just
   outside the panel either way.
+- `tooltip_delay`: milliseconds of hover over a widget before its tooltip
+  appears (default `500`). `0` makes it instant. Only matters for widgets
+  that implement a tooltip at all -- see "Hover tooltips" below.
 
 ### `WIDGET`
 
@@ -176,7 +179,9 @@ THEME	top	bg=#202020cc	fg=#eeeeee	spacing=6
 
 - `bg`, `fg`: `#RRGGBB` or `#RRGGBBAA` (alpha only has a visible effect if
   the X server has a 32-bit ARGB visual available, i.e. a compositor is
-  running -- otherwise the background renders fully opaque).
+  running -- otherwise the background renders fully opaque). Also used
+  for the context menu and hover tooltip popups (see below) -- there's
+  one color scheme per panel, not a separate one for its popups.
 - `spacing`: pixels of gap between adjacent widgets (default `4`).
 
 ## Context menus
@@ -201,12 +206,16 @@ coordinates -- same convention plasmashell's taskbar context menus use.
 Any widget can opt into a hover tooltip by implementing
 `PanelWidgetOps.get_tooltip()` (optional -- widgets that don't are
 unaffected, `spacer` doesn't implement it). After the pointer sits over a
-widget (or one of its sub-items, e.g. one `tasklist` button) for ~500ms, a
-small popup appears with whatever text the widget reports -- glued to the
-panel's outer edge and aligned with that specific item, the same
-plasmashell-style positioning context menus use, so it never overlaps the
-panel itself. Content refreshes about once a second while shown, so e.g.
-`clock`'s tooltip keeps ticking even if the pointer doesn't move.
+widget (or one of its sub-items, e.g. one `tasklist` button) for the
+panel's `tooltip_delay` (default 500ms, `0` = instant -- see `PANEL`
+above), a small popup appears with whatever text the widget reports --
+glued to the panel's outer edge and aligned with that specific item, the
+same plasmashell-style positioning context menus use, so it never
+overlaps the panel itself, and painted with the panel's own `bg`/`fg`
+theme colors (same as the context menu -- one color scheme per panel, not
+a separate one for its popups). Content refreshes about once a second
+while shown, so e.g. `clock`'s tooltip keeps ticking even if the pointer
+doesn't move.
 
 Unlike the context menu, the tooltip takes no pointer/keyboard grab --
 it's meant to coexist with normal desktop interaction, not take it over.
