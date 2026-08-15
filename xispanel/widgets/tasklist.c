@@ -52,6 +52,7 @@ typedef struct {
                         * whole button height. See icon_size_for(). */
     int show_thumbs; /* 1 = tooltip includes a live thumbnail of the hovered task's window (see thumb.c);
                        * no-op if xispanel was built without libXcomposite or no compositor is running. */
+    int show_desktop_badge; /* 1 = draw the task's virtual-desktop number on its icon; 0 (default) = don't. */
     TaskEntry tasks[MAX_TASKS];
     int n_tasks;
     int n_desktops;
@@ -95,6 +96,7 @@ static int tasklist_init(PanelWidget *w)
         tp->icon_padding = 0;
     }
     tp->show_thumbs = kv_get(w->config_kv, "show_thumbs", buf, sizeof(buf)) && strcmp(buf, "yes") == 0;
+    tp->show_desktop_badge = kv_get(w->config_kv, "show_desktop_badge", buf, sizeof(buf)) && strcmp(buf, "yes") == 0;
     tp->n_desktops = 1;
     w->next_tick_ms = now_ms();
     return 0;
@@ -409,7 +411,7 @@ static void tasklist_paint(PanelWidget *w, cairo_t *cr)
             cairo_arc(cr, bx + icon_px + 2, icon_y + 2, 2.5, 0, 2 * 3.14159265);
             cairo_fill(cr);
         }
-        if (tp->n_desktops > 1 && e->desktop >= 0) {
+        if (tp->show_desktop_badge && tp->n_desktops > 1 && e->desktop >= 0) {
             char badge[16];
             snprintf(badge, sizeof(badge), "%d", e->desktop + 1);
             double badge_fs = w->thickness * 0.28;

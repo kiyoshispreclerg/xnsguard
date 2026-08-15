@@ -131,8 +131,10 @@ Widget types implemented so far:
   top-level window from `_NET_CLIENT_LIST`, refreshed by polling every
   ~800ms. `wide` draws icon+title (Windows XP style, titles truncated
   with an ellipsis and capped at 180px); `compact` draws icon only
-  (Windows 7 style). A small desktop-number badge is drawn on a task's
-  icon when the session has more than one virtual desktop. Every visible
+  (Windows 7 style). `show_desktop_badge=yes|no` (default `no`) draws a
+  small desktop-number badge on a task's icon when the session has more
+  than one virtual desktop; off by default to keep icons uncluttered.
+  Every visible
   task's on-screen button rectangle is also written to its window's
   `_NET_WM_ICON_GEOMETRY` on every repaint -- the same property KWin/
   Compiz/etc. read to decide where a minimize/unminimize animation should
