@@ -114,7 +114,10 @@ WIDGET	top	1	clock	format=%H:%M	tz=America/Sao_Paulo
   order their `WIDGET` lines appear in the file, left-to-right (or
   top-to-bottom for a vertical panel).
 - `<type>`: one of the registered widget types (see below).
-- remaining fields: widget-specific `key=value` options.
+- remaining fields: widget-specific `key=value` options. A value may be
+  wrapped in double quotes to embed spaces, e.g. `launcher`'s
+  `cmd="xterm -e htop"` -- there's no escaping inside the quotes (a value
+  can't contain a literal `"`), which nothing needs so far.
 
 Widget types implemented so far:
 
@@ -181,10 +184,18 @@ Widget types implemented so far:
   "System tray (StatusNotifierItem)" below for how registration/hosting
   works. No dependency on `libdbus-1` at build *link* time -- see MPRIS's
   note on optional runtime deps, same mechanism (`sni.c`).
+- `launcher`: a single generic clickable icon -- `icon=<path>` (any
+  format Imlib2 can decode; falls back to a single-letter placeholder
+  derived from `name` if missing or it fails to load), `name=<text>`
+  (hover tooltip, and the fallback placeholder's letter), `cmd=<command>`
+  (run via `sh -c` on left-click, detached -- quote it if it needs
+  spaces, e.g. `cmd="xterm -e htop"`). Deliberately not a full
+  `.desktop`-aware application launcher (no parsing, no icon-theme
+  lookup, no search) -- multiple `launcher` widgets is how the user pins
+  individual shortcuts today; that's future launcher-phase territory.
 
-More widget types (global menu, launcher, system monitor) are later
-phases -- see the plan this tool was built from; they are not implemented
-yet.
+More widget types (global menu, system monitor) are later phases -- see
+the plan this tool was built from; they are not implemented yet.
 
 ### Widget sizing
 
@@ -456,9 +467,9 @@ own file" structure:
 - `sni.c`: the optional (dlopen'd libdbus-1) StatusNotifierItem tray
   client+host described above.
 - `widgets/spacer.c`, `widgets/clock.c`, `widgets/tasklist.c`,
-  `widgets/winctl.c`, `widgets/tray.c`: one file per widget type. Adding a
-  new type is "write `widgets/foo.c` defining a `PanelWidgetOps foo_ops`,
-  declare it `extern` in `xispanel.h`, add it to
+  `widgets/winctl.c`, `widgets/tray.c`, `widgets/launcher.c`: one file per
+  widget type. Adding a new type is "write `widgets/foo.c` defining a
+  `PanelWidgetOps foo_ops`, declare it `extern` in `xispanel.h`, add it to
   the registry array in `xispanel.c`" -- no other file needs to change.
 
 ## Design notes

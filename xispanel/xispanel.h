@@ -186,6 +186,19 @@ int kv_get_int(const char *kvline, const char *key, int defval);
  * orientation (horizontal panels lay widgets out along x, vertical panels
  * along y). */
 void widget_get_rect(const PanelWidget *w, int *x, int *y, int *width, int *height);
+/* Decodes any format Imlib2 understands (PNG, SVG if librsvg's loader is
+ * present at runtime, etc.) into a premultiplied-alpha ARGB32 Cairo
+ * surface, or NULL on any failure (missing file, decode error, larger
+ * than 4096px either side). Used for the panel's own 9-slice background
+ * (see panel_load_bg_image()) and available to any widget that wants to
+ * load an image of its own, e.g. `launcher`'s icon= key. */
+cairo_surface_t *load_png_argb(const char *path);
+/* Runs `cmd` via `sh -c`, detached (double-forked via setsid()) and never
+ * waited on -- SIGCHLD is set to SIG_IGN in main() so the child is
+ * auto-reaped by the kernel instead of becoming a zombie, same pattern
+ * xisback's run_action() uses for its own click actions. No-op if `cmd`
+ * is NULL/empty. */
+void run_detached(const char *cmd);
 
 /* ---- WM-type / strut atoms widgets/menu may need (ewmh.c) ---- */
 extern Atom g_atom_wm_window_type;
@@ -305,5 +318,6 @@ extern const PanelWidgetOps clock_ops;
 extern const PanelWidgetOps tasklist_ops;
 extern const PanelWidgetOps winctl_ops;
 extern const PanelWidgetOps tray_ops;
+extern const PanelWidgetOps launcher_ops;
 
 #endif

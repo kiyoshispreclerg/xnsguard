@@ -30,9 +30,11 @@ Imlib2 for image decoding -- the same dependency spirit as
   to a scrollable strip with an up/down arrow pair when it doesn't fit),
   `winctl` (active window's icon/title + configurable
   minimize/maximize/close buttons, similar to KDE's Active Window Control
-  -- see [PROTOCOL.md](PROTOCOL.md)), and `tray` (StatusNotifierItem
-  system tray -- xispanel becomes the `StatusNotifierWatcher` if none
-  exists yet, or coexists as a second host if one already does).
+  -- see [PROTOCOL.md](PROTOCOL.md)), `tray` (StatusNotifierItem system
+  tray -- xispanel becomes the watcher if none exists yet, or coexists as
+  a second host if one already does), and `launcher` (a single
+  user-defined clickable icon: `icon=`/`name=`/`cmd=`, no `.desktop`
+  parsing).
 - Widgets that don't fit the panel's available space shrink toward a
   per-type minimum instead of overflowing it (see PROTOCOL.md's "Widget
   sizing").

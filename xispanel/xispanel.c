@@ -124,8 +124,13 @@ uint64_t now_ms(void)
 }
 
 /* Looks up "key=value" inside a whitespace-separated token line (the tail
- * of a PANEL/WIDGET/THEME config record, or a widget's own config_kv).
- * Returns 1 if found. */
+ * of a PANEL/WIDGET/THEME config record, or a widget's own config_kv). A
+ * value may be wrapped in double quotes to embed spaces (e.g. launcher's
+ * `cmd="xterm -e htop"`) -- everything between the quotes, unparsed, is
+ * treated as one token, and the surrounding quotes themselves are
+ * stripped from the returned value. No escaping inside quotes (a value
+ * can't contain a literal `"`); not needed by anything so far. Returns 1
+ * if found. */
 int kv_get(const char *kvline, const char *key, char *out, size_t outsz)
 {
     if (!kvline) {
@@ -141,16 +146,25 @@ int kv_get(const char *kvline, const char *key, char *out, size_t outsz)
             break;
         }
         const char *tok_start = p;
-        while (*p && *p != ' ' && *p != '\t') {
+        int in_quotes = 0;
+        while (*p && (in_quotes || (*p != ' ' && *p != '\t'))) {
+            if (*p == '"') {
+                in_quotes = !in_quotes;
+            }
             p++;
         }
         size_t tok_len = (size_t)(p - tok_start);
         if (tok_len > keylen && tok_start[keylen] == '=' && strncmp(tok_start, key, keylen) == 0) {
+            const char *val_start = tok_start + keylen + 1;
             size_t vlen = tok_len - keylen - 1;
+            if (vlen >= 2 && val_start[0] == '"' && val_start[vlen - 1] == '"') {
+                val_start++;
+                vlen -= 2;
+            }
             if (vlen >= outsz) {
                 vlen = outsz - 1;
             }
-            memcpy(out, tok_start + keylen + 1, vlen);
+            memcpy(out, val_start, vlen);
             out[vlen] = 0;
             return 1;
         }
@@ -251,6 +265,7 @@ static const PanelWidgetOps *g_widget_registry[] = {
     &tasklist_ops,
     &winctl_ops,
     &tray_ops,
+    &launcher_ops,
     NULL,
 };
 
@@ -541,7 +556,24 @@ static Window panel_create_sensor(Panel *p)
  * as "no image", not a fatal error: THEME's bg_image is meant to
  * gracefully fall back to the plain bg_r/g/b/a color whenever it can't be
  * loaded. */
-static cairo_surface_t *load_png_argb(const char *path)
+void run_detached(const char *cmd)
+{
+    if (!cmd || !cmd[0]) {
+        return;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("xispanel: fork");
+        return;
+    }
+    if (pid == 0) {
+        setsid();
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+}
+
+cairo_surface_t *load_png_argb(const char *path)
 {
     Imlib_Image img = imlib_load_image(path);
     if (!img) {
@@ -1513,6 +1545,10 @@ static int run_as_daemon(const char *sockpath)
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
     signal(SIGPIPE, SIG_IGN);
+    /* run_detached()'s children (launcher widget clicks) are never
+     * waitpid()'d -- ignoring SIGCHLD makes the kernel reap them itself
+     * instead of leaving zombies, same pattern xisback uses. */
+    signal(SIGCHLD, SIG_IGN);
     fcntl(listenfd, F_SETFD, FD_CLOEXEC);
     fcntl(ConnectionNumber(g_dpy), F_SETFD, FD_CLOEXEC);
 
