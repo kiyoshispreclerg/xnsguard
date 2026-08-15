@@ -171,8 +171,15 @@ Widget types implemented so far:
   active window doesn't match -- e.g. `same_output=yes` on a per-output
   panel hides icon/title/buttons while focus is on another monitor,
   instead of showing controls for a window this panel doesn't "own".
-  Polls `_NET_ACTIVE_WINDOW` every ~300ms, same tradeoff as `tasklist`'s
-  polling.
+  `width=<px>` (default unset -- auto width, the widget grows with the
+  title's length up to 220px, then grows again when the buttons become
+  visible) pins the widget to always exactly that many pixels wide
+  instead: the title is ellipsized into whatever room icon+buttons leave,
+  and shows nothing at all if there's no room left, rather than ever
+  resizing the widget itself -- keeps whatever's drawn after `winctl` in
+  the panel from shifting position every time the active window or its
+  maximized state changes. Polls `_NET_ACTIVE_WINDOW` every ~300ms, same
+  tradeoff as `tasklist`'s polling.
 - `tray`: one square icon button per active StatusNotifierItem (the
   `org.kde.StatusNotifierItem`/`org.freedesktop.StatusNotifierItem`
   DBus protocol used by every modern tray -- KDE, GNOME's legacy

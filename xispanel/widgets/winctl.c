@@ -25,6 +25,9 @@ typedef struct {
     int side_start;  /* 1 = buttons before the icon/title, 0 = after (default) */
     int same_desktop_only; /* 1 = only show controls while the active window is on this panel's desktop */
     int same_output_only;  /* 1 = only show controls while the active window is on this panel's output */
+    int fixed_width; /* 0 = auto (grows/shrinks with title length and button visibility, old behavior);
+                       * >0 = always exactly this wide -- title is ellipsized to fit instead, including
+                       * shrinking further when the buttons show/hide, so neighboring widgets never shift. */
 
     Window active_win;
     int active_applies; /* active_win != None and passes same_desktop_only/same_output_only */
@@ -74,6 +77,7 @@ static int winctl_init(PanelWidget *w)
     wp->side_start = kv_get(w->config_kv, "side", buf, sizeof(buf)) && strcmp(buf, "start") == 0;
     wp->same_desktop_only = kv_get(w->config_kv, "same_desktop", buf, sizeof(buf)) && strcmp(buf, "yes") == 0;
     wp->same_output_only = kv_get(w->config_kv, "same_output", buf, sizeof(buf)) && strcmp(buf, "yes") == 0;
+    wp->fixed_width = kv_get_int(w->config_kv, "width", 0);
 
     wp->active_win = None;
     w->next_tick_ms = now_ms();
@@ -138,6 +142,15 @@ static void winctl_measure(PanelWidget *w, int cross_axis, int *out_len, int *ou
     if (!wp->active_applies) {
         *out_len = 0;
         *out_min_len = 0;
+        return;
+    }
+
+    if (wp->fixed_width > 0) {
+        /* Always exactly this wide regardless of title length or
+         * whether the buttons are currently shown -- winctl_paint()
+         * ellipsizes the title into whatever room that leaves instead. */
+        *out_len = wp->fixed_width;
+        *out_min_len = wp->fixed_width;
         return;
     }
 
@@ -207,7 +220,12 @@ static void winctl_paint(PanelWidget *w, cairo_t *cr)
     }
     tx += icon_px + 8;
 
-    if (wp->title[0]) {
+    /* When width= is tight enough that icon+buttons alone eat the whole
+     * fixed width, there's no room left for any title text at all --
+     * trim_to_width() leaves a string untouched when max_width <= 0
+     * (nothing to shrink *to*), so skip drawing entirely rather than
+     * overflow into the buttons. */
+    if (wp->title[0] && content_end - tx - 8 > 0) {
         char label[160];
         snprintf(label, sizeof(label), "%s", wp->title);
         cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.95);
