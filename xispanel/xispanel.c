@@ -68,6 +68,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <locale.h>
+#include <math.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -166,21 +167,29 @@ int kv_get_int(const char *kvline, const char *key, int defval)
     return defval;
 }
 
-/* Real window-space rectangle for a widget, accounting for panel
- * orientation (horizontal panels lay widgets out along x, vertical panels
- * along y). Widgets that don't care about orientation (most of them) just
- * call this once from paint()/on_button(). */
+/* Local-frame rectangle for a widget to paint into: origin always at
+ * (0,0), since panel_repaint() already translates+rotates the cairo_t
+ * before calling paint() -- a widget never needs to know its own on-panel
+ * position, the panel's edge, or its rotate angle.
+ *
+ * The *shape* reported still depends on both: at rotate 0/180 a widget
+ * gets its panel's natural physical shape (wide/short for top/bottom,
+ * narrow/tall for left/right); at 90/270 that shape is transposed, since
+ * panel_repaint() rotates a quarter turn to fit the *same* physical
+ * footprint with width and height swapped. Every widget (text, icons,
+ * buttons, everything) therefore renders "rotated" for free with zero
+ * orientation-specific code -- see the comment above panel_repaint(). */
 void widget_get_rect(const PanelWidget *w, int *x, int *y, int *width, int *height)
 {
     Panel *p = w->panel;
-    if (p->edge == EDGE_TOP || p->edge == EDGE_BOTTOM) {
-        *x = w->x;
-        *y = 0;
+    int natural_horizontal = (p->edge == EDGE_TOP || p->edge == EDGE_BOTTOM);
+    int transposed = (p->rotate == 90 || p->rotate == 270);
+    *x = 0;
+    *y = 0;
+    if (natural_horizontal != transposed) {
         *width = w->len;
         *height = w->thickness;
     } else {
-        *x = 0;
-        *y = w->x;
         *width = w->thickness;
         *height = w->len;
     }
@@ -660,6 +669,39 @@ static void panel_repaint(Panel *p)
         PanelWidget *w = &p->widgets[i];
         if (w->ops->paint) {
             cairo_save(p->buf_cr);
+            /* This widget's real, physical, un-rotated on-panel rectangle
+             * -- same shape widget_get_rect() always used to report
+             * before rotation existed. Rotating *about its center* by any
+             * multiple of 90 degrees is what lets one formula handle
+             * every edge/angle combination: at 0/180 the content shape
+             * equals this rect; at 90/270 it's this rect transposed (see
+             * widget_get_rect()), and rotating that transposed shape
+             * about the same center lands it back on exactly this
+             * footprint. Click/tooltip/menu hit-testing never sees any of
+             * this -- it works from the panel's real physical layout the
+             * whole time, so it's completely unaffected by rotation. */
+            int px, py, pw, ph;
+            if (p->edge == EDGE_TOP || p->edge == EDGE_BOTTOM) {
+                px = w->x;
+                py = 0;
+                pw = w->len;
+                ph = w->thickness;
+            } else {
+                px = 0;
+                py = w->x;
+                pw = w->thickness;
+                ph = w->len;
+            }
+            double cx = px + pw / 2.0;
+            double cy = py + ph / 2.0;
+            int transposed = (p->rotate == 90 || p->rotate == 270);
+            double content_w = transposed ? ph : pw;
+            double content_h = transposed ? pw : ph;
+            cairo_translate(p->buf_cr, cx, cy);
+            if (p->rotate) {
+                cairo_rotate(p->buf_cr, p->rotate * M_PI / 180.0);
+            }
+            cairo_translate(p->buf_cr, -content_w / 2.0, -content_h / 2.0);
             w->ops->paint(w, p->buf_cr);
             cairo_restore(p->buf_cr);
         }
@@ -957,6 +999,15 @@ static void apply_panel_kv(Panel *p, const char *kvline)
     p->thickness_cfg = kv_get_int(kvline, "thickness", p->thickness_cfg);
     if (kv_get(kvline, "mode", buf, sizeof(buf))) {
         p->mode = parse_mode(buf);
+    }
+    if (kv_get(kvline, "rotate", buf, sizeof(buf))) {
+        int r = atoi(buf);
+        if (r == 0 || r == 90 || r == 180 || r == 270) {
+            p->rotate = r;
+        } else {
+            fprintf(stderr, "xispanel: panel '%s': invalid rotate=%s (must be 0, 90, 180, or 270), ignoring\n",
+                    p->name, buf);
+        }
     }
 }
 

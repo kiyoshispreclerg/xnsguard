@@ -98,6 +98,12 @@ struct Panel {
     int pct; /* 0-100 */
     int thickness_cfg;
     enum panel_mode mode;
+    /* 0/90/180/270: rotates every widget's content as a rigid whole
+     * around the center of its on-panel slot. Works on any edge (not
+     * just left/right) -- e.g. 180 on a top panel just flips its content
+     * upside down; 90/270 on a top panel turns its (normally wide/short)
+     * content sideways to fit the same footprint. See panel_repaint(). */
+    int rotate;
 
     /* theme */
     double bg_r, bg_g, bg_b, bg_a;

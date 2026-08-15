@@ -85,6 +85,19 @@ PANEL	top	*	edge=top	pct=100	thickness=32	mode=dock
   `overlay` (floats on top, no reserved space) | `autohide` (overlay,
   slides in on hover over a thin edge sensor and back out shortly after
   the pointer leaves). Default `dock`.
+- `rotate`: `0` | `90` | `180` | `270` (default `0`). Rotates every
+  widget's content as a rigid whole around the center of its on-panel
+  slot -- works on *any* edge, not just left/right: `180` on a top panel
+  just flips its content upside down; `90`/`270` on a top panel turns its
+  (normally wide/short) content sideways to fit the same footprint. Most
+  useful case: by default a `left`/`right` panel's widgets render upright
+  and stacked (readable head-on, but text gets cramped into the panel's
+  thickness -- fine for icon-only/compact widgets, poor for `clock`'s or
+  `tasklist`'s wide-mode text); `rotate=90` or `rotate=270` turns that
+  content sideways to read along the panel instead, same content a
+  horizontal panel would draw, just rotated a quarter turn. Popups
+  (context menu, tooltip) are never rotated -- they render normally just
+  outside the panel either way.
 
 ### `WIDGET`
 
@@ -293,6 +306,25 @@ own file" structure:
   outright if it ever ends up in an error state anyway -- defense in
   depth, since a single bad frame blanking a panel forever would be a
   much worse failure mode than one widget occasionally not repainting.
+- `widget_get_rect()` always returns a *local*, `(0,0)`-anchored
+  rectangle -- a widget never knows its own on-panel position, the
+  panel's edge, or its `rotate` angle. `panel_repaint()` computes each
+  widget's real physical on-panel rectangle, then does
+  `cairo_translate` (to its center) + `cairo_rotate(rotate degrees)` +
+  `cairo_translate` (back by half the *possibly-transposed* content
+  size) around its `paint()` call -- rotating about the rect's own
+  center is what makes one formula handle every edge/angle combination
+  without special-casing any of the four angles. This is also why
+  `rotate` needs zero per-widget code: at 90/270 `widget_get_rect()`
+  reports that physical rectangle transposed (width/height swapped), so
+  every widget (text, icons, `tasklist`'s scroll arrows, `winctl`'s
+  buttons) paints exactly as it always does into what it thinks is an
+  ordinary axis-aligned strip -- the rotation is a rigid transform of
+  that same drawing, applied once, outside any widget's knowledge.
+  Hit-testing (`dispatch_button`'s `local_x`, `tasklist`'s per-button
+  indices) is computed from the panel's real, physical, *unrotated*
+  main-axis extent and is therefore completely unaffected by this --
+  rotation is a rendering-only transform.
 - Every panel repaints into an offscreen `cairo_image_surface_t` first
   (`Panel::buf_surface`/`buf_cr`), then blits the finished frame onto the
   real, on-screen `cairo_xlib_surface_t` with a single `cairo_paint()`.

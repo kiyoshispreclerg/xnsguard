@@ -20,6 +20,9 @@ Imlib2 for image decoding -- the same dependency spirit as
   `_NET_WM_STRUT_PARTIAL`), `overlay` (floats above everything, no
   reserved space), `autohide` (overlay that slides in on hover and back
   out shortly after).
+- `rotate=0|90|180|270`: turns every widget's content sideways (or
+  upside down) as a rigid whole, on any edge -- e.g. a left/right panel's
+  text reading along the panel instead of cramped into its thickness.
 - A small widget system (compile-time registry, no plugins/dlopen), each
   type in its own file under [widgets/](widgets/): `spacer` (fixed or
   greedy/fill), `clock`, `tasklist` (EWMH-based, wide/compact modes,
