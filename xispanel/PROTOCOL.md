@@ -126,7 +126,16 @@ Widget types implemented so far:
   every greedy spacer on the panel. A greedy spacer before a fixed-size
   widget right-aligns everything after it.
 - `clock`: `format=<strftime format>` (default `%H:%M`). Updates once a
-  second. No timezone popup yet.
+  second. `tz=<IANA zone, e.g. America/Sao_Paulo>` (default: empty, meaning
+  the system's own configured zone) overrides just this widget's displayed
+  time -- e.g. a second panel/output showing a different zone. There's no
+  portable `localtime_r()`-in-an-arbitrary-zone call, so this uses the
+  standard workaround of pointing `TZ` at the target zone, calling
+  `tzset()`, reading the time, then restoring `TZ` exactly as it was.
+  `tooltip_tz=<zone1,zone2,...>` lists additional zones to show in the
+  tooltip, each as its own date+time block separated by a blank line;
+  without it the tooltip just shows one weekday/date/time block for the
+  widget's own zone (`tz=` or system default).
 - `tasklist`: `mode=wide|compact` (default `wide`). One button per
   top-level window from `_NET_CLIENT_LIST`, refreshed by polling every
   ~800ms. `wide` draws icon+title (Windows XP style, titles truncated
