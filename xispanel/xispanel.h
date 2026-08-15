@@ -312,6 +312,21 @@ void sni_activate(int idx, int x, int y); /* left click */
 void sni_secondary_activate(int idx, int x, int y); /* middle click */
 void sni_context_menu(int idx, int x, int y); /* right click */
 
+/* ---- volume control: shells out to `pactl`, no libpulse linked (pulse.c) ----
+ *
+ * Unconditionally compiled (no headers/library needed to build this file
+ * at all) -- pulse_available() is a runtime-only check for whether the
+ * `pactl` binary exists in $PATH, cached after the first call. Every
+ * other function here is a no-op / reports failure if it doesn't. */
+int pulse_available(void);
+/* 1 on success, filling *out_pct (0-100ish, PulseAudio allows >100 with
+ * boosted volume) and *out_muted. `sink`/`source` are pactl device
+ * names/indices, or the literal "@DEFAULT_SINK@"/"@DEFAULT_SOURCE@". */
+int pulse_get_sink_state(const char *sink, int *out_pct, int *out_muted);
+int pulse_get_source_state(const char *source, int *out_pct, int *out_muted);
+void pulse_set_sink_volume_relative(const char *sink, int delta_pct); /* delta_pct may be negative */
+void pulse_toggle_sink_mute(const char *sink);
+
 /* ---- widget registry: each file under widgets/ defines one of these --- */
 extern const PanelWidgetOps spacer_ops;
 extern const PanelWidgetOps clock_ops;
@@ -319,5 +334,6 @@ extern const PanelWidgetOps tasklist_ops;
 extern const PanelWidgetOps winctl_ops;
 extern const PanelWidgetOps tray_ops;
 extern const PanelWidgetOps launcher_ops;
+extern const PanelWidgetOps volume_ops;
 
 #endif

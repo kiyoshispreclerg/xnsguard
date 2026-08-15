@@ -226,6 +226,18 @@ Widget types implemented so far:
   application launcher (no parsing, no icon-theme lookup, no search) --
   multiple `launcher` widgets is how the user pins individual shortcuts
   today; that's future launcher-phase territory.
+- `volume`: a speaker icon reflecting the default PulseAudio/PipeWire
+  sink's level/mute state, backed by shelling out to `pactl` (see
+  "Volume control" below) -- no libpulse linked, and no dependency at
+  all (build or runtime) if `pactl` isn't installed. Scroll up/down on
+  the icon adjusts the default sink's volume by `step=<pct>` (default
+  `5`) per notch; left-click toggles mute; right-click runs
+  `cmd_edit=<command>` (default `pavucontrol`) for a full mixer. Hovering
+  shows a read-only tooltip with the default output's and input's
+  level/mute state (`Saída: NN%` / `Entrada: NN%`) -- individually
+  adjustable per-device scrollbars in the tooltip are a known gap against
+  the original ask, not yet implemented; `cmd_edit`'s external mixer
+  covers that need for now.
 
 More widget types (global menu, system monitor) are later phases -- see
 the plan this tool was built from; they are not implemented yet.
@@ -484,6 +496,37 @@ registration, icon fetch, left/middle/right click dispatch, and tooltip
 all confirmed working, and `ldd`/`strings` confirm no build-time link to
 `libdbus`.
 
+### Volume control
+
+The `volume` widget shells out to the `pactl` command-line tool
+(`pulse.c`) instead of linking `libpulse`/`libpipewire` directly. This is
+a different shape of "optional dependency" than MPRIS/tray's dlopen'd
+libdbus-1: PulseAudio's (and PipeWire's pulse-compat) client library is
+built around a persistent async connection + callback mainloop, not
+simple one-shot synchronous calls the way libdbus-1's blocking-call API
+is -- wrapping it properly would mean folding a real chunk of that
+mainloop into xispanel's own `select()` loop for not much benefit over
+just running `pactl`, which is bundled with `pulseaudio-utils` and also
+provided by `pipewire-pulse`'s compatibility layer, so it's present on
+both actual PulseAudio and PipeWire-with-pulse-compat systems. This means
+`pulse.c` has **no build-time dependency whatsoever** (no headers, no
+library, nothing in the Makefile's `pkg-config` list) -- it compiles
+unconditionally, and `pulse_available()` is a runtime-only check (a
+cached `pactl --version` run through `popen()`) for whether the binary
+exists in `$PATH`; every function reports "no audio" instead of failing
+if it doesn't.
+
+Every `pactl` invocation is prefixed with `LC_ALL=C` so its output is
+locale-independent to parse -- verified against a real pt_BR session
+where `pactl get-sink-mute` would otherwise print `Mute: não` instead of
+`Mute: no`. The device names passed around are always the literal
+`@DEFAULT_SINK@`/`@DEFAULT_SOURCE@` (PulseAudio's own aliases for
+"whatever the current default is"), not resolved device names -- no
+separate "get default device" call needed. Verified live: scroll
+up/down changed the real system volume (confirmed against `pactl
+get-sink-volume` before/after), click toggled real mute state, and the
+tooltip reflected both sink and source levels correctly.
+
 ## Source layout
 
 Following the plan's "widgets can be added/removed/reordered, each is its
@@ -508,10 +551,14 @@ own file" structure:
 - `sni.c`: the optional (dlopen'd libdbus-1) StatusNotifierItem tray
   client+host described above; `sni_stub.c` is its equivalent build-time
   fallback.
+- `pulse.c`: the `pactl`-shelling volume control backend described
+  above. Unconditionally compiled -- no stub pair needed, since it has no
+  build-time dependency to begin with.
 - `widgets/spacer.c`, `widgets/clock.c`, `widgets/tasklist.c`,
-  `widgets/winctl.c`, `widgets/tray.c`, `widgets/launcher.c`: one file per
-  widget type. Adding a new type is "write `widgets/foo.c` defining a
-  `PanelWidgetOps foo_ops`, declare it `extern` in `xispanel.h`, add it to
+  `widgets/winctl.c`, `widgets/tray.c`, `widgets/launcher.c`,
+  `widgets/volume.c`: one file per widget type. Adding a new type is
+  "write `widgets/foo.c` defining a `PanelWidgetOps foo_ops`, declare it
+  `extern` in `xispanel.h`, add it to
   the registry array in `xispanel.c`" -- no other file needs to change.
 
 ## Design notes

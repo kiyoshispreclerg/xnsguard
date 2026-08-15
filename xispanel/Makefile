@@ -27,7 +27,7 @@ LDLIBS := $(shell pkg-config --libs $(PKGS)) -lm -ldl
 PREFIX ?= /usr/local
 BINDIR := $(PREFIX)/bin
 
-SRCS := xispanel.c ewmh.c menu.c tooltip.c $(DBUS_SRCS) widgets/spacer.c widgets/clock.c widgets/tasklist.c widgets/winctl.c widgets/tray.c widgets/launcher.c
+SRCS := xispanel.c ewmh.c menu.c tooltip.c pulse.c $(DBUS_SRCS) widgets/spacer.c widgets/clock.c widgets/tasklist.c widgets/winctl.c widgets/tray.c widgets/launcher.c widgets/volume.c
 OBJS := $(SRCS:.c=.o)
 
 xispanel: $(OBJS)

@@ -267,6 +267,7 @@ static const PanelWidgetOps *g_widget_registry[] = {
     &winctl_ops,
     &tray_ops,
     &launcher_ops,
+    &volume_ops,
     NULL,
 };
 

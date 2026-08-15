@@ -39,9 +39,10 @@ and finally Fontconfig's own `sans-serif` default if neither file exists
   minimize/maximize/close buttons, similar to KDE's Active Window Control
   -- see [PROTOCOL.md](PROTOCOL.md)), `tray` (StatusNotifierItem system
   tray -- xispanel becomes the watcher if none exists yet, or coexists as
-  a second host if one already does), and `launcher` (a single
-  user-defined clickable icon: `icon=`/`name=`/`cmd=`, no `.desktop`
-  parsing).
+  a second host if one already does), `launcher` (a single user-defined
+  clickable icon: `icon=`/`name=`/`cmd=` plus per-button/scroll
+  variants, no `.desktop` parsing), and `volume` (default sink level/mute,
+  scroll to adjust, shells out to `pactl` -- no libpulse linked).
 - Widgets that don't fit the panel's available space shrink toward a
   per-type minimum instead of overflowing it (see PROTOCOL.md's "Widget
   sizing").
