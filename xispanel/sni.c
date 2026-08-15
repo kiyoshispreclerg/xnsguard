@@ -16,12 +16,19 @@
  * Properties.Get/GetAll queries, Introspect) other processes actually call
  * on us.
  *
- * Startup: tries to become the well-known name
- * "org.freedesktop.StatusNotifierWatcher" (DO_NOT_QUEUE -- if some other
- * tray already owns it, we simply don't become the watcher and instead
- * just poll *its* RegisteredStatusNotifierItems property as a second
- * host, so xispanel coexists rather than fighting over the name). Always
- * also requests "org.freedesktop.StatusNotifierHost-<pid>", the
+ * Two watcher bus names exist in the wild for what is otherwise the exact
+ * same protocol: "org.freedesktop.StatusNotifierWatcher" (the name the
+ * spec actually documents) and "org.kde.StatusNotifierWatcher" (the
+ * original pre-freedesktop.org name, which is what KDE's kded5/kded6
+ * still registers today -- and since nearly every tray item's own client
+ * library checks the KDE name either first or exclusively, it's the one
+ * that matters in practice on a real KDE/Plasma session, not the
+ * freedesktop.org one). Startup checks both via GetNameOwner and attaches
+ * to whichever already has an owner (KDE's name wins if, implausibly,
+ * both do); if *neither* does, xispanel becomes the watcher under *both*
+ * names at once (DO_NOT_QUEUE on each), so it works as the sole tray
+ * host regardless of which name a given item's library happens to probe.
+ * Always also requests "org.freedesktop.StatusNotifierHost-<pid>", the
  * conventional way a host announces itself, though not every item
  * actually checks for one.
  *
@@ -41,9 +48,14 @@
 #define SNI_POLL_MS 1500
 #define SNI_CALL_TIMEOUT_MS 200
 #define SNI_MAX_ITEMS 24
-#define SNI_WATCHER_IFACE "org.freedesktop.StatusNotifierWatcher"
 #define SNI_WATCHER_PATH "/StatusNotifierWatcher"
 #define SNI_ITEM_IFACE "org.kde.StatusNotifierItem"
+
+static const char *SNI_WATCHER_NAMES[] = {
+    "org.kde.StatusNotifierWatcher",
+    "org.freedesktop.StatusNotifierWatcher",
+};
+#define SNI_N_WATCHER_NAMES 2
 
 typedef struct {
     char busname[128];
@@ -57,6 +69,11 @@ static int g_n_items = 0;
 static uint64_t g_next_poll_ms = 0;
 static int g_is_watcher = 0;
 static int g_host_registered = 0;
+/* Which of SNI_WATCHER_NAMES[] to actually talk to when we're not the
+ * watcher ourselves -- whichever one GetNameOwner found an owner for at
+ * startup. Both interface *and* bus name are this same string (the
+ * protocol reuses the bus name as its own interface name). */
+static const char *g_watcher_name = NULL;
 
 static void *g_libdbus = NULL;
 static int g_load_attempted = 0;
@@ -68,6 +85,7 @@ static void (*p_dbus_error_free)(DBusError *);
 static dbus_bool_t (*p_dbus_error_is_set)(const DBusError *);
 static DBusConnection *(*p_dbus_bus_get)(DBusBusType, DBusError *);
 static int (*p_dbus_bus_request_name)(DBusConnection *, const char *, unsigned int, DBusError *);
+static dbus_bool_t (*p_dbus_bus_name_has_owner)(DBusConnection *, const char *, DBusError *);
 static DBusMessage *(*p_dbus_message_new_method_call)(const char *, const char *, const char *, const char *);
 static DBusMessage *(*p_dbus_message_new_method_return)(DBusMessage *);
 static DBusMessage *(*p_dbus_message_new_error)(DBusMessage *, const char *, const char *);
@@ -108,6 +126,7 @@ static int sni_load_symbols(void)
     LOAD_SYM(dbus_error_is_set);
     LOAD_SYM(dbus_bus_get);
     LOAD_SYM(dbus_bus_request_name);
+    LOAD_SYM(dbus_bus_name_has_owner);
     LOAD_SYM(dbus_message_new_method_call);
     LOAD_SYM(dbus_message_new_method_return);
     LOAD_SYM(dbus_message_new_error);
@@ -168,18 +187,46 @@ static int sni_ensure_connected(void)
         return 0;
     }
 
-    /* DBUS_NAME_FLAG_DO_NOT_QUEUE = 4: fail immediately instead of queuing
-     * if some other process already owns the watcher name, rather than
-     * silently becoming a backup owner that only takes over if the first
-     * one exits. */
-    DBusError err2;
-    p_dbus_error_init(&err2);
-    int ret = p_dbus_bus_request_name(g_conn, SNI_WATCHER_IFACE, 4, &err2);
-    p_dbus_error_free(&err2);
-    /* DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER == 1 */
-    g_is_watcher = (ret == 1);
-    if (g_is_watcher) {
-        fprintf(stderr, "xispanel: sni: no other tray watcher found, xispanel is now the StatusNotifierWatcher\n");
+    /* Find whichever of the two watcher names (see header comment) is
+     * already owned by someone else first, before trying to claim
+     * anything ourselves. */
+    for (int i = 0; i < SNI_N_WATCHER_NAMES && !g_watcher_name; i++) {
+        DBusError herr;
+        p_dbus_error_init(&herr);
+        dbus_bool_t owned = p_dbus_bus_name_has_owner(g_conn, SNI_WATCHER_NAMES[i], &herr);
+        p_dbus_error_free(&herr);
+        if (owned) {
+            g_watcher_name = SNI_WATCHER_NAMES[i];
+        }
+    }
+
+    if (g_watcher_name) {
+        fprintf(stderr, "xispanel: sni: found existing tray watcher %s, attaching as a second host\n",
+                g_watcher_name);
+    } else {
+        /* Nobody's the watcher yet -- claim *both* well-known names
+         * (DBUS_NAME_FLAG_DO_NOT_QUEUE = 4: fail immediately instead of
+         * queuing behind anyone who races us for it) so xispanel answers
+         * to whichever one a given item's client library happens to
+         * probe. */
+        int got_any = 0;
+        for (int i = 0; i < SNI_N_WATCHER_NAMES; i++) {
+            DBusError err2;
+            p_dbus_error_init(&err2);
+            int ret = p_dbus_bus_request_name(g_conn, SNI_WATCHER_NAMES[i], 4, &err2);
+            p_dbus_error_free(&err2);
+            /* DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER == 1 */
+            if (ret == 1) {
+                got_any = 1;
+            }
+        }
+        g_is_watcher = got_any;
+        if (g_is_watcher) {
+            fprintf(stderr,
+                    "xispanel: sni: no other tray watcher found, xispanel is now the StatusNotifierWatcher\n");
+        } else {
+            fprintf(stderr, "xispanel: sni: no tray watcher found and could not become one, tray will stay empty\n");
+        }
     }
 
     char hostname[64];
@@ -441,8 +488,9 @@ static void sni_handle_incoming(void)
         const char *sender = p_dbus_message_get_sender(msg);
         DBusMessage *reply = NULL;
 
-        if (iface && member && strcmp(iface, SNI_WATCHER_IFACE) == 0 &&
-            strcmp(member, "RegisterStatusNotifierItem") == 0) {
+        int iface_is_watcher = iface && (strcmp(iface, SNI_WATCHER_NAMES[0]) == 0 ||
+                                          strcmp(iface, SNI_WATCHER_NAMES[1]) == 0);
+        if (iface_is_watcher && member && strcmp(member, "RegisterStatusNotifierItem") == 0) {
             DBusMessageIter it;
             const char *arg = NULL;
             if (p_dbus_message_iter_init(msg, &it) && p_dbus_message_iter_get_arg_type(&it) == DBUS_TYPE_STRING) {
@@ -493,7 +541,7 @@ static void sni_handle_incoming(void)
     }
 }
 
-/* Refreshes g_items[] from whichever watcher owns SNI_WATCHER_IFACE (be it
+/* Refreshes g_items[] from whichever watcher owns g_watcher_name (be it
  * us or another process), then re-fetches each item's Title/IconPixmap.
  * Also drains+handles incoming requests if we're the watcher. Called at
  * most once every SNI_POLL_MS from the main loop. */
@@ -511,11 +559,11 @@ void sni_poll(uint64_t now)
 
     sni_handle_incoming();
 
-    if (!g_is_watcher) {
+    if (!g_is_watcher && g_watcher_name) {
         /* We're not the watcher -- read its RegisteredStatusNotifierItems
          * property instead of tracking registrations ourselves. */
-        DBusMessage *reply = sni_call2s(SNI_WATCHER_IFACE, SNI_WATCHER_PATH, "org.freedesktop.DBus.Properties", "Get",
-                                         SNI_WATCHER_IFACE, "RegisteredStatusNotifierItems");
+        DBusMessage *reply = sni_call2s(g_watcher_name, SNI_WATCHER_PATH, "org.freedesktop.DBus.Properties", "Get",
+                                         g_watcher_name, "RegisteredStatusNotifierItems");
         if (reply) {
             DBusMessageIter it, variant, arr;
             if (p_dbus_message_iter_init(reply, &it) && p_dbus_message_iter_get_arg_type(&it) == DBUS_TYPE_VARIANT) {

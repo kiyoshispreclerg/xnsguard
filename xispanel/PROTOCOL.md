@@ -378,15 +378,23 @@ crash or startup failure.
 
 Unlike MPRIS (a pure DBus *client*), a tray also has to act as a DBus
 *service*: other processes' tray icons call `RegisterStatusNotifierItem`
-on whichever process owns the well-known name
-`org.freedesktop.StatusNotifierWatcher`. On startup xispanel tries to
-claim that name (`DBUS_NAME_FLAG_DO_NOT_QUEUE` -- fail immediately rather
-than silently becoming a backup owner) and logs which role it ended up
-in:
+on whichever process owns the well-known watcher name. Two such names
+exist for the exact same protocol in practice --
+`org.freedesktop.StatusNotifierWatcher` (what the spec document actually
+says) and `org.kde.StatusNotifierWatcher` (the original pre-freedesktop.org
+name, still what KDE's `kded5`/`kded6` registers, and still what most
+tray items' client libraries check first or exclusively -- confirmed
+against a real Plasma session: `kded5` owns `org.kde.StatusNotifierWatcher`
+and nothing owns the freedesktop.org name at all). On startup xispanel
+checks both via `dbus_bus_name_has_owner()` and logs which role it ended
+up in:
 
-- **No other watcher running** (the common case, e.g. replacing
-  plasmashell/liquidshell entirely): xispanel becomes the watcher itself.
-  It then has to *receive* `RegisterStatusNotifierItem` calls from other
+- **No other watcher running** (e.g. replacing plasmashell/liquidshell
+  entirely on a bare X session): xispanel becomes the watcher itself
+  under *both* names at once (`DBUS_NAME_FLAG_DO_NOT_QUEUE` on each --
+  fail immediately rather than silently becoming a backup owner), so it
+  answers to whichever name a given item's library happens to probe. It
+  then has to *receive* `RegisterStatusNotifierItem` calls from other
   processes, which -- rather than pulling `libdbus-1`'s watch/timeout
   objects into xispanel's `select()` loop (flagged as the fiddliest part
   of DBus integration in the original phased plan) -- is handled by
@@ -399,9 +407,10 @@ in:
   `RegisterStatusNotifierItem`, plus best-effort stubs for
   `Properties.Get(All)`/`Introspect` so a strict client doesn't hang
   waiting on a reply that never comes).
-- **Another watcher already running** (some other tray host coexisting):
-  xispanel doesn't fight over the name -- it just becomes a second host,
-  polling *that* watcher's `RegisteredStatusNotifierItems` property
+- **Another watcher already running** (the common case on an existing
+  Plasma/KDE session, or any other DE already running its own tray host):
+  xispanel doesn't fight over either name -- it just becomes a second
+  host, polling *that* watcher's `RegisteredStatusNotifierItems` property
   instead of tracking registrations itself.
 
 Either way, once an item is known, xispanel polls its
