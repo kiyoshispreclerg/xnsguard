@@ -336,6 +336,99 @@ static int extract_get_string(DBusMessage *reply, char *buf, size_t bufsz)
     return 1;
 }
 
+/* Same shape as extract_get_string() but for a Properties.Get on an
+ * object-path-typed property (e.g. StatusNotifierItem's "Menu") -- same
+ * `const char *` marshalling as a string, just a different DBus type tag. */
+static int extract_get_objpath(DBusMessage *reply, char *buf, size_t bufsz)
+{
+    DBusMessageIter it, variant;
+    if (!p_dbus_message_iter_init(reply, &it) || p_dbus_message_iter_get_arg_type(&it) != DBUS_TYPE_VARIANT) {
+        return 0;
+    }
+    p_dbus_message_iter_recurse(&it, &variant);
+    if (p_dbus_message_iter_get_arg_type(&variant) != DBUS_TYPE_OBJECT_PATH) {
+        return 0;
+    }
+    const char *val = NULL;
+    p_dbus_message_iter_get_basic(&variant, &val);
+    snprintf(buf, bufsz, "%s", val ? val : "");
+    return 1;
+}
+
+/* Some items (fcitx5's own SNI item, confirmed live) never set IconPixmap
+ * at all -- just IconName, a themed icon name meant to be resolved via the
+ * freedesktop icon theme spec (index.theme parsing, per-size subdirs,
+ * theme inheritance...). Full spec compliance is explicitly launcher-phase
+ * territory (see the original project plan's icon_theme.c), so this is a
+ * deliberately unsophisticated stand-in: generate a fixed grid of candidate
+ * paths (theme base x category x size-or-"symbolic"/"scalable" x
+ * extension) and load the first hit via load_png_argb() (Imlib2, already
+ * linked -- no new dependency), rather than a real recursive/spec-aware
+ * search (which risks a synchronous multi-thousand-file directory walk on
+ * the main thread the first time an icon needs resolving -- a real stall
+ * risk on a theme with a large icon set, unacceptable for what only saves
+ * a fallback letter icon from showing). Themes disagree on directory
+ * order -- breeze nests size *under* category
+ * (".../devices/symbolic/name.svg"), Adwaita/hicolor nest category *under*
+ * size (".../scalable/devices/name.svg", confirmed against both live) --
+ * so both orderings are tried. Good enough to turn a blank/fallback icon
+ * into a real one for the common case; finds nothing for an icon this
+ * grid doesn't happen to cover, degrading back to the fallback icon
+ * exactly like an absent IconPixmap already does. Also handles the (seen
+ * in the wild) case of an item passing an absolute path as IconName
+ * directly. */
+static cairo_surface_t *resolve_icon_name(const char *name)
+{
+    if (!name || !name[0]) {
+        return NULL;
+    }
+    if (name[0] == '/') {
+        return load_png_argb(name);
+    }
+    static const char *bases[] = {
+        "/usr/share/icons/breeze",
+        "/usr/share/icons/breeze-dark",
+        "/usr/share/icons/Adwaita",
+        "/usr/share/icons/hicolor",
+    };
+    static const char *categories[] = {"status", "apps", "devices", "actions", "categories", "mimetypes", "places"};
+    static const char *sizedirs[] = {"symbolic", "scalable", "48x48", "32x32", "24x24", "22x22", "16x16"};
+    static const char *exts[] = {".svg", ".png"};
+    char path[PATH_MAX];
+    for (size_t b = 0; b < sizeof(bases) / sizeof(bases[0]); b++) {
+        for (size_t c = 0; c < sizeof(categories) / sizeof(categories[0]); c++) {
+            for (size_t s = 0; s < sizeof(sizedirs) / sizeof(sizedirs[0]); s++) {
+                for (size_t e = 0; e < sizeof(exts) / sizeof(exts[0]); e++) {
+                    /* breeze order: <category>/<sizedir>/<name> */
+                    snprintf(path, sizeof(path), "%s/%s/%s/%s%s", bases[b], categories[c], sizedirs[s], name,
+                             exts[e]);
+                    cairo_surface_t *surf = access(path, R_OK) == 0 ? load_png_argb(path) : NULL;
+                    if (surf) {
+                        return surf;
+                    }
+                    /* Adwaita/hicolor order: <sizedir>/<category>/<name> */
+                    snprintf(path, sizeof(path), "%s/%s/%s/%s%s", bases[b], sizedirs[s], categories[c], name,
+                             exts[e]);
+                    surf = access(path, R_OK) == 0 ? load_png_argb(path) : NULL;
+                    if (surf) {
+                        return surf;
+                    }
+                }
+            }
+        }
+    }
+    /* Flat fallback, no theme structure at all. */
+    static const char *exts2[] = {".png", ".svg", ".xpm"};
+    for (size_t e = 0; e < sizeof(exts2) / sizeof(exts2[0]); e++) {
+        snprintf(path, sizeof(path), "/usr/share/pixmaps/%s%s", name, exts2[e]);
+        cairo_surface_t *surf = access(path, R_OK) == 0 ? load_png_argb(path) : NULL;
+        if (surf) {
+            return surf;
+        }
+    }
+    return NULL;
+}
+
 /* Same shape as extract_get_string() but for a targeted Properties.Get on
  * IconPixmap: variant<"a(iiay)">, an array of (width,height,ARGB32-
  * network-byte-order pixel bytes) structs. Picks the largest available and
@@ -647,15 +740,30 @@ void sni_poll(uint64_t now)
             dst->next_icon_poll_ms = now + SNI_ICON_REFRESH_MS;
             DBusMessage *ireply = sni_call2s(it->busname, it->path, "org.freedesktop.DBus.Properties", "Get",
                                               SNI_ITEM_IFACE, "IconPixmap");
+            cairo_surface_t *icon = NULL;
             if (ireply) {
-                cairo_surface_t *icon = extract_get_icon_pixmap(ireply);
+                icon = extract_get_icon_pixmap(ireply);
                 p_dbus_message_unref(ireply);
-                if (icon) {
-                    if (dst->icon) {
-                        cairo_surface_destroy(dst->icon);
-                    }
-                    dst->icon = icon;
+            }
+            if (!icon) {
+                /* No raw pixmap -- try IconName resolved against a theme
+                 * (see resolve_icon_name()'s doc comment). Only bothered
+                 * with when IconPixmap came up empty, so items that do
+                 * provide real pixmap data never pay for this extra call. */
+                DBusMessage *nreply = sni_call2s(it->busname, it->path, "org.freedesktop.DBus.Properties", "Get",
+                                                  SNI_ITEM_IFACE, "IconName");
+                if (nreply) {
+                    char iconname[128] = "";
+                    extract_get_string(nreply, iconname, sizeof(iconname));
+                    p_dbus_message_unref(nreply);
+                    icon = resolve_icon_name(iconname);
                 }
+            }
+            if (icon) {
+                if (dst->icon) {
+                    cairo_surface_destroy(dst->icon);
+                }
+                dst->icon = icon;
             }
         }
     }
@@ -706,4 +814,274 @@ void sni_context_menu(int idx, int x, int y)
         return;
     }
     sni_send2i(g_items[idx].busname, g_items[idx].path, SNI_ITEM_IFACE, "ContextMenu", x, y);
+}
+
+/* ---- DBusMenu client, for tray items whose Menu property points at a
+ * com.canonical.dbusmenu object -----------------------------------------
+ *
+ * StatusNotifierItem's ContextMenu(x,y) is only a fallback for items that
+ * *don't* have a proper menu: per spec, when the "Menu" property is set to
+ * a real object path, hosts are expected to fetch and render *that* menu
+ * themselves rather than calling ContextMenu() (which such items often
+ * don't even implement -- confirmed against fcitx5's own SNI item: its
+ * ContextMenu isn't in its introspection at all, only Activate/Scroll/
+ * SecondaryActivate, while its Menu property points at a real object
+ * exposing the input-method switcher). Reuses every dlopen'd libdbus-1
+ * symbol sni.c already loads -- no new runtime dependency.
+ *
+ * GetLayout(0, -1, []) returns the *entire* tree in one call (depth -1 =
+ * unlimited), so no follow-up round-trips are needed for nested submenus
+ * (fcitx5's real menu nests its actual input-method list one level under
+ * a "Group" container). Rather than building real nested-submenu UI in
+ * menu.c (a flat popup today, by design -- see its own header comment),
+ * this flattens the whole tree into that same flat list, indenting each
+ * item by its depth: simpler, and every menu seen in practice from real
+ * tray items (fcitx5, network applets) is shallow enough that a flattened
+ * view is still perfectly usable. */
+#define DBUSMENU_IFACE "com.canonical.dbusmenu"
+#define DBUSMENU_MAX_ITEMS 24
+
+static char g_dbusmenu_busname[128];
+static char g_dbusmenu_path[128];
+static int g_dbusmenu_ids[DBUSMENU_MAX_ITEMS];
+static MenuItem g_dbusmenu_items[DBUSMENU_MAX_ITEMS];
+static int g_dbusmenu_n = 0;
+
+/* Fire-and-forget DBusMenu Event(id, "clicked", <int32 0>, timestamp) --
+ * same "don't wait for a reply nothing here needs" shape as sni_send2i(). */
+static void dbusmenu_send_event(const char *dest, const char *path, int32_t id)
+{
+    DBusMessage *msg = p_dbus_message_new_method_call(dest, path, DBUSMENU_IFACE, "Event");
+    if (!msg) {
+        return;
+    }
+    DBusMessageIter it, variant;
+    p_dbus_message_iter_init_append(msg, &it);
+    p_dbus_message_iter_append_basic(&it, DBUS_TYPE_INT32, &id);
+    const char *event_id = "clicked";
+    p_dbus_message_iter_append_basic(&it, DBUS_TYPE_STRING, &event_id);
+    p_dbus_message_iter_open_container(&it, DBUS_TYPE_VARIANT, "i", &variant);
+    int32_t dummy = 0;
+    p_dbus_message_iter_append_basic(&variant, DBUS_TYPE_INT32, &dummy);
+    p_dbus_message_iter_close_container(&it, &variant);
+    dbus_uint32_t timestamp = 0;
+    p_dbus_message_iter_append_basic(&it, DBUS_TYPE_UINT32, &timestamp);
+    p_dbus_connection_send(g_conn, msg, NULL);
+    p_dbus_message_unref(msg);
+}
+
+/* Recursively flattens one (ia{sv}av) node (already positioned at a
+ * DBUS_TYPE_VARIANT wrapping that struct) into g_dbusmenu_items[]/
+ * g_dbusmenu_ids[], indenting by `depth`. Skips invisible items and their
+ * entire subtree; disabled items are still listed (greyed out) so the
+ * layout doesn't visibly shift, matching how tasklist's own context menu
+ * treats not-currently-applicable actions. */
+static void dbusmenu_parse_node(DBusMessageIter *variant_iter, int depth)
+{
+    if (g_dbusmenu_n >= DBUSMENU_MAX_ITEMS) {
+        return;
+    }
+    /* Two recurses, not one: the first lands *at* the (ia{sv}av) struct the
+     * variant wraps (its arg type, not inside its fields yet -- same
+     * two-step variant-then-container pattern extract_get_icon_pixmap()
+     * already relies on for its variant<array<struct>>); the second
+     * actually enters that struct to reach its fields (id, then props,
+     * then children). Missing this second step was a real bug: it made
+     * every field-type check below silently fail, so id stayed 0 and
+     * label stayed empty for every real menu item, while the *count* of
+     * items still came out right (that loop only walks the variants
+     * themselves, unaffected by this). */
+    DBusMessageIter node_struct, node;
+    p_dbus_message_iter_recurse(variant_iter, &node_struct);
+    p_dbus_message_iter_recurse(&node_struct, &node);
+
+    int32_t id = 0;
+    if (p_dbus_message_iter_get_arg_type(&node) == DBUS_TYPE_INT32) {
+        p_dbus_message_iter_get_basic(&node, &id);
+    }
+    p_dbus_message_iter_next(&node);
+
+    char label[64] = "";
+    int is_separator = 0, enabled = 1, visible = 1;
+    if (p_dbus_message_iter_get_arg_type(&node) == DBUS_TYPE_ARRAY) {
+        DBusMessageIter props;
+        p_dbus_message_iter_recurse(&node, &props);
+        while (p_dbus_message_iter_get_arg_type(&props) == DBUS_TYPE_DICT_ENTRY) {
+            DBusMessageIter entry;
+            p_dbus_message_iter_recurse(&props, &entry);
+            const char *key = NULL;
+            if (p_dbus_message_iter_get_arg_type(&entry) == DBUS_TYPE_STRING) {
+                p_dbus_message_iter_get_basic(&entry, &key);
+            }
+            p_dbus_message_iter_next(&entry);
+            if (key && p_dbus_message_iter_get_arg_type(&entry) == DBUS_TYPE_VARIANT) {
+                DBusMessageIter val;
+                p_dbus_message_iter_recurse(&entry, &val);
+                int vt = p_dbus_message_iter_get_arg_type(&val);
+                if (!strcmp(key, "label") && vt == DBUS_TYPE_STRING) {
+                    const char *s = NULL;
+                    p_dbus_message_iter_get_basic(&val, &s);
+                    /* DBusMenu labels use "_" for mnemonics (like GTK) --
+                     * strip it, xispanel has no keyboard-mnemonic support
+                     * to hook it up to anyway. */
+                    if (s) {
+                        size_t o = 0;
+                        for (size_t j = 0; s[j] && o + 1 < sizeof(label); j++) {
+                            if (s[j] != '_') {
+                                label[o++] = s[j];
+                            }
+                        }
+                        label[o] = 0;
+                    }
+                } else if (!strcmp(key, "type") && vt == DBUS_TYPE_STRING) {
+                    const char *s = NULL;
+                    p_dbus_message_iter_get_basic(&val, &s);
+                    if (s && !strcmp(s, "separator")) {
+                        is_separator = 1;
+                    }
+                } else if (!strcmp(key, "enabled") && vt == DBUS_TYPE_BOOLEAN) {
+                    dbus_bool_t b = TRUE;
+                    p_dbus_message_iter_get_basic(&val, &b);
+                    enabled = b;
+                } else if (!strcmp(key, "visible") && vt == DBUS_TYPE_BOOLEAN) {
+                    dbus_bool_t b = TRUE;
+                    p_dbus_message_iter_get_basic(&val, &b);
+                    visible = b;
+                }
+            }
+            if (!p_dbus_message_iter_next(&props)) {
+                break;
+            }
+        }
+        p_dbus_message_iter_next(&node);
+    }
+
+    if (visible) {
+        MenuItem *mi = &g_dbusmenu_items[g_dbusmenu_n];
+        memset(mi, 0, sizeof(*mi));
+        mi->is_separator = is_separator;
+        mi->enabled = enabled;
+        if (!is_separator) {
+            snprintf(mi->label, sizeof(mi->label), "%*s%s", depth * 2, "", label);
+        }
+        g_dbusmenu_ids[g_dbusmenu_n] = id;
+        g_dbusmenu_n++;
+    }
+
+    /* Third field: av (array of variant), each wrapping a child node --
+     * present (possibly empty) whether or not this item has visible
+     * children; recurse only if actually visible, matching the skip above. */
+    if (visible && p_dbus_message_iter_get_arg_type(&node) == DBUS_TYPE_ARRAY) {
+        DBusMessageIter children;
+        p_dbus_message_iter_recurse(&node, &children);
+        while (p_dbus_message_iter_get_arg_type(&children) == DBUS_TYPE_VARIANT &&
+               g_dbusmenu_n < DBUSMENU_MAX_ITEMS) {
+            dbusmenu_parse_node(&children, depth + 1);
+            if (!p_dbus_message_iter_next(&children)) {
+                break;
+            }
+        }
+    }
+}
+
+static void sni_dbusmenu_select(Panel *panel, PanelWidget *widget, void *ctx, int index)
+{
+    (void)panel;
+    (void)widget;
+    (void)ctx;
+    if (index < 0 || index >= g_dbusmenu_n || !sni_ensure_connected()) {
+        return;
+    }
+    dbusmenu_send_event(g_dbusmenu_busname, g_dbusmenu_path, g_dbusmenu_ids[index]);
+}
+
+/* Opens the hovered item's DBusMenu as a flat popup (see the file comment
+ * above), if it has one. Returns 1 if it did (and a menu was opened, even
+ * if fetching the layout failed after the property check -- callers
+ * shouldn't also fall back to ContextMenu() in that case, since a Menu
+ * property being set at all means the item doesn't expect ContextMenu()
+ * to be called), 0 if the item has no Menu property (empty or "/", the
+ * spec's "no menu" convention) so the caller should fall back to
+ * ContextMenu()/Activate() instead. */
+int sni_menu_open(int idx, Panel *panel, PanelWidget *widget, int anchor_x, int anchor_w)
+{
+    if (idx < 0 || idx >= g_n_items || !sni_ensure_connected()) {
+        return 0;
+    }
+    const char *busname = g_items[idx].busname;
+    const char *path = g_items[idx].path;
+
+    DBusMessage *mreply = sni_call2s(busname, path, "org.freedesktop.DBus.Properties", "Get", SNI_ITEM_IFACE, "Menu");
+    if (!mreply) {
+        return 0;
+    }
+    char menu_path[128] = "";
+    extract_get_objpath(mreply, menu_path, sizeof(menu_path));
+    p_dbus_message_unref(mreply);
+    if (!menu_path[0] || !strcmp(menu_path, "/")) {
+        return 0;
+    }
+
+    DBusMessage *msg = p_dbus_message_new_method_call(busname, menu_path, DBUSMENU_IFACE, "GetLayout");
+    if (!msg) {
+        return 1; /* has a Menu property, just couldn't ask it right now -- still don't fall back */
+    }
+    DBusMessageIter it, str_arr;
+    p_dbus_message_iter_init_append(msg, &it);
+    int32_t parent_id = 0, depth = -1;
+    p_dbus_message_iter_append_basic(&it, DBUS_TYPE_INT32, &parent_id);
+    p_dbus_message_iter_append_basic(&it, DBUS_TYPE_INT32, &depth);
+    p_dbus_message_iter_open_container(&it, DBUS_TYPE_ARRAY, "s", &str_arr);
+    p_dbus_message_iter_close_container(&it, &str_arr);
+    DBusError err;
+    p_dbus_error_init(&err);
+    DBusMessage *reply = p_dbus_connection_send_with_reply_and_block(g_conn, msg, SNI_CALL_TIMEOUT_MS, &err);
+    p_dbus_message_unref(msg);
+    if (p_dbus_error_is_set(&err)) {
+        p_dbus_error_free(&err);
+        return 1;
+    }
+    if (!reply) {
+        return 1;
+    }
+
+    g_dbusmenu_n = 0;
+    DBusMessageIter rit;
+    if (p_dbus_message_iter_init(reply, &rit) && p_dbus_message_iter_get_arg_type(&rit) == DBUS_TYPE_UINT32) {
+        p_dbus_message_iter_next(&rit); /* skip revision */
+        if (p_dbus_message_iter_get_arg_type(&rit) == DBUS_TYPE_STRUCT) {
+            /* dbusmenu_parse_node() expects a variant-wrapped struct (that's
+             * the shape every *child* comes in); the top-level reply's
+             * struct isn't itself variant-wrapped, but its own children
+             * (what we actually want to list -- the root item is just an
+             * unlabeled container) are, via the same av field every node
+             * has. Walk into the root struct by hand once to reach them. */
+            DBusMessageIter root;
+            p_dbus_message_iter_recurse(&rit, &root); /* now at field 1: id */
+            p_dbus_message_iter_next(&root); /* now at field 2: props dict (a{sv}) */
+            if (p_dbus_message_iter_get_arg_type(&root) == DBUS_TYPE_ARRAY) {
+                p_dbus_message_iter_next(&root); /* now at field 3: children (av) */
+            }
+            if (p_dbus_message_iter_get_arg_type(&root) == DBUS_TYPE_ARRAY) {
+                DBusMessageIter children;
+                p_dbus_message_iter_recurse(&root, &children);
+                while (p_dbus_message_iter_get_arg_type(&children) == DBUS_TYPE_VARIANT &&
+                       g_dbusmenu_n < DBUSMENU_MAX_ITEMS) {
+                    dbusmenu_parse_node(&children, 0);
+                    if (!p_dbus_message_iter_next(&children)) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    p_dbus_message_unref(reply);
+
+    if (g_dbusmenu_n <= 0) {
+        return 1;
+    }
+    snprintf(g_dbusmenu_busname, sizeof(g_dbusmenu_busname), "%s", busname);
+    snprintf(g_dbusmenu_path, sizeof(g_dbusmenu_path), "%s", menu_path);
+    panel_menu_open(panel, widget, anchor_x, anchor_w, g_dbusmenu_items, g_dbusmenu_n, NULL, sni_dbusmenu_select);
+    return 1;
 }

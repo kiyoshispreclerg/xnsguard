@@ -3,11 +3,15 @@
  * sni.c for the actual DBus protocol work; this file is purely layout +
  * painting + click dispatch, same split as tasklist.c/mpris.c).
  *
- * Left-click Activate()s the item (e.g. opens the app's menu/window),
- * middle-click SecondaryActivate()s it, right-click opens its own
- * ContextMenu() -- xispanel doesn't render that menu itself, the item's
- * own process does (that's what the SNI protocol's ContextMenu(x,y) call
- * is for: the item pops up its own DBusMenu-backed menu near (x,y)).
+ * Left- and right-click both first try sni_menu_open(): if the item has a
+ * Menu (DBusMenu) property set, xispanel fetches+renders that menu itself
+ * (see sni.c's DBusMenu client) rather than relying on the item's own
+ * process to pop up something near (x,y) -- many real items (fcitx5's
+ * input-method switcher, network applets) don't implement ContextMenu()
+ * at all once they set Menu, expecting hosts to do exactly this. Only
+ * when there's no Menu property does left-click fall back to plain
+ * Activate() and right-click to ContextMenu(x,y). Middle-click always
+ * just SecondaryActivate()s the item -- DBusMenu has no equivalent for it.
  */
 #include "../xispanel.h"
 
@@ -142,15 +146,26 @@ static int tray_on_button(PanelWidget *w, int button, int local_x, int local_y, 
     if (idx < 0) {
         return 0;
     }
+    int anchor_x = pad + idx * slot;
     switch (button) {
     case Button1:
-        sni_activate(idx, root_x, root_y);
+        /* Items that set a Menu (DBusMenu) property -- e.g. fcitx5's
+         * input-method switcher -- often don't implement Activate()
+         * meaningfully at all, expecting *that* menu to be the primary
+         * left-click interaction instead (real-world convention, not
+         * explicitly spelled out by the SNI spec itself). Only fall back
+         * to plain Activate() when there's no Menu to show. */
+        if (!sni_menu_open(idx, w->panel, w, anchor_x, icon_px)) {
+            sni_activate(idx, root_x, root_y);
+        }
         return 1;
     case Button2:
         sni_secondary_activate(idx, root_x, root_y);
         return 1;
     case Button3:
-        sni_context_menu(idx, root_x, root_y);
+        if (!sni_menu_open(idx, w->panel, w, anchor_x, icon_px)) {
+            sni_context_menu(idx, root_x, root_y);
+        }
         return 1;
     default:
         return 0;

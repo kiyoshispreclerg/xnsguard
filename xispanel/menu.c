@@ -30,7 +30,8 @@ typedef struct {
     Window win;
     cairo_surface_t *surface;
     cairo_t *cr;
-    MenuItem items[8];
+    MenuItem items[24]; /* bumped from 8 to fit flattened DBusMenu menus (tray items like
+                          * fcitx5's input-method switcher can have a dozen+ entries) */
     int n_items;
     int item_h;
     int width, height;

@@ -553,15 +553,36 @@ surface the same way `_NET_WM_ICON` already is in `ewmh.c`. Items that
 never set `IconPixmap` fall back to the same single-letter placeholder
 tasklist/winctl use, keyed off `Title`/`IconName`.
 
-Left-click sends `Activate(root_x, root_y)`, middle-click
-`SecondaryActivate(root_x, root_y)`, right-click `ContextMenu(root_x,
-root_y)` -- all fire-and-forget, per spec. xispanel never renders the
-item's context menu itself; that's the item's own process's job (it's
-usually backed by DBusMenu, a later/separate phase from the plan). Tested
-end-to-end against a throwaway Python (`dbus-python`) fake tray item:
-registration, icon fetch, left/middle/right click dispatch, and tooltip
-all confirmed working, and `ldd`/`strings` confirm no build-time link to
-`libdbus`.
+Middle-click always just sends `SecondaryActivate(root_x, root_y)`
+(fire-and-forget, per spec -- DBusMenu below has no equivalent for it).
+Left- and right-click first try rendering the item's own **DBusMenu**
+(`Menu` property): a real object path there means the item expects
+*that* to be the primary interaction, not `Activate()`/`ContextMenu()`
+-- confirmed against fcitx5's real SNI item, whose introspection doesn't
+even list a `ContextMenu` method (only `Activate`/`Scroll`/
+`SecondaryActivate`), while `Menu` points at a working
+`com.canonical.dbusmenu` object serving its input-method switcher. xispanel
+fetches it with a single `GetLayout(0, -1, [])` call (depth `-1` returns
+the *entire* tree recursively -- fcitx5's real menu nests the actual
+input-method list one level under a "Group" container, so this avoids a
+follow-up round-trip per level) and flattens it into menu.c's existing
+flat popup, indenting each item by its depth in the tree rather than
+building real nested-submenu UI -- every tray-item menu seen in practice
+is shallow enough that a flattened view is still perfectly usable.
+Clicking an entry sends `Event(id, "clicked", <int32 0>, 0)`
+fire-and-forget, same convention DBusMenu clients use. `menu.c`'s item
+cap was bumped from 8 to 24 to fit menus like fcitx5's (5 input methods +
+separator + Configure/Restart/Exit = 9 flattened entries) which
+previously would've silently failed to open (`panel_menu_open()` refuses
+`n_items` past its cap). Only when the `Menu` property is empty/absent
+(the spec's "no menu" convention, object path `/` or unset) does
+left-click fall back to plain `Activate(root_x, root_y)` and right-click
+to `ContextMenu(root_x, root_y)`. Tested end-to-end against a throwaway
+Python (`dbus-python`) fake tray item: registration, icon fetch,
+left/middle/right click dispatch, and tooltip all confirmed working
+(before the DBusMenu client existed -- that part's been exercised
+against fcitx5's real menu directly, `ldd`/`strings` still confirm no
+build-time link to `libdbus`).
 
 ### Volume control
 

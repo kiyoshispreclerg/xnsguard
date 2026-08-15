@@ -346,6 +346,13 @@ cairo_surface_t *sni_icon(int idx); /* NULL if unknown/idx out of range */
 void sni_activate(int idx, int x, int y); /* left click */
 void sni_secondary_activate(int idx, int x, int y); /* middle click */
 void sni_context_menu(int idx, int x, int y); /* right click */
+/* If the item has a Menu (DBusMenu) property, fetches+flattens its layout
+ * and opens it via panel_menu_open(), returning 1 -- the item's own
+ * process didn't necessarily implement ContextMenu() at all (many don't,
+ * once they set Menu -- see sni.c's DBusMenu client section), so the
+ * caller shouldn't fall back to sni_context_menu()/sni_activate() when
+ * this returns 1, only when it returns 0 (no Menu property set). */
+int sni_menu_open(int idx, Panel *panel, PanelWidget *widget, int anchor_x, int anchor_w);
 
 /* ---- volume control: shells out to `pactl`, no libpulse linked (pulse.c) ----
  *
