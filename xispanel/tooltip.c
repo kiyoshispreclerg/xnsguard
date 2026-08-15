@@ -44,6 +44,9 @@
 #define TOOLTIP_FONT_SIZE 13.0
 #define TOOLTIP_MAX_LINES 4
 #define TOOLTIP_CLOSE_ICON 14
+#define MPRIS_BTN_SIZE 22
+#define MPRIS_BTN_GAP 4
+#define MPRIS_ROW_H (MPRIS_BTN_SIZE + TOOLTIP_PAD_Y)
 
 typedef struct {
     Window win;
@@ -53,6 +56,9 @@ typedef struct {
     /* Close-icon hit-rect, in popup-local coordinates; only meaningful
      * when g_closable. */
     int close_x, close_y, close_w, close_h;
+    /* previous/play-pause/next button hit-rects, only meaningful when
+     * g_has_mpris. */
+    int mpris_btn_x[3], mpris_btn_y, mpris_btn_size;
 } TooltipPopup;
 
 static TooltipPopup *g_popup = NULL;
@@ -69,6 +75,13 @@ static uint64_t g_last_refresh_ms = 0;
 static int g_shown = 0;
 static int g_closable = 0;
 static void *g_ctx = NULL;
+
+/* Set alongside g_text whenever the current hover target implements
+ * get_tooltip_mpris() and reports an active player -- see mpris.c and
+ * PanelWidgetOps.get_tooltip_mpris's doc comment in xispanel.h. */
+static int g_has_mpris = 0;
+static char g_mpris_busname[128];
+static int g_mpris_playing = 0;
 
 /* 0 = no close pending. Set on LeaveNotify from either the panel widget or
  * the popup itself; cleared on EnterNotify to either -- see the file
@@ -102,7 +115,31 @@ void tooltip_close(void)
     g_shown = 0;
     g_closable = 0;
     g_ctx = NULL;
+    g_has_mpris = 0;
+    g_mpris_busname[0] = 0;
+    g_mpris_playing = 0;
     g_close_deadline_ms = 0;
+}
+
+/* Queries get_tooltip_mpris() (if `w` implements it) for `local_x`,
+ * updating g_has_mpris/g_mpris_busname/g_mpris_playing. Cheap: mpris.c's
+ * side of this is a lookup against its own periodically-polled cache, no
+ * DBus traffic happens here. */
+static void query_mpris(PanelWidget *w, int local_x)
+{
+    g_has_mpris = 0;
+    g_mpris_busname[0] = 0;
+    g_mpris_playing = 0;
+    if (!w->ops->get_tooltip_mpris) {
+        return;
+    }
+    char busname[128];
+    int playing = 0;
+    if (w->ops->get_tooltip_mpris(w, local_x, busname, sizeof(busname), &playing)) {
+        g_has_mpris = 1;
+        snprintf(g_mpris_busname, sizeof(g_mpris_busname), "%s", busname);
+        g_mpris_playing = playing;
+    }
 }
 
 /* Splits g_text on '\n' into up to TOOLTIP_MAX_LINES lines and measures
@@ -182,6 +219,54 @@ static void paint_popup(void)
         cairo_stroke(cr);
     }
 
+    if (g_has_mpris) {
+        double s = g_popup->mpris_btn_size;
+        double by = g_popup->mpris_btn_y;
+        cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.85);
+
+        /* previous: two left-pointing triangles */
+        double bx = g_popup->mpris_btn_x[0];
+        double cy = by + s / 2.0;
+        cairo_move_to(cr, bx + s * 0.55, by + s * 0.2);
+        cairo_line_to(cr, bx + s * 0.2, cy);
+        cairo_line_to(cr, bx + s * 0.55, by + s * 0.8);
+        cairo_close_path(cr);
+        cairo_fill(cr);
+        cairo_move_to(cr, bx + s * 0.85, by + s * 0.2);
+        cairo_line_to(cr, bx + s * 0.5, cy);
+        cairo_line_to(cr, bx + s * 0.85, by + s * 0.8);
+        cairo_close_path(cr);
+        cairo_fill(cr);
+
+        /* play (triangle) or pause (two bars), depending on current state */
+        bx = g_popup->mpris_btn_x[1];
+        if (g_mpris_playing) {
+            cairo_rectangle(cr, bx + s * 0.28, by + s * 0.2, s * 0.16, s * 0.6);
+            cairo_fill(cr);
+            cairo_rectangle(cr, bx + s * 0.56, by + s * 0.2, s * 0.16, s * 0.6);
+            cairo_fill(cr);
+        } else {
+            cairo_move_to(cr, bx + s * 0.28, by + s * 0.18);
+            cairo_line_to(cr, bx + s * 0.78, cy);
+            cairo_line_to(cr, bx + s * 0.28, by + s * 0.82);
+            cairo_close_path(cr);
+            cairo_fill(cr);
+        }
+
+        /* next: two right-pointing triangles */
+        bx = g_popup->mpris_btn_x[2];
+        cairo_move_to(cr, bx + s * 0.15, by + s * 0.2);
+        cairo_line_to(cr, bx + s * 0.5, cy);
+        cairo_line_to(cr, bx + s * 0.15, by + s * 0.8);
+        cairo_close_path(cr);
+        cairo_fill(cr);
+        cairo_move_to(cr, bx + s * 0.45, by + s * 0.2);
+        cairo_line_to(cr, bx + s * 0.8, cy);
+        cairo_line_to(cr, bx + s * 0.45, by + s * 0.8);
+        cairo_close_path(cr);
+        cairo_fill(cr);
+    }
+
     cairo_surface_flush(g_popup->surface);
     XFlush(g_dpy);
 }
@@ -218,6 +303,21 @@ static void show_popup(void)
     if (g_closable && pop->height < TOOLTIP_CLOSE_ICON + TOOLTIP_PAD_Y * 2) {
         pop->height = TOOLTIP_CLOSE_ICON + TOOLTIP_PAD_Y * 2;
     }
+
+    if (g_has_mpris) {
+        int mpris_row_w = 3 * MPRIS_BTN_SIZE + 2 * MPRIS_BTN_GAP + TOOLTIP_PAD_X * 2;
+        if (mpris_row_w > pop->width) {
+            pop->width = mpris_row_w;
+        }
+        pop->mpris_btn_y = pop->height;
+        pop->height += MPRIS_ROW_H;
+        int row_x0 = (pop->width - (3 * MPRIS_BTN_SIZE + 2 * MPRIS_BTN_GAP)) / 2;
+        for (int i = 0; i < 3; i++) {
+            pop->mpris_btn_x[i] = row_x0 + i * (MPRIS_BTN_SIZE + MPRIS_BTN_GAP);
+        }
+        pop->mpris_btn_size = MPRIS_BTN_SIZE;
+    }
+
     if (pop->width < 1) {
         pop->width = 1;
     }
@@ -225,7 +325,7 @@ static void show_popup(void)
         pop->height = 1;
     }
     pop->close_x = pop->width - TOOLTIP_CLOSE_ICON - 6;
-    pop->close_y = (pop->height - TOOLTIP_CLOSE_ICON) / 2;
+    pop->close_y = (pop->height - (g_has_mpris ? MPRIS_ROW_H : 0) - TOOLTIP_CLOSE_ICON) / 2;
     pop->close_w = TOOLTIP_CLOSE_ICON;
     pop->close_h = TOOLTIP_CLOSE_ICON;
 
@@ -299,7 +399,11 @@ static int refresh_text(void)
     if (!g_widget->ops->get_tooltip(g_widget, g_local_x, buf, sizeof(buf), &ax, &aw, &closable, &ctx)) {
         return 0;
     }
-    int changed = strcmp(g_text, buf) != 0 || g_closable != closable;
+    int had_mpris = g_has_mpris;
+    int was_playing = g_mpris_playing;
+    query_mpris(g_widget, g_local_x);
+    int changed =
+        strcmp(g_text, buf) != 0 || g_closable != closable || had_mpris != g_has_mpris || was_playing != g_mpris_playing;
     snprintf(g_text, sizeof(g_text), "%s", buf);
     g_anchor_x = ax;
     g_anchor_w = aw;
@@ -341,7 +445,11 @@ void tooltip_notice_motion(Panel *p, int axis_pos)
          * refresh in case content changed under a stationary pointer). */
         g_local_x = local_x;
         g_ctx = ctx;
-        if (strcmp(g_text, buf) != 0 || g_closable != closable) {
+        int had_mpris = g_has_mpris;
+        int was_playing = g_mpris_playing;
+        query_mpris(hit, local_x);
+        if (strcmp(g_text, buf) != 0 || g_closable != closable || had_mpris != g_has_mpris ||
+            was_playing != g_mpris_playing) {
             snprintf(g_text, sizeof(g_text), "%s", buf);
             g_closable = closable;
             if (g_shown) {
@@ -361,6 +469,7 @@ void tooltip_notice_motion(Panel *p, int axis_pos)
     g_anchor_w = aw;
     g_closable = closable;
     g_ctx = ctx;
+    query_mpris(hit, local_x);
     snprintf(g_text, sizeof(g_text), "%s", buf);
     g_since_ms = now_ms();
 }
@@ -424,7 +533,33 @@ uint64_t tooltip_next_wake_ms(void)
  * select-and-close pattern. */
 static void handle_popup_click(int local_x, int local_y)
 {
-    if (!g_closable || !g_widget) {
+    if (!g_widget) {
+        tooltip_close();
+        return;
+    }
+
+    if (g_has_mpris && g_popup) {
+        int s = g_popup->mpris_btn_size;
+        int by = g_popup->mpris_btn_y;
+        for (int i = 0; i < 3; i++) {
+            int bx = g_popup->mpris_btn_x[i];
+            if (local_x >= bx && local_x < bx + s && local_y >= by && local_y < by + s) {
+                char busname[128];
+                snprintf(busname, sizeof(busname), "%s", g_mpris_busname);
+                tooltip_close();
+                if (i == 0) {
+                    mpris_previous(busname);
+                } else if (i == 1) {
+                    mpris_play_pause(busname);
+                } else {
+                    mpris_next(busname);
+                }
+                return;
+            }
+        }
+    }
+
+    if (!g_closable) {
         tooltip_close();
         return;
     }

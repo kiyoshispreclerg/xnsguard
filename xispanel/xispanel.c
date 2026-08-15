@@ -1448,6 +1448,7 @@ static int run_as_daemon(const char *sockpath)
 
         now = now_ms();
         tooltip_tick(now);
+        mpris_poll(now);
         for (int i = 0; i < MAX_PANELS; i++) {
             Panel *p = &g_panels[i];
             if (!p->in_use) {

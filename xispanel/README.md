@@ -59,9 +59,18 @@ for how a new widget type gets added.
 - Cairo with the `cairo-xlib` backend
 - Imlib2
 - FreeType2, Fontconfig
+- dbus-1 (build-time headers only -- see below)
 
 On Debian/Ubuntu: `libx11-dev libxrandr-dev libcairo2-dev libimlib2-dev
-libfreetype6-dev libfontconfig1-dev`.
+libfreetype6-dev libfontconfig1-dev libdbus-1-dev`.
+
+MPRIS media controls (previous/play-pause/next buttons in `tasklist`'s
+tooltip for whatever window owns an active media player) are the one
+optional *runtime* dependency: `libdbus-1-dev` is needed to **build**
+xispanel (for `<dbus/dbus.h>`'s types), but `libdbus-1.so.3` is never
+linked -- it's `dlopen()`'d at runtime, so a system without it installed
+still runs xispanel fine, just without those buttons. See
+[PROTOCOL.md](PROTOCOL.md)'s "MPRIS media controls" section.
 
 ### How to Compile and Install
 

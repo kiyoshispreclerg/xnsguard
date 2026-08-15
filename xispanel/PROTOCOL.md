@@ -251,6 +251,38 @@ Currently implemented:
   window (`ewmh_activate`), the close icon closes it (`ewmh_close`) --
   same actions the button's own click/context-menu already expose, just
   reachable from the tooltip too, like plasmashell's taskbar tooltips.
+  If the hovered task's window also owns an active MPRIS2 player (see
+  below), its tooltip additionally shows previous/play-pause/next
+  buttons.
+
+### MPRIS media controls
+
+`tasklist`'s tooltip shows previous/play-pause/next buttons when the
+hovered window's PID (`_NET_WM_PID`) matches an active
+`org.mpris.MediaPlayer2.*` player on the session bus (matched via
+`org.freedesktop.DBus.GetConnectionUnixProcessID`) -- same idea as
+plasmashell's taskbar tooltips showing media controls for whichever app
+happens to be playing something.
+
+This is the one place in xispanel that talks to DBus, and it's an
+**optional runtime dependency**: `mpris.c` `dlopen()`s `libdbus-1.so.3`
+and resolves every symbol it needs via `dlsym()` -- it is never linked at
+build time (`ldd xispanel` shows no `libdbus`). A system with the
+`dbus-1` dev headers available at build time (needed for `mpris.c` to
+compile against `<dbus/dbus.h>`'s types) but no `libdbus-1.so.3`
+installed at runtime just runs fine with MPRIS support silently
+unavailable -- no crash, no startup failure, `tasklist`'s tooltip simply
+never shows the extra buttons. Volume/mute control (PulseAudio/PipeWire)
+is a separate, heavier dependency decision, deliberately not part of
+this -- see the project notes.
+
+Player discovery polls the bus every ~1.5s (`mpris_poll()`, called from
+the main loop) rather than subscribing to DBus signals or folding
+libdbus-1's file descriptor into the `select()` loop -- simpler, and a
+media-control button doesn't need sub-second freshness. Every DBus call
+uses a short (200ms) blocking timeout; this is a deliberate tradeoff
+(documented in `mpris.c`) to avoid the far larger complexity of a real
+async DBus main-loop integration for a best-effort feature.
 
 Window thumbnails are a planned follow-up, gated on an active compositor
 -- not implemented yet.
@@ -272,6 +304,8 @@ own file" structure:
   and the icon/text drawing helpers built on top of it.
 - `menu.c`: the generic context-menu popup described above.
 - `tooltip.c`: the generic hover-tooltip popup described above.
+- `mpris.c`: the optional (dlopen'd libdbus-1) MPRIS2 client described
+  above.
 - `widgets/spacer.c`, `widgets/clock.c`, `widgets/tasklist.c`,
   `widgets/winctl.c`: one file per widget type. Adding a new type is
   "write `widgets/foo.c` defining a `PanelWidgetOps foo_ops`, declare it

@@ -72,6 +72,19 @@ typedef struct {
      * *out_closable = 1) -- e.g. close the window it describes. The
      * tooltip closes right after. */
     void (*tooltip_close_item)(PanelWidget *w, void *ctx);
+    /* Optional, called right after a successful get_tooltip(): if
+     * whatever the tooltip describes has an active MPRIS player attached
+     * (e.g. tasklist matching the hovered window's PID via
+     * ewmh_get_pid()/mpris_find_for_pid()), fill *out_busname with its
+     * DBus bus name and *out_playing with its current play state, and
+     * return 1 -- the tooltip then draws play/pause/next/previous buttons
+     * that call mpris_play_pause()/mpris_next()/mpris_previous() with
+     * that bus name directly (see tooltip.c). Never called if MPRIS is
+     * unavailable (no libdbus-1 at runtime, or no session bus) since
+     * mpris_find_for_pid() itself just always reports nothing then.
+     * Widgets that don't apply (clock, winctl) simply don't implement
+     * this. */
+    int (*get_tooltip_mpris)(PanelWidget *w, int local_x, char *out_busname, size_t bufsz, int *out_playing);
 } PanelWidgetOps;
 
 struct PanelWidget {
@@ -184,6 +197,7 @@ void ewmh_get_state_flags(Window w, int *minimized, int *maximized);
 Window ewmh_get_active_window(void);
 int ewmh_get_number_of_desktops(void);
 int ewmh_skip_taskbar(Window w); /* 1 if a taskbar should never list this window */
+unsigned long ewmh_get_pid(Window w); /* 0 if the window never set _NET_WM_PID */
 void ewmh_activate(Window w);
 void ewmh_close(Window w);
 void ewmh_toggle_maximize(Window w);
@@ -239,6 +253,21 @@ void tooltip_tick(uint64_t now); /* advance the show-delay timer / refresh shown
 uint64_t tooltip_next_wake_ms(void); /* 0 = no pending timer, else fold into the main loop's timeout */
 void tooltip_close(void); /* hide immediately -- call before invalidating any Panel/PanelWidget */
 int tooltip_handle_event(const XEvent *ev); /* 1 if `ev` belonged to the tooltip popup */
+
+/* ---- MPRIS2 media control client (mpris.c) ----
+ *
+ * Best-effort and entirely optional: libdbus-1 is dlopen()'d at runtime,
+ * never linked, so every function here is always safe to call and simply
+ * acts as if no player is ever found when the library (or a session bus)
+ * isn't available. See mpris.c for why this polls instead of integrating
+ * DBus watches into the select() loop. */
+void mpris_poll(uint64_t now); /* call periodically from the main loop, e.g. alongside tooltip_tick() */
+/* 1 if a player with this PID is currently known, filling *out_busname
+ * and *out_playing. */
+int mpris_find_for_pid(unsigned long pid, char *out_busname, size_t bufsz, int *out_playing);
+void mpris_play_pause(const char *busname);
+void mpris_next(const char *busname);
+void mpris_previous(const char *busname);
 
 /* ---- widget registry: each file under widgets/ defines one of these --- */
 extern const PanelWidgetOps spacer_ops;

@@ -25,6 +25,7 @@ static Atom g_atom_net_client_list;
 static Atom g_atom_net_wm_name;
 static Atom g_atom_utf8_string;
 static Atom g_atom_net_wm_desktop;
+static Atom g_atom_net_wm_pid;
 static Atom g_atom_net_wm_state;
 static Atom g_atom_net_wm_state_hidden;
 static Atom g_atom_net_wm_state_maximized_vert;
@@ -54,6 +55,7 @@ void ewmh_init_atoms(void)
     g_atom_net_wm_name = XInternAtom(g_dpy, "_NET_WM_NAME", False);
     g_atom_utf8_string = XInternAtom(g_dpy, "UTF8_STRING", False);
     g_atom_net_wm_desktop = XInternAtom(g_dpy, "_NET_WM_DESKTOP", False);
+    g_atom_net_wm_pid = XInternAtom(g_dpy, "_NET_WM_PID", False);
     g_atom_net_wm_state = XInternAtom(g_dpy, "_NET_WM_STATE", False);
     g_atom_net_wm_state_hidden = XInternAtom(g_dpy, "_NET_WM_STATE_HIDDEN", False);
     g_atom_net_wm_state_maximized_vert = XInternAtom(g_dpy, "_NET_WM_STATE_MAXIMIZED_VERT", False);
@@ -239,6 +241,27 @@ int ewmh_get_desktop(Window w)
         XFree(prop);
     }
     return desktop;
+}
+
+/* 0 if the window never set _NET_WM_PID (not every app does). Used to
+ * match a taskbar window to an MPRIS player owning the same PID -- see
+ * mpris.c. */
+unsigned long ewmh_get_pid(Window w)
+{
+    Atom actual_type;
+    int actual_format;
+    unsigned long n_items, bytes_after;
+    unsigned char *prop = NULL;
+    unsigned long pid = 0;
+    if (XGetWindowProperty(g_dpy, w, g_atom_net_wm_pid, 0, 1, False, XA_CARDINAL, &actual_type, &actual_format,
+                            &n_items, &bytes_after, &prop) == Success &&
+        prop) {
+        if (n_items > 0) {
+            pid = *(unsigned long *)(void *)prop;
+        }
+        XFree(prop);
+    }
+    return pid;
 }
 
 void ewmh_get_state_flags(Window w, int *minimized, int *maximized)

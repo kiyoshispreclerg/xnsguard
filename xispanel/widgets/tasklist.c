@@ -270,6 +270,29 @@ static void tasklist_tooltip_close_item(PanelWidget *w, void *ctx)
     XFlush(g_dpy);
 }
 
+/* Matches the hovered task's window to an active MPRIS player by PID
+ * (mpris.c polls the bus separately; this is just a cheap lookup against
+ * that cache). Re-resolves the task from local_x the same way
+ * tasklist_get_tooltip() does rather than trusting it was called
+ * first/last -- tooltip.c calls both independently. */
+static int tasklist_get_tooltip_mpris(PanelWidget *w, int local_x, char *out_busname, size_t bufsz, int *out_playing)
+{
+    TasklistPriv *tp = w->priv;
+    tasklist_layout_visible(w);
+
+    if (tp->scrollable && local_x >= tp->arrow_x) {
+        return 0;
+    }
+    for (int vi = 0; vi < tp->n_visible; vi++) {
+        if (local_x >= tp->vis_x[vi] && local_x < tp->vis_x[vi] + tp->vis_w[vi]) {
+            Window win = tp->tasks[tp->vis_idx[vi]].win;
+            unsigned long pid = ewmh_get_pid(win);
+            return mpris_find_for_pid(pid, out_busname, bufsz, out_playing);
+        }
+    }
+    return 0;
+}
+
 static void tasklist_paint(PanelWidget *w, cairo_t *cr)
 {
     TasklistPriv *tp = w->priv;
@@ -503,6 +526,7 @@ const PanelWidgetOps tasklist_ops = {
     .on_button = tasklist_on_button,
     .on_tick = tasklist_on_tick,
     .get_tooltip = tasklist_get_tooltip,
+    .get_tooltip_mpris = tasklist_get_tooltip_mpris,
     .tooltip_activate = tasklist_tooltip_activate,
     .tooltip_close_item = tasklist_tooltip_close_item,
 };
