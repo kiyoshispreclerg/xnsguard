@@ -207,6 +207,7 @@ int ewmh_get_desktop(Window w); /* -1 = sticky/not set */
 void ewmh_get_state_flags(Window w, int *minimized, int *maximized);
 Window ewmh_get_active_window(void);
 int ewmh_get_number_of_desktops(void);
+int ewmh_get_current_desktop(void); /* -1 if unavailable */
 int ewmh_skip_taskbar(Window w); /* 1 if a taskbar should never list this window */
 unsigned long ewmh_get_pid(Window w); /* 0 if the window never set _NET_WM_PID */
 void ewmh_activate(Window w);

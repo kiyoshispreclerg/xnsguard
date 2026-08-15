@@ -142,7 +142,13 @@ Widget types implemented so far:
   panel windows). If the widget doesn't have room for every open window's
   button, it shrinks to as little as one button wide and shows a small
   up/down arrow pair (one task at a time) instead of overflowing the
-  panel -- see "Widget sizing" below.
+  panel -- see "Widget sizing" below. `same_desktop=yes|no` (default
+  `no`) restricts the list to windows on the current `_NET_CURRENT_DESKTOP`
+  (ignored if the WM never sets that property). `minimized_only=yes|no`
+  (default `no`) restricts it to only minimized windows. Both filters
+  apply independently and can be combined; either just narrows the same
+  `_NET_CLIENT_LIST` polling tasklist already does, not a different data
+  source.
 - `winctl`: active-window icon + title, plus configurable window-control
   buttons -- similar to KDE's "Active Window Control" plasmoid. Options:
   `buttons=<comma-list>` (any of `min`, `max`, `close`, in the order given

@@ -35,6 +35,7 @@ static Atom g_atom_net_close_window;
 static Atom g_atom_net_wm_icon;
 static Atom g_atom_net_wm_moveresize;
 static Atom g_atom_net_number_of_desktops;
+static Atom g_atom_net_current_desktop;
 static Atom g_atom_wm_state; /* ICCCM WM_STATE, distinct from _NET_WM_STATE */
 static Atom g_atom_wm_change_state;
 static Atom g_atom_net_wm_state_skip_taskbar;
@@ -65,6 +66,7 @@ void ewmh_init_atoms(void)
     g_atom_net_wm_icon = XInternAtom(g_dpy, "_NET_WM_ICON", False);
     g_atom_net_wm_moveresize = XInternAtom(g_dpy, "_NET_WM_MOVERESIZE", False);
     g_atom_net_number_of_desktops = XInternAtom(g_dpy, "_NET_NUMBER_OF_DESKTOPS", False);
+    g_atom_net_current_desktop = XInternAtom(g_dpy, "_NET_CURRENT_DESKTOP", False);
     g_atom_wm_state = XInternAtom(g_dpy, "WM_STATE", False);
     g_atom_wm_change_state = XInternAtom(g_dpy, "WM_CHANGE_STATE", False);
     g_atom_net_wm_state_skip_taskbar = XInternAtom(g_dpy, "_NET_WM_STATE_SKIP_TASKBAR", False);
@@ -340,6 +342,26 @@ int ewmh_get_number_of_desktops(void)
         XFree(prop);
     }
     return n;
+}
+
+/* -1 if unavailable (some very minimal WM not setting it) -- callers
+ * should treat that as "don't filter by desktop", not "desktop -1". */
+int ewmh_get_current_desktop(void)
+{
+    Atom actual_type;
+    int actual_format;
+    unsigned long n_items, bytes_after;
+    unsigned char *prop = NULL;
+    int desktop = -1;
+    if (XGetWindowProperty(g_dpy, g_root, g_atom_net_current_desktop, 0, 1, False, XA_CARDINAL, &actual_type,
+                            &actual_format, &n_items, &bytes_after, &prop) == Success &&
+        prop) {
+        if (n_items > 0) {
+            desktop = (int)*(long *)(void *)prop;
+        }
+        XFree(prop);
+    }
+    return desktop;
 }
 
 static void ewmh_send_client_message(Window w, Atom message_type, long l0, long l1, long l2, long l3, long l4)

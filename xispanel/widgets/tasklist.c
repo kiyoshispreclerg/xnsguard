@@ -45,6 +45,8 @@ typedef struct {
 
 typedef struct {
     int compact; /* 0 = wide (icon+label), 1 = compact (icon only) */
+    int same_desktop_only; /* 1 = only list tasks on the current _NET_CURRENT_DESKTOP */
+    int minimized_only; /* 1 = only list minimized tasks */
     TaskEntry tasks[MAX_TASKS];
     int n_tasks;
     int n_desktops;
@@ -80,6 +82,8 @@ static int tasklist_init(PanelWidget *w)
     TasklistPriv *tp = w->priv;
     char buf[16];
     tp->compact = kv_get(w->config_kv, "mode", buf, sizeof(buf)) && strcmp(buf, "compact") == 0;
+    tp->same_desktop_only = kv_get(w->config_kv, "same_desktop", buf, sizeof(buf)) && strcmp(buf, "yes") == 0;
+    tp->minimized_only = kv_get(w->config_kv, "minimized_only", buf, sizeof(buf)) && strcmp(buf, "yes") == 0;
     tp->n_desktops = 1;
     w->next_tick_ms = now_ms();
     return 0;
@@ -109,6 +113,8 @@ static void tasklist_on_tick(PanelWidget *w, uint64_t now)
         n = MAX_TASKS;
     }
 
+    int current_desktop = tp->same_desktop_only ? ewmh_get_current_desktop() : -1;
+
     TaskEntry fresh[MAX_TASKS];
     int n_fresh = 0;
     int icon_px = w->thickness > 8 ? w->thickness - 8 : 16;
@@ -117,14 +123,26 @@ static void tasklist_on_tick(PanelWidget *w, uint64_t now)
         if (ewmh_skip_taskbar(win)) {
             continue;
         }
+        int desktop = ewmh_get_desktop(win);
+        int minimized, maximized;
+        ewmh_get_state_flags(win, &minimized, &maximized);
+        /* current_desktop == -1 means either the filter is off, or no WM
+         * ever set _NET_CURRENT_DESKTOP -- either way, don't filter. */
+        if (tp->same_desktop_only && current_desktop >= 0 && desktop >= 0 && desktop != current_desktop) {
+            continue;
+        }
+        if (tp->minimized_only && !minimized) {
+            continue;
+        }
         int old_idx = tasklist_find(tp, win);
         TaskEntry *e = &fresh[n_fresh++];
         memset(e, 0, sizeof(*e));
         e->win = win;
         ewmh_get_title(win, e->title, sizeof(e->title));
         ewmh_get_class(win, e->wm_class, sizeof(e->wm_class));
-        e->desktop = ewmh_get_desktop(win);
-        ewmh_get_state_flags(win, &e->minimized, &e->maximized);
+        e->desktop = desktop;
+        e->minimized = minimized;
+        e->maximized = maximized;
         if (old_idx >= 0) {
             e->pinned = tp->tasks[old_idx].pinned;
             e->icon = tp->tasks[old_idx].icon; /* ownership moves to `fresh` */
