@@ -57,10 +57,14 @@
  * Cells are arranged in a row-major grid, wrapping to a new row once the
  * output's width is exhausted and capping the row count once its height
  * is too -- see compute_group_grid(). */
-#define GROUP_THUMB_W 110
-#define GROUP_THUMB_H 70
+/* Same size as the single-window tooltip's thumbnail (THUMB_W/H) -- the
+ * tooltip is meant to grow with the group instead of shrinking thumbnails
+ * to fit, capped by compute_group_grid()'s wrap/"+N mais" overflow
+ * handling rather than by making each cell smaller. */
+#define GROUP_THUMB_W THUMB_W
+#define GROUP_THUMB_H THUMB_H
 #define GROUP_CELL_GAP 8
-#define GROUP_TITLE_H 16
+#define GROUP_TITLE_ROW_H (TOOLTIP_CLOSE_ICON + 6) /* title + close icon share this row, under the thumbnail */
 #define GROUP_TITLE_MAXW 150 /* text-mode cell content width cap before ellipsis */
 #define GROUP_ROW_GAP 6
 #define GROUP_SCREEN_MARGIN 24 /* stay this far from the output's edges */
@@ -265,7 +269,7 @@ static void paint_popup_group(void)
     if (g_font_face) {
         cairo_set_font_face(cr, g_font_face);
     }
-    cairo_set_font_size(cr, TOOLTIP_FONT_SIZE * 0.85);
+    cairo_set_font_size(cr, TOOLTIP_FONT_SIZE);
 
     for (int i = 0; i < g_popup->group_shown_n; i++) {
         int ix = g_popup->group_item_x[i];
@@ -281,11 +285,15 @@ static void paint_popup_group(void)
                  * the reserved space blank rather than resizing mid-display. */
             }
             cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.95);
-            trim_to_width(cr, title, sizeof(title), GROUP_THUMB_W);
+            /* Leave room for the close icon at the row's right edge -- title
+             * is left-aligned in what's left, not centered under the whole
+             * thumbnail, so it never runs under the icon. */
+            trim_to_width(cr, title, sizeof(title), GROUP_THUMB_W - TOOLTIP_CLOSE_ICON - 8);
             cairo_text_extents_t ext;
             cairo_text_extents(cr, title, &ext);
-            double tx = ix + (GROUP_THUMB_W - ext.width) / 2.0 - ext.x_bearing;
-            double ty = iy + GROUP_THUMB_H + 4 - ext.y_bearing;
+            double row_y = iy + GROUP_THUMB_H;
+            double tx = ix - ext.x_bearing;
+            double ty = row_y + (GROUP_TITLE_ROW_H - ext.height) / 2.0 - ext.y_bearing;
             cairo_move_to(cr, tx, ty);
             cairo_show_text(cr, title);
         } else {
@@ -574,12 +582,12 @@ static void show_popup_group_layout(TooltipPopup *pop)
     if (g_font_face) {
         cairo_set_font_face(probe_cr, g_font_face);
     }
-    cairo_set_font_size(probe_cr, TOOLTIP_FONT_SIZE * 0.85);
+    cairo_set_font_size(probe_cr, TOOLTIP_FONT_SIZE);
 
     int cell_w, cell_h;
     if (pop->group_thumbs) {
         cell_w = GROUP_THUMB_W;
-        cell_h = GROUP_THUMB_H + GROUP_TITLE_H;
+        cell_h = GROUP_THUMB_H + GROUP_TITLE_ROW_H;
     } else {
         /* Widest title across every member (capped), so every row's close
          * icon lines up in the same column. */
@@ -625,8 +633,11 @@ static void show_popup_group_layout(TooltipPopup *pop)
         pop->group_item_w[i] = cell_w;
         pop->group_item_h[i] = cell_h;
         if (pop->group_thumbs) {
-            pop->group_close_x[i] = ix + cell_w - TOOLTIP_CLOSE_ICON - 2;
-            pop->group_close_y[i] = iy + 2;
+            /* Title row, under the thumbnail -- not overlapping it -- same
+             * "close icon at the row's right edge" convention as the
+             * single-window tooltip's own close icon. */
+            pop->group_close_x[i] = ix + cell_w - TOOLTIP_CLOSE_ICON;
+            pop->group_close_y[i] = iy + GROUP_THUMB_H + (GROUP_TITLE_ROW_H - TOOLTIP_CLOSE_ICON) / 2;
         } else {
             pop->group_close_x[i] = ix + cell_w - TOOLTIP_CLOSE_ICON;
             pop->group_close_y[i] = iy + (cell_h - TOOLTIP_CLOSE_ICON) / 2;
