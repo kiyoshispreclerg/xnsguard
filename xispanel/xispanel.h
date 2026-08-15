@@ -235,6 +235,10 @@ int ewmh_get_number_of_desktops(void);
 int ewmh_get_current_desktop(void); /* -1 if unavailable */
 int ewmh_skip_taskbar(Window w); /* 1 if a taskbar should never list this window */
 int ewmh_window_in_rect(Window w, int rx, int ry, int rw, int rh); /* 1 if w's center is inside the rect */
+/* Sets _NET_WM_ICON_GEOMETRY(x,y,w,h) in root coordinates -- tells the WM/
+ * compositor where this window's taskbar button is, so minimize/unminimize
+ * animations target it instead of the pointer position. */
+void ewmh_set_icon_geometry(Window win, int x, int y, int w, int h);
 unsigned long ewmh_get_pid(Window w); /* 0 if the window never set _NET_WM_PID */
 void ewmh_activate(Window w);
 void ewmh_close(Window w);

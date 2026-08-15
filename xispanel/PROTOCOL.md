@@ -132,7 +132,14 @@ Widget types implemented so far:
   ~800ms. `wide` draws icon+title (Windows XP style, titles truncated
   with an ellipsis and capped at 180px); `compact` draws icon only
   (Windows 7 style). A small desktop-number badge is drawn on a task's
-  icon when the session has more than one virtual desktop. Left-click
+  icon when the session has more than one virtual desktop. Every visible
+  task's on-screen button rectangle is also written to its window's
+  `_NET_WM_ICON_GEOMETRY` on every repaint -- the same property KWin/
+  Compiz/etc. read to decide where a minimize/unminimize animation should
+  end/start, instead of defaulting to the pointer position (exact for
+  `rotate=0/180`; an approximation at `90/270` since content is
+  transposed there, acceptable for what's only an animation-endpoint
+  hint). Left-click
   activates a window (or minimizes it if it's already the active one,
   clicking again restores it); right-click opens a context menu
   (Minimizar/Maximizar/Mover/Fechar, plus Fixar/Desafixar). "Fixar" is

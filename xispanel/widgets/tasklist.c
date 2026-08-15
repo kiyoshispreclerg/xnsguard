@@ -364,11 +364,23 @@ static void tasklist_paint(PanelWidget *w, cairo_t *cr)
     Window active = ewmh_get_active_window();
     int icon_px = icon_size_for(w->thickness, tp->icon_padding);
     int icon_y = oy + (w->thickness - icon_px) / 2;
+    /* Root-window-space mapping for _NET_WM_ICON_GEOMETRY below. Uses the
+     * panel's un-rotated physical position (same rect panel_repaint()
+     * computes before applying p->rotate) -- exact for rotate=0/180, an
+     * approximation at 90/270 since the button's actual displayed spot is
+     * transposed; acceptable for what's only an animation-endpoint hint. */
+    int horiz = (p->edge == EDGE_TOP || p->edge == EDGE_BOTTOM);
 
     for (int vi = 0; vi < tp->n_visible; vi++) {
         TaskEntry *e = &tp->tasks[tp->vis_idx[vi]];
         int bx = ox + tp->vis_x[vi];
         int bw = tp->vis_w[vi];
+
+        if (horiz) {
+            ewmh_set_icon_geometry(e->win, p->x + w->x + tp->vis_x[vi], p->y, bw, w->thickness);
+        } else {
+            ewmh_set_icon_geometry(e->win, p->x, p->y + w->x + tp->vis_x[vi], w->thickness, bw);
+        }
 
         if (e->win == active) {
             cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.18);

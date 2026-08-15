@@ -40,6 +40,7 @@ static Atom g_atom_wm_state; /* ICCCM WM_STATE, distinct from _NET_WM_STATE */
 static Atom g_atom_wm_change_state;
 static Atom g_atom_net_wm_state_skip_taskbar;
 static Atom g_atom_net_wm_window_type_desktop;
+static Atom g_atom_net_wm_icon_geometry;
 
 #define ICON_PROP_MAX_LONGS 200000
 
@@ -71,6 +72,20 @@ void ewmh_init_atoms(void)
     g_atom_wm_change_state = XInternAtom(g_dpy, "WM_CHANGE_STATE", False);
     g_atom_net_wm_state_skip_taskbar = XInternAtom(g_dpy, "_NET_WM_STATE_SKIP_TASKBAR", False);
     g_atom_net_wm_window_type_desktop = XInternAtom(g_dpy, "_NET_WM_WINDOW_TYPE_DESKTOP", False);
+    g_atom_net_wm_icon_geometry = XInternAtom(g_dpy, "_NET_WM_ICON_GEOMETRY", False);
+}
+
+/* Tells the window manager/compositor where this task's taskbar button is
+ * on screen, in root coordinates -- the same property KWin/Compiz/etc.
+ * already read to decide where a minimize/iconify animation should end
+ * (and an unminimize animation should start from), instead of defaulting
+ * to the pointer position. Cheap enough to call on every tasklist repaint
+ * (~800ms tick cadence): a handful of 4-CARDINAL ChangeProperty calls. */
+void ewmh_set_icon_geometry(Window win, int x, int y, int w, int h)
+{
+    long geom[4] = {x, y, w, h};
+    XChangeProperty(g_dpy, win, g_atom_net_wm_icon_geometry, XA_CARDINAL, 32, PropModeReplace,
+                     (unsigned char *)geom, 4);
 }
 
 /* Windows a taskbar should never list: desktop/dock window types (KDE's
