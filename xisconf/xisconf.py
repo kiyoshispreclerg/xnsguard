@@ -918,6 +918,239 @@ def list_xisguard_rules():
     return resp.get("rules", []) if resp.get("ok") else None
 
 
+# ══════════════════════════════ Panels (xispanel) ══════════════════════════════
+#
+# xispanel is a panel/taskbar daemon configured entirely by its own text
+# config file (see xispanel/PROTOCOL.md, "Config file"): 3 line-oriented
+# record types (PANEL/WIDGET/THEME), space/tab-separated, values optionally
+# double-quoted to embed spaces. This tab is a plain editor for that file --
+# unlike Wallpaper/Permissions it does *not* mutate a running daemon's live
+# state field-by-field (there's no such control-socket command yet, see the
+# protocol doc's "planned, not yet implemented" section); it only reads and
+# writes xispanel.conf, and separately offers RELOAD/QUIT over the control
+# socket (`xispanel-ctl.sock`) to make a saved file take effect.
+
+PANEL_WIDGET_TYPES = ["launcher", "tasklist", "spacer", "clock", "winctl", "globalmenu", "volume"]
+
+# Per-type widget option schema: (key, kind, default, choices-or-None).
+# kind in {"str", "int", "bool", "choice", "file"}.
+WIDGET_TYPE_SCHEMAS = {
+    "launcher": [
+        ("icon", "file", "", None),
+        ("name", "str", "", None),
+        ("cmd", "str", "", None),
+        ("cmd_middle", "str", "", None),
+        ("cmd_right", "str", "", None),
+        ("cmd_scroll_up", "str", "", None),
+        ("cmd_scroll_down", "str", "", None),
+    ],
+    "tasklist": [
+        ("mode", "choice", "wide", ["wide", "compact"]),
+        ("show_desktop_badge", "bool", "no", None),
+        ("same_desktop", "bool", "no", None),
+        ("same_output", "bool", "no", None),
+        ("minimized_only", "bool", "no", None),
+        ("icon_padding", "int", "0", None),
+        ("show_thumbs", "bool", "no", None),
+        ("group", "bool", "no", None),
+    ],
+    "spacer": [
+        ("size", "str", "", None),
+    ],
+    "clock": [
+        ("format", "str", "%H:%M", None),
+        ("tz", "str", "", None),
+        ("tooltip_tz", "str", "", None),
+    ],
+    "winctl": [
+        ("buttons", "str", "min,max,close", None),
+        ("show", "choice", "maximized", ["maximized", "always"]),
+        ("side", "choice", "end", ["start", "end"]),
+        ("width", "str", "", None),
+        ("same_desktop", "bool", "no", None),
+        ("same_output", "bool", "no", None),
+        ("fallback", "choice", "", ["", "clock", "username", "os", "os_version", "text"]),
+        ("fallback_format", "str", "%H:%M", None),
+        ("fallback_text", "str", "", None),
+    ],
+    "globalmenu": [
+        ("mode", "choice", "closed", ["closed", "open"]),
+    ],
+    "volume": [
+        ("step", "int", "5", None),
+        ("cmd_edit", "str", "pavucontrol", None),
+    ],
+}
+
+PANEL_EDGES = ["top", "bottom", "left", "right"]
+PANEL_MODES = ["dock", "overlay", "autohide"]
+PANEL_ROTATIONS = ["0", "90", "180", "270"]
+
+
+@dataclass
+class PanelWidgetCfg:
+    type: str
+    options: dict = field(default_factory=dict)
+
+
+@dataclass
+class PanelCfg:
+    name: str
+    output: str = "*"
+    options: dict = field(default_factory=dict)
+    theme: dict = field(default_factory=dict)
+    widgets: list = field(default_factory=list)  # list[PanelWidgetCfg]
+
+
+def xispanel_conf_path():
+    config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config")
+    return os.path.join(config_home, "xispanel.conf")
+
+
+def _parse_kv_tokens(tokens):
+    opts = {}
+    for tok in tokens:
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            opts[k] = v
+    return opts
+
+
+def parse_xispanel_conf(path):
+    """Returns (panels: {name: PanelCfg}, order: [name,...]) reflecting the
+    file's PANEL/WIDGET/THEME lines, in file order. Missing file -> both
+    empty (not an error -- xispanel itself treats "no config yet" as normal
+    on first run)."""
+    panels = {}
+    order = []
+    try:
+        with open(path, "r") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return panels, order
+
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            tokens = shlex.split(line)
+        except ValueError:
+            continue  # unbalanced quotes etc -- skip the malformed line
+        if not tokens:
+            continue
+        rectype = tokens[0].upper()
+        if rectype == "PANEL" and len(tokens) >= 3:
+            name, output = tokens[1], tokens[2]
+            panels[name] = PanelCfg(name=name, output=output,
+                                    options=_parse_kv_tokens(tokens[3:]))
+            order.append(name)
+        elif rectype == "WIDGET" and len(tokens) >= 4:
+            panel_name, wtype = tokens[1], tokens[3]
+            if panel_name in panels:
+                panels[panel_name].widgets.append(
+                    PanelWidgetCfg(type=wtype, options=_parse_kv_tokens(tokens[4:])))
+        elif rectype == "THEME" and len(tokens) >= 2:
+            panel_name = tokens[1]
+            if panel_name in panels:
+                panels[panel_name].theme = _parse_kv_tokens(tokens[2:])
+    return panels, order
+
+
+def _format_kv(key, value):
+    value = "" if value is None else str(value)
+    value = value.replace('"', "")
+    if value == "" or any(c.isspace() for c in value):
+        return f'{key}="{value}"'
+    return f"{key}={value}"
+
+
+def write_xispanel_conf(path, panels, order):
+    """Serializes `panels`/`order` (same shape parse_xispanel_conf returns)
+    back to the PANEL/WIDGET/THEME line format, written atomically."""
+    lines = []
+    for name in order:
+        p = panels.get(name)
+        if p is None:
+            continue
+        kvs = " ".join(_format_kv(k, v) for k, v in p.options.items() if v not in (None, ""))
+        lines.append(f"PANEL\t{p.name}\t{p.output or '*'}" + (f"\t{kvs}" if kvs else ""))
+
+        theme_kvs = " ".join(_format_kv(k, v) for k, v in p.theme.items() if v not in (None, ""))
+        if theme_kvs:
+            lines.append(f"THEME\t{p.name}\t{theme_kvs}")
+
+        for i, w in enumerate(p.widgets):
+            wkvs = " ".join(_format_kv(k, v) for k, v in w.options.items() if v not in (None, ""))
+            lines.append(f"WIDGET\t{p.name}\t{i}\t{w.type}" + (f"\t{wkvs}" if wkvs else ""))
+
+    text = "\n".join(lines) + ("\n" if lines else "")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w") as f:
+        f.write(text)
+    os.replace(tmp_path, path)
+
+
+def _xispanel_ctl_paths():
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+    return [os.path.join(runtime_dir, "xispanel-ctl.sock"), "/tmp/xispanel-ctl.sock"]
+
+
+def _xispanel_ctl_send(req):
+    """Sends ONE JSON request line to the xispanel control socket (trying
+    $XDG_RUNTIME_DIR then the /tmp fallback, per the protocol doc) and
+    returns the parsed JSON response."""
+    last_err = OSError("xispanel control socket not found")
+    for path in _xispanel_ctl_paths():
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(3.0)
+        try:
+            s.connect(path)
+            s.sendall((json.dumps(req) + "\n").encode())
+            s.shutdown(socket.SHUT_WR)
+            data = b"".join(iter(lambda: s.recv(65536), b""))
+            return json.loads(data.decode())
+        except OSError as e:
+            last_err = e
+            continue
+        finally:
+            s.close()
+    raise last_err
+
+
+def xispanel_get_status():
+    try:
+        resp = _xispanel_ctl_send({"cmd": "GET_STATUS"})
+    except (OSError, ValueError):
+        return None
+    return resp if resp.get("ok") else None
+
+
+def _hex_to_qcolor(hexstr, default):
+    """Parses xispanel's #RRGGBB / #RRGGBBAA (alpha LAST -- unlike Qt's own
+    #AARRGGBB hex convention, hence the manual parse) into a QColor."""
+    s = (hexstr or "").lstrip("#")
+    try:
+        if len(s) == 8:
+            r, g, b, a = int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16), int(s[6:8], 16)
+        elif len(s) == 6:
+            r, g, b, a = int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16), 255
+        else:
+            raise ValueError
+        return QtGui.QColor(r, g, b, a)
+    except ValueError:
+        return QtGui.QColor(default)
+
+
+def _qcolor_to_hex(color):
+    r, g, b, a = color.red(), color.green(), color.blue(), color.alpha()
+    if a < 255:
+        return f"#{r:02x}{g:02x}{b:02x}{a:02x}"
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
 # ══════════════════════════════ About: server info (xdpyinfo) ══════════════════════════════
 
 def detect_server_info():
@@ -1204,6 +1437,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.baseline_xisguard_status: dict = {}
         self.xisguard_rules: list = []
 
+        # --- panels (xispanel) ---
+        self.xispanel_panels: dict = {}
+        self.xispanel_order: list = []
+        self.selected_panel_name: Optional[str] = None
+        self.selected_widget_index: Optional[int] = None
+
         # --- log status bar ---
         self._last_log_line = None
 
@@ -1233,6 +1472,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._tab_index_pointer_kbd = self.tabs.addTab(
             self._build_pointer_keyboard_tab(), "Pointer/Keyboard")
         self.tabs.addTab(self._build_wallpaper_tab(), "Wallpaper")
+        self.tabs.addTab(self._build_panels_tab(), "Panels")
         self._tab_index_other = self.tabs.addTab(self._build_other_tab(), "Other")
         self._tab_index_permissions = self.tabs.addTab(
             self._build_permissions_tab(), "Permissions")
@@ -1263,6 +1503,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.btn_detect.clicked.connect(self.refresh)
         self.btn_apply.clicked.connect(self.apply)
+
+        # Loaded once here, not on every refresh()/Detect -- unlike the
+        # other tabs, Panels is a plain file editor with its own Save
+        # button, so re-parsing xispanel.conf on every Detect click would
+        # silently blow away unsaved edits made on this tab.
+        self._load_panels_from_disk()
 
         self.refresh()
 
@@ -2011,6 +2257,541 @@ class MainWindow(QtWidgets.QMainWindow):
             self.edit_action_middle.setText(actions["middle"])
             self.edit_action_double.setText(actions["double"])
 
+    # ---------------------------------------------------------------- Panels tab (xispanel)
+
+    def _build_panels_tab(self):
+        outer_tab = QtWidgets.QWidget()
+        outer_layout = QtWidgets.QVBoxLayout(outer_tab)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        outer_layout.addWidget(scroll)
+
+        tab = QtWidgets.QWidget()
+        scroll.setWidget(tab)
+        layout = QtWidgets.QVBoxLayout(tab)
+
+        self.lbl_panels_status = QtWidgets.QLabel("-")
+        self.lbl_panels_status.setWordWrap(True)
+        layout.addWidget(self.lbl_panels_status)
+
+        note = QtWidgets.QLabel(
+            "This tab only reads/writes xispanel.conf directly -- edits "
+            "here don't reach the running daemon until you Reload or "
+            "Restart panels below.")
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color: {SELECT_BORDER};")
+        layout.addWidget(note)
+
+        # ---- panel list ----
+        grp_panels = QtWidgets.QGroupBox("Panels")
+        lv = QtWidgets.QVBoxLayout(grp_panels)
+
+        self.list_panels = QtWidgets.QListWidget()
+        self.list_panels.currentItemChanged.connect(self._on_panel_selected)
+        lv.addWidget(self.list_panels)
+
+        row_btns = QtWidgets.QHBoxLayout()
+        btn_add_panel = QtWidgets.QPushButton("Add panel...")
+        btn_add_panel.clicked.connect(self._on_panel_add)
+        row_btns.addWidget(btn_add_panel)
+        btn_remove_panel = QtWidgets.QPushButton("Remove panel")
+        btn_remove_panel.clicked.connect(self._on_panel_remove)
+        row_btns.addWidget(btn_remove_panel)
+        row_btns.addStretch(1)
+        btn_save = QtWidgets.QPushButton("Save")
+        btn_save.setToolTip("Writes xispanel.conf. Use the Apply button at "
+                            "the top of xisconf to reload the running daemon.")
+        btn_save.clicked.connect(self._on_panels_save)
+        row_btns.addWidget(btn_save)
+        btn_restart = QtWidgets.QPushButton("Restart panels")
+        btn_restart.setToolTip(
+            "Quits and relaunches the xispanel daemon (QUIT, then spawns "
+            "a fresh instance) instead of reloading -- e.g. to fully reset "
+            "stuck panel windows.")
+        btn_restart.clicked.connect(self._on_panels_restart)
+        row_btns.addWidget(btn_restart)
+        lv.addLayout(row_btns)
+
+        layout.addWidget(grp_panels, 1)
+
+        # ---- selected panel's own options ----
+        grp_opts = QtWidgets.QGroupBox("Panel options")
+        outer_opts = QtWidgets.QVBoxLayout(grp_opts)
+
+        # 3 pairs of label:field columns per row instead of 2, to fit this
+        # many fields in fewer rows.
+        grid = QtWidgets.QGridLayout()
+
+        self.cmb_panel_output = QtWidgets.QComboBox()
+        self.cmb_panel_output.currentIndexChanged.connect(
+            lambda _i: self._on_panel_option_changed("output", self.cmb_panel_output.currentData()))
+        grid.addWidget(QtWidgets.QLabel("Output:"), 0, 0)
+        grid.addWidget(self.cmb_panel_output, 0, 1)
+
+        self.cmb_panel_edge = QtWidgets.QComboBox()
+        self.cmb_panel_edge.addItems(PANEL_EDGES)
+        self.cmb_panel_edge.currentTextChanged.connect(
+            lambda text: self._on_panel_option_changed("edge", text))
+        grid.addWidget(QtWidgets.QLabel("Edge:"), 0, 2)
+        grid.addWidget(self.cmb_panel_edge, 0, 3)
+
+        self.cmb_panel_mode = QtWidgets.QComboBox()
+        self.cmb_panel_mode.addItems(PANEL_MODES)
+        self.cmb_panel_mode.currentTextChanged.connect(
+            lambda text: self._on_panel_option_changed("mode", text))
+        grid.addWidget(QtWidgets.QLabel("Mode:"), 0, 4)
+        grid.addWidget(self.cmb_panel_mode, 0, 5)
+
+        self.spin_panel_thickness = QtWidgets.QSpinBox()
+        self.spin_panel_thickness.setRange(4, 256)
+        self.spin_panel_thickness.setSuffix(" px")
+        self.spin_panel_thickness.valueChanged.connect(
+            lambda v: self._on_panel_option_changed("thickness", str(v)))
+        grid.addWidget(QtWidgets.QLabel("Width/height:"), 1, 0)
+        grid.addWidget(self.spin_panel_thickness, 1, 1)
+
+        self.spin_panel_pct = QtWidgets.QSpinBox()
+        self.spin_panel_pct.setRange(1, 100)
+        self.spin_panel_pct.setSuffix(" %")
+        self.spin_panel_pct.valueChanged.connect(
+            lambda v: self._on_panel_option_changed("pct", str(v)))
+        grid.addWidget(QtWidgets.QLabel("Size percentage:"), 1, 2)
+        grid.addWidget(self.spin_panel_pct, 1, 3)
+
+        self.cmb_panel_rotate = QtWidgets.QComboBox()
+        self.cmb_panel_rotate.addItems(PANEL_ROTATIONS)
+        self.cmb_panel_rotate.currentTextChanged.connect(
+            lambda text: self._on_panel_option_changed("rotate", text))
+        grid.addWidget(QtWidgets.QLabel("Rotate:"), 1, 4)
+        grid.addWidget(self.cmb_panel_rotate, 1, 5)
+
+        self.btn_panel_bg = QtWidgets.QPushButton()
+        self.btn_panel_bg.clicked.connect(lambda: self._on_panel_pick_color("bg", self.btn_panel_bg))
+        grid.addWidget(QtWidgets.QLabel("Background color:"), 2, 0)
+        grid.addWidget(self.btn_panel_bg, 2, 1)
+
+        self.btn_panel_fg = QtWidgets.QPushButton()
+        self.btn_panel_fg.clicked.connect(lambda: self._on_panel_pick_color("fg", self.btn_panel_fg))
+        grid.addWidget(QtWidgets.QLabel("Foreground color:"), 2, 2)
+        grid.addWidget(self.btn_panel_fg, 2, 3)
+
+        self.spin_panel_spacing = QtWidgets.QSpinBox()
+        self.spin_panel_spacing.setRange(0, 64)
+        self.spin_panel_spacing.setSuffix(" px")
+        self.spin_panel_spacing.valueChanged.connect(
+            lambda v: self._on_panel_theme_changed("spacing", str(v)))
+        grid.addWidget(QtWidgets.QLabel("Widget spacing:"), 2, 4)
+        grid.addWidget(self.spin_panel_spacing, 2, 5)
+
+        self.spin_panel_tooltip_delay = QtWidgets.QSpinBox()
+        self.spin_panel_tooltip_delay.setRange(0, 5000)
+        self.spin_panel_tooltip_delay.setSuffix(" ms")
+        self.spin_panel_tooltip_delay.valueChanged.connect(
+            lambda v: self._on_panel_option_changed("tooltip_delay", str(v)))
+        grid.addWidget(QtWidgets.QLabel("Tooltip delay:"), 3, 0)
+        grid.addWidget(self.spin_panel_tooltip_delay, 3, 1)
+
+        self.spin_panel_tooltip_close_delay = QtWidgets.QSpinBox()
+        self.spin_panel_tooltip_close_delay.setRange(0, 5000)
+        self.spin_panel_tooltip_close_delay.setSuffix(" ms")
+        self.spin_panel_tooltip_close_delay.valueChanged.connect(
+            lambda v: self._on_panel_option_changed("tooltip_close_delay", str(v)))
+        grid.addWidget(QtWidgets.QLabel("Tooltip close delay:"), 3, 2)
+        grid.addWidget(self.spin_panel_tooltip_close_delay, 3, 3)
+
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
+        grid.setColumnStretch(5, 1)
+        outer_opts.addLayout(grid)
+
+        self._panel_option_widgets = [
+            self.cmb_panel_output, self.cmb_panel_edge, self.spin_panel_thickness,
+            self.spin_panel_pct, self.cmb_panel_mode, self.cmb_panel_rotate,
+            self.btn_panel_bg, self.btn_panel_fg, self.spin_panel_spacing,
+            self.spin_panel_tooltip_delay, self.spin_panel_tooltip_close_delay,
+        ]
+
+        # ---- widgets on the selected panel, and that widget's own options
+        # ---- side by side, resizable (drag the splitter handle to give
+        # ---- one side more room than the other).
+        splitter = QtWidgets.QSplitter(_orientation_h())
+
+        grp_widgets = QtWidgets.QGroupBox("Widgets")
+        wv = QtWidgets.QVBoxLayout(grp_widgets)
+
+        self.list_panel_widgets = QtWidgets.QListWidget()
+        self.list_panel_widgets.currentRowChanged.connect(self._on_panel_widget_selected)
+        wv.addWidget(self.list_panel_widgets)
+
+        row_w_btns = QtWidgets.QHBoxLayout()
+        self.cmb_new_widget_type = QtWidgets.QComboBox()
+        self.cmb_new_widget_type.addItems(PANEL_WIDGET_TYPES)
+        row_w_btns.addWidget(self.cmb_new_widget_type)
+        btn_add_widget = QtWidgets.QPushButton("Add widget")
+        btn_add_widget.clicked.connect(self._on_panel_widget_add)
+        row_w_btns.addWidget(btn_add_widget)
+        btn_remove_widget = QtWidgets.QPushButton("Remove widget")
+        btn_remove_widget.clicked.connect(self._on_panel_widget_remove)
+        row_w_btns.addWidget(btn_remove_widget)
+        row_w_btns.addStretch(1)
+        wv.addLayout(row_w_btns)
+
+        splitter.addWidget(grp_widgets)
+
+        # ---- the selected widget's own options, one more level down ----
+        self.grp_widget_opts = QtWidgets.QGroupBox("Widget options")
+        self.form_widget_opts = QtWidgets.QFormLayout(self.grp_widget_opts)
+        splitter.addWidget(self.grp_widget_opts)
+
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        outer_opts.addWidget(splitter, 1)
+
+        layout.addWidget(grp_opts)
+        layout.addStretch(1)
+
+        self._set_panel_options_enabled(False)
+        return outer_tab
+
+    def _set_panel_options_enabled(self, enabled):
+        for w in self._panel_option_widgets:
+            w.setEnabled(enabled)
+        self.list_panel_widgets.setEnabled(enabled)
+        self.grp_widget_opts.setEnabled(enabled)
+
+    # ---- loading/saving the whole file ----
+
+    def _load_panels_from_disk(self):
+        path = xispanel_conf_path()
+        self.xispanel_panels, self.xispanel_order = parse_xispanel_conf(path)
+        if self.xispanel_order:
+            self.lbl_panels_status.setText(
+                f"Loaded {len(self.xispanel_order)} panel(s) from {path}.")
+        else:
+            self.lbl_panels_status.setText(
+                f"No panels yet in {path} (missing or empty). Add one and "
+                "Save, or start xispanel once to generate its default config.")
+        self.selected_panel_name = None
+        self.selected_widget_index = None
+        self._rebuild_panel_list()
+        self._sync_panel_options_form()
+        self._rebuild_panel_widget_list()
+        self._rebuild_widget_options_form()
+
+    def _on_panels_save(self):
+        path = xispanel_conf_path()
+        try:
+            write_xispanel_conf(path, self.xispanel_panels, self.xispanel_order)
+        except OSError as e:
+            self._log(f"ERROR saving {path}: {e}")
+            QtWidgets.QMessageBox.critical(self, "Save failed", str(e))
+            return
+        self._log(f"Saved {path} ({len(self.xispanel_order)} panel(s)).")
+        self.lbl_panels_status.setText(
+            f"Saved {len(self.xispanel_order)} panel(s) to {path}. "
+            "Click Apply (top of xisconf) to reload the running daemon, "
+            "or Restart panels below.")
+
+    def _on_panels_restart(self):
+        self._log("$ xispanel-ctl QUIT (then relaunch xispanel)")
+        if self.chk_dry_run.isChecked():
+            self._log("(simulation mode: nothing was executed)")
+            return
+        try:
+            resp = _xispanel_ctl_send({"cmd": "QUIT"})
+            self._log(f"xispanel: {resp}")
+        except OSError as e:
+            self._log(f"xispanel not reachable ({e}) -- launching a fresh instance.")
+        time.sleep(0.3)
+        try:
+            subprocess.Popen(["xispanel"], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+            self._log("xispanel relaunched.")
+        except FileNotFoundError:
+            self._log("ERROR: xispanel executable not found in PATH.")
+            QtWidgets.QMessageBox.critical(
+                self, "xispanel error", "xispanel executable not found in PATH.")
+
+    # ---- panel list + selected panel's options ----
+
+    def _refresh_panel_output_combo(self):
+        current = self.cmb_panel_output.currentData()
+        self.cmb_panel_output.blockSignals(True)
+        self.cmb_panel_output.clear()
+        self.cmb_panel_output.addItem("* (whole virtual screen)", "*")
+        for out in self.outputs.values():
+            if out.connected:
+                self.cmb_panel_output.addItem(out.name, out.name)
+        idx = self.cmb_panel_output.findData(current) if current else -1
+        self.cmb_panel_output.setCurrentIndex(idx if idx >= 0 else 0)
+        self.cmb_panel_output.blockSignals(False)
+
+    def _rebuild_panel_list(self):
+        self.list_panels.blockSignals(True)
+        self.list_panels.clear()
+        role = QtCore.Qt.ItemDataRole.UserRole if _QT6 else QtCore.Qt.UserRole
+        for name in self.xispanel_order:
+            p = self.xispanel_panels[name]
+            edge = p.options.get("edge", "top")
+            item = QtWidgets.QListWidgetItem(f"{name}  ({p.output}, {edge})")
+            item.setData(role, name)
+            self.list_panels.addItem(item)
+        self.list_panels.blockSignals(False)
+        if self.xispanel_order:
+            idx = (self.xispanel_order.index(self.selected_panel_name)
+                  if self.selected_panel_name in self.xispanel_order else 0)
+            self.list_panels.setCurrentRow(idx)
+        else:
+            self.selected_panel_name = None
+
+    def _refresh_current_panel_list_item(self):
+        row = self.list_panels.currentRow()
+        panel = self._current_panel()
+        if row < 0 or not panel:
+            return
+        edge = panel.options.get("edge", "top")
+        self.list_panels.item(row).setText(f"{panel.name}  ({panel.output}, {edge})")
+
+    def _current_panel(self):
+        return self.xispanel_panels.get(self.selected_panel_name)
+
+    def _on_panel_selected(self, current, _previous):
+        role = QtCore.Qt.ItemDataRole.UserRole if _QT6 else QtCore.Qt.UserRole
+        self.selected_panel_name = current.data(role) if current else None
+        self.selected_widget_index = None
+        self._sync_panel_options_form()
+        self._rebuild_panel_widget_list()
+        self._rebuild_widget_options_form()
+
+    def _sync_panel_options_form(self):
+        panel = self._current_panel()
+        self._set_panel_options_enabled(panel is not None)
+        self._updating_panel = True
+        try:
+            self._refresh_panel_output_combo()
+            if panel is None:
+                return
+            idx = self.cmb_panel_output.findData(panel.output)
+            self.cmb_panel_output.setCurrentIndex(idx if idx >= 0 else 0)
+            self.cmb_panel_edge.setCurrentText(panel.options.get("edge", "top"))
+            self.spin_panel_thickness.setValue(int(panel.options.get("thickness") or 32))
+            self.spin_panel_pct.setValue(int(panel.options.get("pct") or 100))
+            mode = panel.options.get("mode", "dock")
+            self.cmb_panel_mode.setCurrentText(mode if mode in PANEL_MODES else "dock")
+            rotate = panel.options.get("rotate", "0")
+            self.cmb_panel_rotate.setCurrentText(rotate if rotate in PANEL_ROTATIONS else "0")
+            self.spin_panel_spacing.setValue(int(panel.theme.get("spacing") or 4))
+            self.spin_panel_tooltip_delay.setValue(int(panel.options.get("tooltip_delay") or 500))
+            self.spin_panel_tooltip_close_delay.setValue(
+                int(panel.options.get("tooltip_close_delay") or 300))
+            self._update_panel_color_button(self.btn_panel_bg, panel.theme.get("bg", ""), "#202020")
+            self._update_panel_color_button(self.btn_panel_fg, panel.theme.get("fg", ""), "#eeeeee")
+        finally:
+            self._updating_panel = False
+
+    def _update_panel_color_button(self, button, hexval, default):
+        button.setText(hexval or f"(default {default})")
+        disp = "#" + (hexval or default).lstrip("#")[:6]
+        button.setStyleSheet(f"background-color: {disp}; color: #ffffff; border: 1px solid #000;")
+
+    def _on_panel_option_changed(self, key, value):
+        if self._updating_panel:
+            return
+        panel = self._current_panel()
+        if not panel:
+            return
+        if key == "output":
+            panel.output = value or "*"
+        else:
+            panel.options[key] = value
+        self._refresh_current_panel_list_item()
+
+    def _on_panel_theme_changed(self, key, value):
+        if self._updating_panel:
+            return
+        panel = self._current_panel()
+        if panel:
+            panel.theme[key] = value
+
+    def _on_panel_pick_color(self, key, button):
+        panel = self._current_panel()
+        if not panel:
+            return
+        default = "#202020" if key == "bg" else "#eeeeee"
+        current = _hex_to_qcolor(panel.theme.get(key, ""), default)
+        opts = (QtWidgets.QColorDialog.ColorDialogOption.ShowAlphaChannel if _QT6
+               else QtWidgets.QColorDialog.ShowAlphaChannel)
+        color = QtWidgets.QColorDialog.getColor(current, self, "Choose color", opts)
+        if not color.isValid():
+            return
+        hexval = _qcolor_to_hex(color)
+        panel.theme[key] = hexval
+        self._update_panel_color_button(button, hexval, default)
+
+    def _on_panel_add(self):
+        name, ok = QtWidgets.QInputDialog.getText(self, "Add panel", "Panel name:")
+        name = name.strip()
+        if not ok or not name:
+            return
+        if name in self.xispanel_panels:
+            QtWidgets.QMessageBox.warning(self, "Name in use", f'Panel "{name}" already exists.')
+            return
+        self.xispanel_panels[name] = PanelCfg(
+            name=name, output="*",
+            options={"edge": "top", "pct": "100", "thickness": "32", "mode": "dock"})
+        self.xispanel_order.append(name)
+        self.selected_panel_name = name
+        self._rebuild_panel_list()
+
+    def _on_panel_remove(self):
+        panel = self._current_panel()
+        if not panel:
+            QtWidgets.QMessageBox.information(self, "No selection", "Select a panel first.")
+            return
+        confirm = QtWidgets.QMessageBox.question(
+            self, "Remove panel", f'Remove panel "{panel.name}" and all its widgets?')
+        yes = QtWidgets.QMessageBox.StandardButton.Yes if _QT6 else QtWidgets.QMessageBox.Yes
+        if confirm != yes:
+            return
+        del self.xispanel_panels[panel.name]
+        self.xispanel_order.remove(panel.name)
+        self.selected_panel_name = None
+        self._rebuild_panel_list()
+        self._sync_panel_options_form()
+        self._rebuild_panel_widget_list()
+        self._rebuild_widget_options_form()
+
+    # ---- widgets on the selected panel ----
+
+    def _widget_summary(self, w):
+        for key in ("name", "cmd", "format", "mode"):
+            if w.options.get(key):
+                return f"({w.options[key]})"
+        return ""
+
+    def _rebuild_panel_widget_list(self):
+        self.list_panel_widgets.blockSignals(True)
+        self.list_panel_widgets.clear()
+        panel = self._current_panel()
+        if panel:
+            for w in panel.widgets:
+                self.list_panel_widgets.addItem(f"{w.type}  {self._widget_summary(w)}".rstrip())
+        self.list_panel_widgets.blockSignals(False)
+        if panel and panel.widgets:
+            idx = (self.selected_widget_index
+                  if self.selected_widget_index is not None
+                  and 0 <= self.selected_widget_index < len(panel.widgets) else 0)
+            self.list_panel_widgets.setCurrentRow(idx)
+        else:
+            self.selected_widget_index = None
+
+    def _current_widget(self):
+        panel = self._current_panel()
+        if not panel or self.selected_widget_index is None:
+            return None
+        if not (0 <= self.selected_widget_index < len(panel.widgets)):
+            return None
+        return panel.widgets[self.selected_widget_index]
+
+    def _on_panel_widget_selected(self, row):
+        self.selected_widget_index = row if row is not None and row >= 0 else None
+        self._rebuild_widget_options_form()
+
+    def _on_panel_widget_add(self):
+        panel = self._current_panel()
+        if not panel:
+            QtWidgets.QMessageBox.information(self, "No panel selected", "Select a panel first.")
+            return
+        wtype = self.cmb_new_widget_type.currentText()
+        panel.widgets.append(PanelWidgetCfg(type=wtype, options={}))
+        self.selected_widget_index = len(panel.widgets) - 1
+        self._rebuild_panel_widget_list()
+
+    def _on_panel_widget_remove(self):
+        panel = self._current_panel()
+        if not panel or self.selected_widget_index is None:
+            QtWidgets.QMessageBox.information(self, "No selection", "Select a widget first.")
+            return
+        del panel.widgets[self.selected_widget_index]
+        self.selected_widget_index = None
+        self._rebuild_panel_widget_list()
+        self._rebuild_widget_options_form()
+
+    # ---- the selected widget's own options ----
+
+    def _rebuild_widget_options_form(self):
+        while self.form_widget_opts.rowCount():
+            self.form_widget_opts.removeRow(0)
+        widget = self._current_widget()
+        self.grp_widget_opts.setVisible(widget is not None)
+        if not widget:
+            return
+        self.grp_widget_opts.setTitle(f"Widget options — {widget.type}")
+        for key, kind, default, choices in WIDGET_TYPE_SCHEMAS.get(widget.type, []):
+            value = widget.options.get(key, default)
+            ctl = self._make_widget_option_control(key, kind, value, choices)
+            self.form_widget_opts.addRow(key + ":", ctl)
+
+    def _make_widget_option_control(self, key, kind, value, choices):
+        if kind == "bool":
+            w = QtWidgets.QCheckBox()
+            w.setChecked(value == "yes")
+            w.toggled.connect(
+                lambda checked, k=key: self._on_widget_option_changed(k, "yes" if checked else "no"))
+            return w
+        if kind == "choice":
+            w = QtWidgets.QComboBox()
+            w.addItems(choices)
+            if value in choices:
+                w.setCurrentText(value)
+            w.currentTextChanged.connect(
+                lambda text, k=key: self._on_widget_option_changed(k, text))
+            return w
+        if kind == "int":
+            w = QtWidgets.QSpinBox()
+            w.setRange(0, 100000)
+            try:
+                w.setValue(int(value))
+            except (TypeError, ValueError):
+                pass
+            w.valueChanged.connect(lambda v, k=key: self._on_widget_option_changed(k, str(v)))
+            return w
+        if kind == "file":
+            row = QtWidgets.QWidget()
+            hl = QtWidgets.QHBoxLayout(row)
+            hl.setContentsMargins(0, 0, 0, 0)
+            edit = QtWidgets.QLineEdit(value)
+            edit.textChanged.connect(lambda text, k=key: self._on_widget_option_changed(k, text))
+            hl.addWidget(edit, 1)
+            btn = QtWidgets.QPushButton("...")
+            btn.setMaximumWidth(30)
+            btn.clicked.connect(lambda _c, e=edit: self._pick_widget_icon_file(e))
+            hl.addWidget(btn)
+            return row
+        w = QtWidgets.QLineEdit(value)
+        w.textChanged.connect(lambda text, k=key: self._on_widget_option_changed(k, text))
+        return w
+
+    def _pick_widget_icon_file(self, edit):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Choose an icon", edit.text() or "")
+        if path:
+            edit.setText(path)
+
+    def _on_widget_option_changed(self, key, value):
+        widget = self._current_widget()
+        if not widget:
+            return
+        if value:
+            widget.options[key] = value
+        else:
+            widget.options.pop(key, None)
+        if self.selected_widget_index is not None:
+            item = self.list_panel_widgets.item(self.selected_widget_index)
+            if item:
+                item.setText(f"{widget.type}  {self._widget_summary(widget)}".rstrip())
+
     # ---------------------------------------------------------------- Other tab
 
     def _build_other_tab(self):
@@ -2440,6 +3221,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_desktop_count()
         self._refresh_power()
         self._refresh_wallpaper()
+        self._sync_panel_options_form()
         self._refresh_permissions()
         self._refresh_about()
         self._update_dirty_indicators()
@@ -2896,10 +3678,9 @@ class MainWindow(QtWidgets.QMainWindow):
         xisguard_status_change = self._xisguard_status_diff()
 
         all_prop_cmds = prop_cmds + pointer_cmds + keyboard_cmds + power_cmds + desktop_cmds
-
-        if not screen_args and not all_prop_cmds and not xisguard_status_change:
-            self._log("Nothing to apply (no pending changes).")
-            return
+        had_pending = bool(screen_args or all_prop_cmds or xisguard_status_change)
+        if not had_pending:
+            self._log("Nothing to apply on Screens/Pointer/Keyboard/Other/Permissions.")
 
         dry = self.chk_dry_run.isChecked()
 
@@ -2933,10 +3714,26 @@ class MainWindow(QtWidgets.QMainWindow):
         if xisguard_status_change:
             self._permissions_send({"cmd": "SET_STATUS", **xisguard_status_change})
 
+        # xispanel has no per-field diff to stage (Panels is a plain file
+        # editor, see its Save button) -- Apply always tells the running
+        # daemon to reload whatever's currently saved in xispanel.conf, a
+        # harmless no-op if nothing changed there since the last reload.
+        self._apply_xispanel_reload(dry)
+
         if dry:
             self._log("(simulation mode: nothing was executed)")
-        else:
+        elif had_pending:
             self.refresh()
+
+    def _apply_xispanel_reload(self, dry):
+        self._log("$ xispanel-ctl RELOAD")
+        if dry:
+            return
+        try:
+            resp = _xispanel_ctl_send({"cmd": "RELOAD"})
+            self._log(f"xispanel: {resp}")
+        except OSError as e:
+            self._log(f"xispanel not reachable ({e}) -- skipped reload.")
 
     def _log(self, text):
         self.log.appendPlainText(text)
