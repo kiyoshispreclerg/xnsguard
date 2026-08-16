@@ -188,6 +188,12 @@ struct Panel {
 
     /* resolved output geometry */
     int out_x, out_y, out_w, out_h;
+    /* resolved output refresh rate in Hz, 0 if RandR couldn't report one
+     * (e.g. no matching output, or a mode with no timing info) -- see
+     * resolve_output_geometry(). Used by tooltip.c to pace the live-
+     * thumbnail fallback poll to roughly this output's own frame rate
+     * instead of a fixed guess. */
+    double out_refresh_hz;
     /* resolved panel geometry when shown */
     int x, y, w, h;
     int thickness;

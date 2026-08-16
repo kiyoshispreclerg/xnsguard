@@ -39,22 +39,8 @@
  * and configurable (tooltip_close_delay=<ms>, default 300, 0 = instant) --
  * see Panel::tooltip_close_delay_ms and close_delay_ms() below. */
 #define TOOLTIP_REFRESH_MS 1000 /* how often to re-poll get_tooltip() while shown */
-#define THUMB_FALLBACK_MS 33 /* baseline repaint cadence (~30fps) for a shown live thumbnail, on top
-                                * of (not instead of) the XDamage-driven repaint. XDamage gives
-                                * near-zero-latency updates when it works, but on at least one real
-                                * setup damage notifications for a GPU-presented (video) window
-                                * stopped arriving entirely a few frames after the tooltip opened --
-                                * confirmed via timestamped logging: the X server/compositor simply
-                                * never sent another XDamageNotify, while the real window kept
-                                * rendering fine. That's outside this file's control to fix (likely a
-                                * server/compositor-side Present+Composite propagation limitation),
-                                * so instead of treating this as a rare safety net, it's a real
-                                * polling driver: thumb_paint() re-fetching the composited pixmap
-                                * directly is *always* correct when called (verified live), the only
-                                * thing damage timing affected was how often that happened. Cheap
-                                * enough to run at this rate now that thumb_paint() caches the
-                                * resolved target window instead of re-discovering (and XSync'ing)
-                                * it on every single call -- see ThumbWatch::target's doc comment. */
+#define THUMB_FALLBACK_DEFAULT_MS 33 /* used when the panel's output refresh rate is unknown -- see
+                                        * thumb_fallback_interval_ms() */
 #define TOOLTIP_GAP 0 /* no dead zone between panel and popup, so the pointer
                         * can cross directly from one to the other */
 #define TOOLTIP_PAD_X 10
@@ -284,6 +270,43 @@ static double tooltip_font_size(void)
 static uint64_t close_delay_ms(void)
 {
     return (uint64_t)(g_panel ? g_panel->tooltip_close_delay_ms : 300);
+}
+
+/* Baseline repaint cadence for a shown live thumbnail, on top of (not
+ * instead of) the XDamage-driven repaint -- see thumb_take_dirty()'s
+ * call site in tooltip_tick(). XDamage gives near-zero-latency updates
+ * when it works, but on at least one real setup damage notifications for
+ * a GPU-presented (video) window stopped arriving entirely a few frames
+ * after the tooltip opened, confirmed via timestamped logging: the X
+ * server/compositor simply never sent another XDamageNotify, while the
+ * real window kept rendering fine. That's outside this file's control to
+ * fix (likely a server/compositor-side Present+Composite propagation
+ * limitation), so instead of treating this as a rare safety net, it's a
+ * real polling driver -- thumb_paint() re-fetching the composited pixmap
+ * directly is *always* correct when called (verified live), the only
+ * thing damage timing affected was how often that happened.
+ *
+ * Paced to half the tooltip's own panel's output refresh rate (a
+ * thumbnail doesn't need to match the source window's own frame rate 1:1
+ * to read as "live", and matching a high-refresh output's full rate
+ * would just burn X round-trips for no visible benefit at this size) --
+ * falls back to THUMB_FALLBACK_DEFAULT_MS when the rate is unknown
+ * (RandR reported no usable mode timing, or the panel spans "*"/every
+ * output, see Panel::out_refresh_hz). Only affordable to poll this often
+ * at all because thumb_paint() caches the resolved composited window
+ * instead of re-discovering (and XSync'ing) it on every single call --
+ * see ThumbWatch::target's doc comment in thumb.c. */
+static uint64_t thumb_fallback_interval_ms(void)
+{
+    double hz = g_panel ? g_panel->out_refresh_hz : 0;
+    if (hz <= 1.0) {
+        return THUMB_FALLBACK_DEFAULT_MS;
+    }
+    uint64_t ms = (uint64_t)(1000.0 / (hz / 2.0));
+    if (ms < 8) {
+        ms = 8; /* don't let a very high refresh rate turn this into a busy-loop */
+    }
+    return ms;
 }
 
 /* Splits g_text on '\n' into up to TOOLTIP_MAX_LINES lines and measures
@@ -1028,14 +1051,15 @@ void tooltip_tick(uint64_t now)
      * for the watched window(s) (thumb_handle_event(), called from
      * xispanel.c's main event loop, sets the dirty flag as soon as one
      * arrives) -- repaints exactly when the source window's content
-     * actually changed, not on a blind cadence. THUMB_FALLBACK_MS is a
-     * backstop on top of that for when damage notifications stop
-     * arriving for reasons outside this file's control (see its doc
-     * comment) -- without it, that looks like the thumbnail silently
-     * freezing instead of just becoming a little less than instant. */
+     * actually changed, not on a blind cadence. thumb_fallback_interval_
+     * ms()'s poll is a backstop on top of that for when damage
+     * notifications stop arriving for reasons outside this file's
+     * control (see its doc comment) -- without it, that looks like the
+     * thumbnail silently freezing instead of just becoming a little less
+     * than instant. */
     if (g_has_thumb || (g_has_group && g_popup && g_popup->group_thumbs)) {
         int dirty = thumb_take_dirty();
-        if (dirty || now - g_last_thumb_paint_ms >= THUMB_FALLBACK_MS) {
+        if (dirty || now - g_last_thumb_paint_ms >= thumb_fallback_interval_ms()) {
             g_last_thumb_paint_ms = now;
             paint_popup();
         }
@@ -1054,12 +1078,13 @@ uint64_t tooltip_next_wake_ms(void)
         if (wake == 0 || w2 < wake) {
             wake = w2;
         }
-        /* Bounds select()'s timeout so THUMB_FALLBACK_MS's backstop poll
-         * (tooltip_tick()) actually fires on schedule even with zero X
-         * activity in between -- the fast path (XDamage) doesn't need an
-         * entry here since it wakes select() via the X fd on its own. */
+        /* Bounds select()'s timeout so thumb_fallback_interval_ms()'s
+         * backstop poll (tooltip_tick()) actually fires on schedule even
+         * with zero X activity in between -- the fast path (XDamage)
+         * doesn't need an entry here since it wakes select() via the X
+         * fd on its own. */
         if (g_shown && (g_has_thumb || (g_has_group && g_popup && g_popup->group_thumbs))) {
-            uint64_t w3 = g_last_thumb_paint_ms + THUMB_FALLBACK_MS;
+            uint64_t w3 = g_last_thumb_paint_ms + thumb_fallback_interval_ms();
             if (wake == 0 || w3 < wake) {
                 wake = w3;
             }

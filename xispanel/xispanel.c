@@ -553,7 +553,10 @@ static int init_font(const char *family_hint)
 /* RandR output geometry (same pattern as xisback's resolve_output_geometry)*/
 /* ------------------------------------------------------------------ */
 
-static int resolve_output_geometry(const char *name, int *ox, int *oy, int *ow, int *oh)
+/* *out_hz is left at 0 if the CRTC's current mode has no usable timing
+ * info to compute one from -- callers should treat that as "unknown",
+ * not "the output truly refreshes at 0Hz". */
+static int resolve_output_geometry(const char *name, int *ox, int *oy, int *ow, int *oh, double *out_hz)
 {
     XRRScreenResources *res = XRRGetScreenResourcesCurrent(g_dpy, g_root);
     if (!res) {
@@ -569,6 +572,26 @@ static int resolve_output_geometry(const char *name, int *ox, int *oy, int *ow, 
                 *oy = ci->y;
                 *ow = (int)ci->width;
                 *oh = (int)ci->height;
+                *out_hz = 0;
+                for (int m = 0; m < res->nmode; m++) {
+                    if (res->modes[m].id != ci->mode) {
+                        continue;
+                    }
+                    XRRModeInfo *mi = &res->modes[m];
+                    if (mi->hTotal == 0 || mi->vTotal == 0) {
+                        break;
+                    }
+                    /* Same formula xrandr itself uses to print "60.00*" etc. */
+                    double vtotal = mi->vTotal;
+                    if (mi->modeFlags & RR_DoubleScan) {
+                        vtotal *= 2;
+                    }
+                    if (mi->modeFlags & RR_Interlace) {
+                        vtotal /= 2;
+                    }
+                    *out_hz = (double)mi->dotClock / ((double)mi->hTotal * vtotal);
+                    break;
+                }
                 found = 1;
                 XRRFreeCrtcInfo(ci);
             }
@@ -650,7 +673,8 @@ static void write_default_config_if_missing(void)
 
 static void panel_resolve_geometry(Panel *p)
 {
-    if (strcmp(p->output, "*") != 0 && resolve_output_geometry(p->output, &p->out_x, &p->out_y, &p->out_w, &p->out_h)) {
+    if (strcmp(p->output, "*") != 0 &&
+        resolve_output_geometry(p->output, &p->out_x, &p->out_y, &p->out_w, &p->out_h, &p->out_refresh_hz)) {
         /* matched */
     } else {
         if (strcmp(p->output, "*") != 0) {
@@ -660,6 +684,7 @@ static void panel_resolve_geometry(Panel *p)
         p->out_y = 0;
         p->out_w = DisplayWidth(g_dpy, g_screen);
         p->out_h = DisplayHeight(g_dpy, g_screen);
+        p->out_refresh_hz = 0; /* spans every output ("*") or none matched -- no single rate applies */
     }
 
     p->thickness = p->thickness_cfg;
