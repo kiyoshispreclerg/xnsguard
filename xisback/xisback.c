@@ -725,6 +725,17 @@ static void layer_finish_fade(Layer *l)
     }
     l->win = l->fade_win;
     l->cur_pixmap = l->fade_pixmap;
+    /* layer_fade_tick() only ever sets opacity for progress < 1.0 (the
+     * "still fading" case) -- the tick that notices progress >= 1.0 comes
+     * straight here without a final "set it to fully opaque" step, and
+     * this function is also reached mid-fade (a new switch or a resize
+     * cutting the animation short) where the window may be sitting at any
+     * partial opacity. Either way, force it to fully opaque now: leaving
+     * it at ~97-99% forever is invisible to some compositors' blending but
+     * not others (e.g. a per-output pipeline may not special-case
+     * "opaque enough" and end up not fully repainting under it, showing
+     * stale pixels from whatever was on screen before). */
+    set_window_opacity(l->win, 1.0);
     l->fade_win = None;
     l->fade_pixmap = None;
     l->fading = 0;
