@@ -23,3 +23,23 @@ int thumb_paint(cairo_t *cr, Window win, double x, double y, double max_w, doubl
     (void)max_h;
     return 0;
 }
+
+void thumb_watch(Window win)
+{
+    (void)win;
+}
+
+void thumb_unwatch_all(void)
+{
+}
+
+int thumb_handle_event(const XEvent *ev)
+{
+    (void)ev;
+    return 0;
+}
+
+int thumb_take_dirty(void)
+{
+    return 0;
+}

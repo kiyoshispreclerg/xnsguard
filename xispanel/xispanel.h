@@ -550,6 +550,22 @@ int thumb_available(void); /* 1 if libXcomposite was built in AND a compositor i
  * (preserving aspect ratio, never upscaled past the window's real size,
  * centered in any leftover space), returns 1 if it painted anything. */
 int thumb_paint(cairo_t *cr, Window win, double x, double y, double max_w, double max_h);
+/* Live-thumbnail change tracking via XDamage -- see thumb.c's file
+ * comment. tooltip.c calls thumb_watch() for every window a shown
+ * tooltip currently displays a thumbnail of (idempotent -- a window
+ * already being watched is a no-op), and thumb_unwatch_all() once that
+ * set changes or the tooltip closes. */
+void thumb_watch(Window win);
+void thumb_unwatch_all(void);
+/* Returns 1 if `ev` was an XDamage notification (for a watched window or
+ * a just-unwatched one -- consumed either way, to keep the server from
+ * queuing more), same dispatch-chain pattern as panel_menu_handle_event()/
+ * tooltip_handle_event(). */
+int thumb_handle_event(const XEvent *ev);
+/* Returns 1 (and clears) if any watched window has been damaged since
+ * the last call -- tooltip_tick() polls this once per main-loop
+ * iteration to decide whether to repaint a shown thumbnail. */
+int thumb_take_dirty(void);
 
 /* ---- widget registry: each file under widgets/ defines one of these --- */
 extern const PanelWidgetOps spacer_ops;

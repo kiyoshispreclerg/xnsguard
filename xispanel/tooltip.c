@@ -39,6 +39,22 @@
  * and configurable (tooltip_close_delay=<ms>, default 300, 0 = instant) --
  * see Panel::tooltip_close_delay_ms and close_delay_ms() below. */
 #define TOOLTIP_REFRESH_MS 1000 /* how often to re-poll get_tooltip() while shown */
+#define THUMB_FALLBACK_MS 33 /* baseline repaint cadence (~30fps) for a shown live thumbnail, on top
+                                * of (not instead of) the XDamage-driven repaint. XDamage gives
+                                * near-zero-latency updates when it works, but on at least one real
+                                * setup damage notifications for a GPU-presented (video) window
+                                * stopped arriving entirely a few frames after the tooltip opened --
+                                * confirmed via timestamped logging: the X server/compositor simply
+                                * never sent another XDamageNotify, while the real window kept
+                                * rendering fine. That's outside this file's control to fix (likely a
+                                * server/compositor-side Present+Composite propagation limitation),
+                                * so instead of treating this as a rare safety net, it's a real
+                                * polling driver: thumb_paint() re-fetching the composited pixmap
+                                * directly is *always* correct when called (verified live), the only
+                                * thing damage timing affected was how often that happened. Cheap
+                                * enough to run at this rate now that thumb_paint() caches the
+                                * resolved target window instead of re-discovering (and XSync'ing)
+                                * it on every single call -- see ThumbWatch::target's doc comment. */
 #define TOOLTIP_GAP 0 /* no dead zone between panel and popup, so the pointer
                         * can cross directly from one to the other */
 #define TOOLTIP_PAD_X 10
@@ -73,8 +89,19 @@
 
 typedef struct {
     Window win;
-    cairo_surface_t *surface;
+    cairo_surface_t *surface; /* window-backed -- only ever touched by the one atomic blit at the end of paint_popup() */
     cairo_t *cr;
+    /* Offscreen composition buffer, same size as the window -- every
+     * paint_popup()/paint_popup_group() drawing call targets this, not
+     * `cr` above, so a damage-driven thumbnail repaint (which can happen
+     * many times a second for a busy window) never shows the window
+     * itself mid-draw (background cleared, then border, then text, then
+     * thumbnail, each a separate visible frame on an unbuffered window
+     * surface -- exactly the flicker plasmashell-style live thumbnails
+     * don't have). The window surface only ever receives one `cairo_
+     * paint()` of this fully-composed buffer per repaint. */
+    cairo_surface_t *back;
+    cairo_t *back_cr;
     int width, height;
     /* Close-icon hit-rect, in popup-local coordinates; only meaningful
      * when g_closable. */
@@ -107,6 +134,7 @@ static int g_anchor_x = 0, g_anchor_w = 0;
 static char g_text[256];
 static uint64_t g_since_ms = 0;
 static uint64_t g_last_refresh_ms = 0;
+static uint64_t g_last_thumb_paint_ms = 0;
 static int g_shown = 0;
 static int g_closable = 0;
 static void *g_ctx = NULL;
@@ -144,6 +172,12 @@ static void destroy_popup(void)
     if (!g_popup) {
         return;
     }
+    if (g_popup->back_cr) {
+        cairo_destroy(g_popup->back_cr);
+    }
+    if (g_popup->back) {
+        cairo_surface_destroy(g_popup->back);
+    }
     if (g_popup->cr) {
         cairo_destroy(g_popup->cr);
     }
@@ -174,6 +208,7 @@ void tooltip_close(void)
     g_has_group = 0;
     g_group_n = 0;
     g_close_deadline_ms = 0;
+    thumb_unwatch_all();
 }
 
 /* Queries get_tooltip_mpris() (if `w` implements it) for `local_x`,
@@ -288,7 +323,7 @@ static int measure_lines(cairo_t *cr, double font_size, char lines[TOOLTIP_MAX_L
 static void paint_popup_group(void)
 {
     Panel *p = g_panel;
-    cairo_t *cr = g_popup->cr;
+    cairo_t *cr = g_popup->back_cr;
     if (g_font_face) {
         cairo_set_font_face(cr, g_font_face);
     }
@@ -357,13 +392,30 @@ static void paint_popup_group(void)
     }
 }
 
+/* Blits the fully-composed offscreen buffer onto the popup's real X
+ * window in one shot -- the only point in this file that ever draws to
+ * g_popup->cr (the window-backed surface), which is what keeps a
+ * damage-driven thumbnail repaint from ever showing the window mid-draw
+ * (background, then border, then text, then thumbnail, each as a
+ * separate visible frame) -- see TooltipPopup's back/back_cr doc
+ * comment. */
+static void blit_and_flush(void)
+{
+    cairo_t *wcr = g_popup->cr;
+    cairo_set_operator(wcr, CAIRO_OPERATOR_SOURCE);
+    cairo_set_source_surface(wcr, g_popup->back, 0, 0);
+    cairo_paint(wcr);
+    cairo_surface_flush(g_popup->surface);
+    XFlush(g_dpy);
+}
+
 static void paint_popup(void)
 {
     if (!g_popup || !g_panel) {
         return;
     }
     Panel *p = g_panel;
-    cairo_t *cr = g_popup->cr;
+    cairo_t *cr = g_popup->back_cr;
     cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
     cairo_set_source_rgba(cr, p->bg_r, p->bg_g, p->bg_b, p->bg_a);
     cairo_paint(cr);
@@ -375,8 +427,7 @@ static void paint_popup(void)
 
     if (g_has_group) {
         paint_popup_group();
-        cairo_surface_flush(g_popup->surface);
-        XFlush(g_dpy);
+        blit_and_flush();
         return;
     }
 
@@ -472,8 +523,7 @@ static void paint_popup(void)
         cairo_fill(cr);
     }
 
-    cairo_surface_flush(g_popup->surface);
-    XFlush(g_dpy);
+    blit_and_flush();
 }
 
 /* Original single-item layout (text + optional close icon/mpris row/
@@ -776,10 +826,41 @@ static void show_popup(void)
         XRaiseWindow(g_dpy, pop->win);
     }
 
+    /* (Re)create the offscreen composition buffer at the current size --
+     * needed on every call, not just non-reuse ones, since content/size
+     * can change on a reused popup too. See TooltipPopup's back/back_cr
+     * doc comment and blit_and_flush(). */
+    if (pop->back_cr) {
+        cairo_destroy(pop->back_cr);
+    }
+    if (pop->back) {
+        cairo_surface_destroy(pop->back);
+    }
+    pop->back = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, pop->width, pop->height);
+    pop->back_cr = cairo_create(pop->back);
+
     g_popup = pop;
     paint_popup();
     g_shown = 1;
     g_last_refresh_ms = now_ms();
+    g_last_thumb_paint_ms = g_last_refresh_ms;
+
+    /* Live-thumbnail tracking: re-sync the XDamage watch set to whatever
+     * window(s) this paint actually shows a thumbnail of, so later
+     * content changes repaint just this popup instead of it staying a
+     * one-shot snapshot from the moment it opened -- see thumb_watch()/
+     * thumb_take_dirty() in thumb.c and the dirty-flag check in
+     * tooltip_tick(). Unwatch-then-rewatch on every show_popup() call
+     * (not every repaint) keeps this cheap: it only runs when the tracked
+     * item/text actually changed, not on every damage-triggered repaint. */
+    thumb_unwatch_all();
+    if (g_has_thumb) {
+        thumb_watch(g_thumb_win);
+    } else if (g_has_group && pop->group_thumbs) {
+        for (int i = 0; i < pop->group_shown_n; i++) {
+            thumb_watch(g_group_items[i].win);
+        }
+    }
 }
 
 /* Re-queries get_tooltip() for the current hover target and updates
@@ -940,6 +1021,23 @@ void tooltip_tick(uint64_t now)
         g_last_refresh_ms = now;
         if (refresh_text()) {
             show_popup(); /* size may have changed (e.g. group membership), not just content */
+            return; /* show_popup() already repainted */
+        }
+    }
+    /* Live-thumbnail repaint: primarily driven by XDamage notifications
+     * for the watched window(s) (thumb_handle_event(), called from
+     * xispanel.c's main event loop, sets the dirty flag as soon as one
+     * arrives) -- repaints exactly when the source window's content
+     * actually changed, not on a blind cadence. THUMB_FALLBACK_MS is a
+     * backstop on top of that for when damage notifications stop
+     * arriving for reasons outside this file's control (see its doc
+     * comment) -- without it, that looks like the thumbnail silently
+     * freezing instead of just becoming a little less than instant. */
+    if (g_has_thumb || (g_has_group && g_popup && g_popup->group_thumbs)) {
+        int dirty = thumb_take_dirty();
+        if (dirty || now - g_last_thumb_paint_ms >= THUMB_FALLBACK_MS) {
+            g_last_thumb_paint_ms = now;
+            paint_popup();
         }
     }
 }
@@ -955,6 +1053,16 @@ uint64_t tooltip_next_wake_ms(void)
                                : (g_since_ms + (uint64_t)g_panel->tooltip_delay_ms);
         if (wake == 0 || w2 < wake) {
             wake = w2;
+        }
+        /* Bounds select()'s timeout so THUMB_FALLBACK_MS's backstop poll
+         * (tooltip_tick()) actually fires on schedule even with zero X
+         * activity in between -- the fast path (XDamage) doesn't need an
+         * entry here since it wakes select() via the X fd on its own. */
+        if (g_shown && (g_has_thumb || (g_has_group && g_popup && g_popup->group_thumbs))) {
+            uint64_t w3 = g_last_thumb_paint_ms + THUMB_FALLBACK_MS;
+            if (wake == 0 || w3 < wake) {
+                wake = w3;
+            }
         }
     }
     return wake;

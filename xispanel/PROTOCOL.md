@@ -860,20 +860,55 @@ Once both gate checks pass, `thumb_paint()` calls
 `XCompositeNameWindowPixmap()` on the window and wraps the result as a
 `cairo_xlib_surface`, scaled to fit a fixed-size box (200x130) preserving
 aspect ratio, never upscaled past the window's real size. Re-fetched
-fresh on every tooltip repaint (~1/s, the same cadence clock's tooltip
-already refreshes at) rather than cached, avoiding the classic
+fresh on every call rather than cached, avoiding the classic
 stale-composite-pixmap pitfall where the pixmap ID silently stops
 updating across an unmap/map or resize.
 
-**Real-world gotcha, worth remembering if this is touched again:** on a
-reparenting WM, the window `_NET_CLIENT_LIST` reports is not necessarily
-the one that's actually composite-redirected -- confirmed on this repo's
-own KWin fork, where `XCompositeNameWindowPixmap()` on the raw client
-window fails with `BadMatch`, and the *client's parent's parent* (two
-`XQueryTree()` hops up) is what's actually redirected. `thumb_paint()`
-walks up the parent chain (capped at 4 hops) trying each ancestor until
-one succeeds or it hits the root, rather than assuming a fixed number of
-wrapper levels.
+**Real-world gotcha #1, worth remembering if this is touched again:** on
+a reparenting WM, the window `_NET_CLIENT_LIST` reports is not
+necessarily the one that's actually composite-redirected -- confirmed on
+this repo's own KWin fork, where `XCompositeNameWindowPixmap()` on the
+raw client window fails with `BadMatch`, and an ancestor frame (walked
+via `XQueryTree()`, capped at 4 hops) is what's actually redirected.
+`resolve_composited_window()` tries `win` itself first, then each
+ancestor in turn, until one succeeds or it hits the root.
+
+**Real-world gotcha #2, live tracking:** `tasklist`'s `show_thumbs=yes`
+tooltip repaints on two independent tracks, not one:
+
+- **XDamage** (`thumb_watch()`/`thumb_handle_event()`/`thumb_take_dirty()`
+  in `thumb.c`): the tooltip subscribes to damage notifications on
+  whichever window `resolve_composited_window()` resolved to (same
+  ancestor-walk as above -- watching the *raw* client window here would
+  silently never fire, since it's typically not the drawable that's
+  actually redirected), and `tooltip_tick()` repaints the instant one
+  arrives. Zero-latency when it works.
+- **A ~30fps poll** (`THUMB_FALLBACK_MS` in `tooltip.c`, currently 33ms):
+  runs regardless of whether any damage event arrived. This isn't a rare
+  safety net -- confirmed via timestamped logging on a real desktop, a
+  GPU-presented (video player) window's damage notifications stopped
+  arriving entirely a few frames after the tooltip opened, while the real
+  window kept rendering fine. That's a server/compositor-side limitation
+  (likely Present+Composite propagation through the redirected ancestor
+  frame) outside this file's control to fix directly. Since a plain
+  re-fetch via `thumb_paint()` is *always* correct when it runs (verified
+  live), the fix was to just run that fetch on a real video-framerate
+  cadence instead of leaning on damage delivery being reliable.
+
+The poll only stayed affordable at that rate because of a second fix:
+`thumb_paint()` originally re-ran the *entire* ancestor-walk-plus-`XSync`
+dance from scratch on every single call, which is a synchronous
+round-trip-heavy operation (`XSync` blocks until the server's replied to
+everything queued) -- fine at the old ~1/s cadence, but the actual
+bottleneck once called every frame: it alone capped the achievable
+repaint rate at roughly 2/s regardless of how fast damage (or the poll)
+tried to drive it. Fixed by having `thumb_watch()` cache the resolved
+ancestor window (`ThumbWatch::target`) the one time it does the full
+walk, so `thumb_paint()` can skip straight to a single, non-`XSync`'d
+`XGetWindowAttributes` + `XCompositeNameWindowPixmap` call on every
+subsequent frame for a window that's currently being watched -- falling
+back to the full (slower, one-off) resolve only for the very first frame
+of a tooltip, painted before `thumb_watch()` has run yet.
 
 Also discovered while building this: xispanel had **no global
 `XErrorHandler`** anywhere -- since it continuously queries arbitrary

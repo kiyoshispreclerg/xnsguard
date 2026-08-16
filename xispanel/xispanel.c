@@ -2028,6 +2028,9 @@ static int run_as_daemon(const char *sockpath)
                     XFlush(g_dpy);
                 } else if (hotkey_handle_event(&ev)) {
                     /* consumed by a registered global hotkey -- see hotkey.c */
+                } else if (thumb_handle_event(&ev)) {
+                    /* an XDamage notification for a watched thumbnail window --
+                     * see thumb.c/tooltip.c's tooltip_tick() */
                 } else if (panel_menu_handle_event(&ev)) {
                     /* consumed by the open context menu */
                 } else if (tooltip_handle_event(&ev)) {
