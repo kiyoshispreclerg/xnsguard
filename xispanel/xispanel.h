@@ -280,6 +280,7 @@ int ewmh_get_number_of_desktops(void);
 int ewmh_get_current_desktop(void); /* -1 if unavailable */
 int ewmh_skip_taskbar(Window w); /* 1 if a taskbar should never list this window */
 int ewmh_window_in_rect(Window w, int rx, int ry, int rw, int rh); /* 1 if w's center is inside the rect */
+int ewmh_window_has_input_focus(Window w); /* 1 if w (or a descendant) holds real X input focus */
 /* Sets _NET_WM_ICON_GEOMETRY(x,y,w,h) in root coordinates -- tells the WM/
  * compositor where this window's taskbar button is, so minimize/unminimize
  * animations target it instead of the pointer position. */

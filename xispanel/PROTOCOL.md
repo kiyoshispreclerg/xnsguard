@@ -756,6 +756,24 @@ The actual `GetLayout`/`Event` protocol work is shared with the tray's
 `globalmenu` is only the EWMH property lookup, active-window tracking,
 and open/closed-mode layout on top of it.
 
+Three optional filters, all off by default (`no`/unset), useful once more
+than one panel/output is showing a `globalmenu` and each should stick to
+windows it actually "owns" instead of every instance mirroring whatever's
+globally active:
+
+- `same_desktop=yes`: only show a menu if the active window's
+  `_NET_WM_DESKTOP` matches the root's `_NET_CURRENT_DESKTOP`. Silently
+  doesn't filter if either is unavailable (no WM support), same fallback
+  `tasklist`'s own `same_desktop` uses.
+- `same_output=yes`: only show a menu if the active window's center falls
+  on this panel's own resolved output rectangle (`Panel::out_x/y/w/h`) --
+  same `ewmh_window_in_rect()` helper `tasklist`'s `same_output` uses.
+- `focused_only=yes`: only show a menu if the active window actually holds
+  real X input focus right now (`XGetInputFocus()`, walking up to
+  parents), not just whatever `_NET_ACTIVE_WINDOW` last pointed at -- some
+  WMs leave that EWMH hint stuck on the last client after focus moves to
+  the root window/desktop (e.g. after clicking empty desktop space).
+
 ### Volume control
 
 The `volume` widget shells out to the `pactl` command-line tool

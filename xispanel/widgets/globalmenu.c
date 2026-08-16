@@ -27,6 +27,12 @@
  * All the actual DBusMenu GetLayout/Event protocol work is shared with
  * the tray's Menu-property handling via dbusmenu.c -- this file is only
  * the EWMH property lookup, active-window tracking, and layout/paint.
+ *
+ * Three optional filters (all off by default, `same_desktop=yes`/
+ * `same_output=yes`/`focused_only=yes`) let a multi-panel/multi-monitor
+ * setup keep each panel's globalmenu limited to windows it actually
+ * "owns" instead of every panel mirroring whatever's globally active --
+ * see globalmenu_passes_filters().
  */
 #include "../xispanel.h"
 
@@ -43,6 +49,11 @@
 
 typedef struct {
     int open_mode; /* 1 = mode=open (inline bar), 0 = mode=closed (hamburger icon, default) */
+    /* Off by default (same convention as tasklist's own same_desktop/
+     * same_output), each config_kv=yes -- see globalmenu_passes_filters(). */
+    int same_desktop_only;
+    int same_output_only;
+    int focused_only;
 
     Window tracked_win;
     char busname[128];
@@ -122,10 +133,45 @@ static int globalmenu_init(PanelWidget *w)
     GlobalmenuPriv *gp = w->priv;
     char buf[16];
     gp->open_mode = kv_get(w->config_kv, "mode", buf, sizeof(buf)) && !strcmp(buf, "open");
+    gp->same_desktop_only = kv_get(w->config_kv, "same_desktop", buf, sizeof(buf)) && !strcmp(buf, "yes");
+    gp->same_output_only = kv_get(w->config_kv, "same_output", buf, sizeof(buf)) && !strcmp(buf, "yes");
+    gp->focused_only = kv_get(w->config_kv, "focused_only", buf, sizeof(buf)) && !strcmp(buf, "yes");
     gp->tracked_win = None;
     gp->open_top_index = -1;
     w->next_tick_ms = now_ms();
     return 0;
+}
+
+/* 1 if `active` passes every filter this widget instance has turned on --
+ * see the GlobalmenuPriv fields' doc comment. `active == None` always
+ * fails (nothing to show a menu for). Mirrors tasklist.c's own same_
+ * desktop/same_output filtering (ewmh_get_current_desktop()/ewmh_window_
+ * in_rect()), plus a globalmenu-specific focused_only check: _NET_ACTIVE_
+ * WINDOW can lag behind real X focus (e.g. some WMs leave it pointing at
+ * the last client after focus moves to the root window/desktop), so
+ * focused_only cross-checks against XGetInputFocus() via ewmh_window_
+ * has_input_focus() instead of trusting the EWMH hint alone. */
+static int globalmenu_passes_filters(PanelWidget *w, Window active)
+{
+    GlobalmenuPriv *gp = w->priv;
+    if (active == None) {
+        return 0;
+    }
+    if (gp->same_desktop_only) {
+        int current_desktop = ewmh_get_current_desktop();
+        int desktop = ewmh_get_desktop(active);
+        if (current_desktop >= 0 && desktop >= 0 && desktop != current_desktop) {
+            return 0;
+        }
+    }
+    if (gp->same_output_only &&
+        !ewmh_window_in_rect(active, w->panel->out_x, w->panel->out_y, w->panel->out_w, w->panel->out_h)) {
+        return 0;
+    }
+    if (gp->focused_only && !ewmh_window_has_input_focus(active)) {
+        return 0;
+    }
+    return 1;
 }
 
 static void globalmenu_refetch_top(GlobalmenuPriv *gp)
@@ -146,15 +192,20 @@ static void globalmenu_on_tick(PanelWidget *w, uint64_t now)
     ensure_atoms();
 
     Window active = ewmh_get_active_window();
-    if (active == gp->tracked_win) {
+    /* Recomputed every tick, not just when `active` itself changes: a
+     * filter's verdict can flip (desktop switch, window dragged to
+     * another output, focus moving to the root window) without _NET_
+     * ACTIVE_WINDOW changing at all. */
+    Window effective = globalmenu_passes_filters(w, active) ? active : None;
+    if (effective == gp->tracked_win) {
         return;
     }
-    gp->tracked_win = active;
+    gp->tracked_win = effective;
 
     char busname[128] = "", objpath[128] = "";
-    if (active != None && !ewmh_skip_taskbar(active)) {
-        read_string_prop(active, g_atom_appmenu_service, busname, sizeof(busname));
-        read_string_prop(active, g_atom_appmenu_path, objpath, sizeof(objpath));
+    if (effective != None && !ewmh_skip_taskbar(effective)) {
+        read_string_prop(effective, g_atom_appmenu_service, busname, sizeof(busname));
+        read_string_prop(effective, g_atom_appmenu_path, objpath, sizeof(objpath));
     }
     int had_menu = gp->has_menu;
     gp->has_menu = busname[0] && objpath[0];

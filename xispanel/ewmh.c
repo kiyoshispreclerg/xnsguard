@@ -325,6 +325,44 @@ void ewmh_get_state_flags(Window w, int *minimized, int *maximized)
     }
 }
 
+/* 1 if `w` (or a descendant of it, e.g. an app's internal focus proxy
+ * window -- Qt/GTK sometimes focus a child rather than the toplevel EWMH
+ * clients enumerate) currently holds real X input focus, as opposed to
+ * merely being _NET_ACTIVE_WINDOW -- some WMs leave the latter pointing
+ * at the last active client even after focus moves to the root window
+ * (e.g. after clicking the desktop), which globalmenu's focused_only
+ * filter uses to tell that apart. */
+int ewmh_window_has_input_focus(Window w)
+{
+    if (w == None) {
+        return 0;
+    }
+    Window focused;
+    int revert_to;
+    XGetInputFocus(g_dpy, &focused, &revert_to);
+    if (focused == None || focused == PointerRoot) {
+        return 0;
+    }
+    while (focused != None) {
+        if (focused == w) {
+            return 1;
+        }
+        Window root_ret, parent_ret, *children = NULL;
+        unsigned int n_children = 0;
+        if (!XQueryTree(g_dpy, focused, &root_ret, &parent_ret, &children, &n_children)) {
+            break;
+        }
+        if (children) {
+            XFree(children);
+        }
+        if (parent_ret == root_ret || parent_ret == None) {
+            break;
+        }
+        focused = parent_ret;
+    }
+    return 0;
+}
+
 /* 1 if `w`'s center falls within the given root-relative rectangle --
  * used to filter tasklist/winctl entries to whatever output the panel
  * itself is resolved onto (Panel::out_x/y/w/h), for multi-monitor
