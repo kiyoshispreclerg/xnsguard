@@ -736,6 +736,11 @@ own file" structure:
 - `sni.c`: the optional (dlopen'd libdbus-1) StatusNotifierItem tray
   client+host described above; `sni_stub.c` is its equivalent build-time
   fallback.
+- `dbusmenu.c`: the generic (dlopen'd libdbus-1, own independent session-bus
+  connection) `com.canonical.dbusmenu` client -- `GetLayout`/`Event`,
+  shared by `sni.c` (a tray item's `Menu` property) and, later, the
+  `globalmenu` widget. No stub pair: only built (and only referenced) when
+  `sni.c` is, so it just doesn't get compiled when `dbus-1` is missing.
 - `pulse.c`: the `pactl`-shelling volume control backend described
   above. Unconditionally compiled -- no stub pair needed, since it has no
   build-time dependency to begin with.

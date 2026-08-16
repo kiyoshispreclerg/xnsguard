@@ -374,6 +374,25 @@ void sni_context_menu(int idx, int x, int y); /* right click */
  * this returns 1, only when it returns 0 (no Menu property set). */
 int sni_menu_open(int idx, Panel *panel, PanelWidget *widget, int anchor_x, int anchor_w);
 
+/* ---- generic com.canonical.dbusmenu client (dbusmenu.c) ----
+ *
+ * Shared by sni.c (a tray item's Menu property) and, later, the
+ * globalmenu widget (_KDE_NET_WM_APPMENU_SERVICE_NAME/_OBJECT_PATH) --
+ * this file only knows "a busname+objectpath pointing at a dbusmenu
+ * object", not where that pair came from. Same optional-dlopen'd-
+ * libdbus-1 philosophy as mpris.c/sni.c, with its own independent
+ * session-bus connection (not shared with sni.c's). */
+#define DBUSMENU_MAX_ITEMS 24
+/* Fetches GetLayout(0,-1,[]) and flattens the whole tree (indented by
+ * depth) into out_items[]/out_ids[] (parallel arrays, both sized
+ * max_items). Returns the number of items flattened (>= 0, possibly 0 for
+ * an empty menu), or -1 if libdbus-1/the session bus/the call itself
+ * failed. */
+int dbusmenu_fetch(const char *busname, const char *path, MenuItem *out_items, int *out_ids, int max_items);
+/* Fire-and-forget Event(id, "clicked", ...) for one of the ids returned by
+ * a prior dbusmenu_fetch() at the same busname/path. */
+void dbusmenu_send_event(const char *busname, const char *path, int32_t id);
+
 /* ---- volume control: shells out to `pactl`, no libpulse linked (pulse.c) ----
  *
  * Unconditionally compiled (no headers/library needed to build this file
