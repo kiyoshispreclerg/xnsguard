@@ -664,6 +664,112 @@ static void handle_click(int root_x, int root_y)
     select_and_close(idx);
 }
 
+/* Sets f->hover_row to the first non-separator item on its *currently
+ * displayed* page, or leaves it at -1 if there isn't one -- used after
+ * opening a submenu via the keyboard (Right/Enter) so Up/Down works
+ * immediately in the new frame without an extra keypress to "arrive"
+ * somewhere first, unlike a mouse-opened submenu which starts with
+ * nothing hovered until the pointer actually moves over it. */
+static void select_first_hover(MenuFrame *f)
+{
+    int start = f->paging ? f->page * f->items_per_page : 0;
+    int end = f->paging ? start + f->items_per_page : f->n;
+    if (end > f->n) {
+        end = f->n;
+    }
+    for (int pos = start; pos < end; pos++) {
+        if (!g_menu->items[f->idx[pos]].is_separator) {
+            f->hover_row = frame_pos_to_row(f, pos);
+            return;
+        }
+    }
+    f->hover_row = -1;
+}
+
+/* Moves the deepest open frame's hover one selectable (non-separator)
+ * item in `delta`'s direction (+1/-1), wrapping around and paging
+ * automatically if needed -- the keyboard equivalent of handle_motion(),
+ * but deliberately simpler: it never auto-opens a submenu after a delay
+ * (that's mouse hover-intent behavior) or auto-collapses a deeper frame,
+ * since by construction there's never a frame open under the deepest
+ * one. Repaints the frame if the hovered row actually changed. */
+static void move_hover(int delta)
+{
+    PanelMenu *m = g_menu;
+    MenuFrame *f = &m->frames[m->n_frames - 1];
+    if (f->n <= 0) {
+        return;
+    }
+    int pos = f->hover_row >= 0 ? frame_row_to_pos(f, f->hover_row) : MENU_ROW_NONE;
+    int p = (pos >= 0) ? pos : (delta > 0 ? -1 : f->n);
+    for (int tries = 0; tries < f->n; tries++) {
+        p += delta;
+        if (p < 0) {
+            p = f->n - 1;
+        }
+        if (p >= f->n) {
+            p = 0;
+        }
+        if (!m->items[f->idx[p]].is_separator) {
+            break;
+        }
+    }
+    if (f->paging) {
+        int target_page = p / f->items_per_page;
+        if (target_page != f->page) {
+            f->page = target_page;
+        }
+    }
+    int row = frame_pos_to_row(f, p);
+    if (row != f->hover_row) {
+        f->hover_row = row;
+        paint_frame(m, f);
+    }
+}
+
+/* Opens the currently-hovered item's submenu (deepest frame) if it has
+ * one -- the keyboard equivalent of hovering it with the mouse and
+ * waiting out open_delay_ms, triggered immediately instead (Right/Enter
+ * are explicit user intent, no need for hover-intent debouncing). */
+static void open_hovered_submenu(void)
+{
+    PanelMenu *m = g_menu;
+    MenuFrame *f = &m->frames[m->n_frames - 1];
+    if (f->hover_row < 0) {
+        return;
+    }
+    int pos = frame_row_to_pos(f, f->hover_row);
+    if (pos < 0) {
+        return;
+    }
+    int idx = f->idx[pos];
+    if (m->items[idx].is_separator || !m->items[idx].enabled || !m->has_children[idx]) {
+        return;
+    }
+    if (open_submenu(m, m->n_frames - 1, pos)) {
+        select_first_hover(&m->frames[m->n_frames - 1]);
+        paint_frame(m, &m->frames[m->n_frames - 1]);
+    }
+}
+
+/* Closes just the deepest frame (Left key: "go back a level"), stepping
+ * back to whichever item in the shallower frame spawned it -- a no-op at
+ * the root frame (m->n_frames == 1), since Escape already covers "close
+ * everything" and an unexpected full close on Left would surprise a
+ * keyboard user just trying to step back one level. */
+static void close_deepest_frame(void)
+{
+    PanelMenu *m = g_menu;
+    if (m->n_frames <= 1) {
+        return;
+    }
+    int spawned_from_pos = m->frames[m->n_frames - 1].spawned_from_pos;
+    close_frames_from(m->n_frames - 1);
+    MenuFrame *f = &m->frames[m->n_frames - 1];
+    f->hover_row = frame_pos_to_row(f, spawned_from_pos);
+    paint_frame(m, f);
+}
+
 void panel_menu_open_tree_lazy(Panel *owner_panel, PanelWidget *owner_widget, int anchor_x, int anchor_w,
                                 const MenuItem *items, const int *depth, const int *lazy, int n_items, void *ctx,
                                 MenuSelectFn on_select, MenuLazyFn on_lazy, MenuHoverRootFn on_hover_root,
@@ -848,9 +954,23 @@ int panel_menu_handle_event(const XEvent *ev)
         return 1;
     }
     if (ev->type == KeyPress && ev->xkey.window == m->frames[0].win) {
+        /* Full keyboard navigation of the cascade -- no mouse required.
+         * Up/Down move the highlight within the deepest open frame;
+         * Right/Enter open the hovered item's submenu (Enter also
+         * activates a leaf item); Left steps back out of a submenu one
+         * level; Escape closes the whole menu. This is what the
+         * globalmenu widget's hotkey= option opens into. */
         KeySym ks = XLookupKeysym((XKeyEvent *)&ev->xkey, 0);
         if (ks == XK_Escape) {
             panel_menu_close();
+        } else if (ks == XK_Down) {
+            move_hover(1);
+        } else if (ks == XK_Up) {
+            move_hover(-1);
+        } else if (ks == XK_Right) {
+            open_hovered_submenu();
+        } else if (ks == XK_Left) {
+            close_deepest_frame();
         } else if (ks == XK_Return || ks == XK_KP_Enter) {
             MenuFrame *f = &m->frames[m->n_frames - 1];
             int pos = f->hover_row >= 0 ? frame_row_to_pos(f, f->hover_row) : MENU_ROW_NONE;
@@ -858,7 +978,7 @@ int panel_menu_handle_event(const XEvent *ev)
                 int idx = f->idx[pos];
                 if (!m->items[idx].is_separator && m->items[idx].enabled) {
                     if (m->has_children[idx]) {
-                        open_submenu(m, m->n_frames - 1, pos);
+                        open_hovered_submenu();
                     } else {
                         select_and_close(idx);
                     }

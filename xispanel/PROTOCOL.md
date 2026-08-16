@@ -533,6 +533,17 @@ grace-period idea hover tooltips use, see below) -- clicking a leaf item,
 or Escape, close it immediately as always. A small right-pointing arrow
 at an item's trailing edge indicates it has a submenu.
 
+Any open menu is fully keyboard-navigable, no mouse required, while it
+holds the keyboard grab: `Up`/`Down` move the highlight within the
+deepest open frame (wrapping around, paging automatically, skipping
+separators); `Right`/`Enter` open the highlighted item's submenu if it
+has one (`Enter` on a leaf item activates it instead); `Left` steps back
+out of a submenu one level (a no-op at the root frame -- `Escape` is
+still what closes the whole menu). A freshly opened submenu starts with
+its own first selectable item already highlighted, so `Down`/`Up` work
+immediately without an extra keypress to "arrive" somewhere first. This
+is what `globalmenu`'s `hotkey=` option (see below) opens into.
+
 A submenu's children can either be supplied up front (DBusMenu's
 `GetLayout(-1)` already returns a whole bounded subtree in one call) or
 fetched **lazily**, the first time that item's submenu is actually opened
@@ -804,6 +815,13 @@ globally active:
   parents), not just whatever `_NET_ACTIVE_WINDOW` last pointed at -- some
   WMs leave that EWMH hint stuck on the last client after focus moves to
   the root window/desktop (e.g. after clicking empty desktop space).
+
+`hotkey=<spec>` (optional, see "Global hotkeys" above) opens the entire
+menu tree as one cascade -- the same call `closed` mode's hamburger click
+makes -- regardless of which `mode` is actually configured, giving a
+keyboard user one reliable entry point into the menu without a mouse.
+Once open, the cascade's own `Up`/`Down`/`Left`/`Right`/`Enter`/`Escape`
+keyboard navigation (see "Context menus" above) reaches every item.
 
 ### Volume control
 

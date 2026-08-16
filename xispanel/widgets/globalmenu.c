@@ -33,6 +33,14 @@
  * setup keep each panel's globalmenu limited to windows it actually
  * "owns" instead of every panel mirroring whatever's globally active --
  * see globalmenu_passes_filters().
+ *
+ * `hotkey=<spec>` (optional, see hotkey.c) opens the *entire* menu tree
+ * as one cascade -- same action as clicking the hamburger icon in
+ * `closed` mode, regardless of which mode is actually configured -- so a
+ * keyboard user always has one reliable way to reach every item without
+ * first having to tab/click into a specific top-level label. Once open,
+ * menu.c's cascade already supports full keyboard navigation (arrow
+ * keys, Enter, Escape) with no mouse involved at all.
  */
 #include "../xispanel.h"
 
@@ -128,6 +136,22 @@ static void read_string_prop(Window w, Atom atom, char *buf, size_t bufsz)
     }
 }
 
+static void globalmenu_open_menu(PanelWidget *w, int parent_id, int anchor_x, int anchor_w);
+
+/* hotkey= callback -- see the file comment. Opens the whole tree
+ * (parent_id=0, the same call `closed` mode's hamburger click makes)
+ * regardless of open_mode, so it doesn't matter which top-level label
+ * (if any) the keyboard user "meant". A no-op if the tracked window
+ * currently has no exported menu at all. */
+static void globalmenu_hotkey_open(PanelWidget *w)
+{
+    GlobalmenuPriv *gp = w->priv;
+    if (!gp->has_menu) {
+        return;
+    }
+    globalmenu_open_menu(w, 0, 0, w->len);
+}
+
 static int globalmenu_init(PanelWidget *w)
 {
     GlobalmenuPriv *gp = w->priv;
@@ -139,7 +163,16 @@ static int globalmenu_init(PanelWidget *w)
     gp->tracked_win = None;
     gp->open_top_index = -1;
     w->next_tick_ms = now_ms();
+    char hotkey[64];
+    if (kv_get(w->config_kv, "hotkey", hotkey, sizeof(hotkey)) && hotkey[0]) {
+        hotkey_register(w, hotkey, globalmenu_hotkey_open);
+    }
     return 0;
+}
+
+static void globalmenu_destroy(PanelWidget *w)
+{
+    hotkey_unregister_widget(w);
 }
 
 /* 1 if `active` passes every filter this widget instance has turned on --
@@ -436,6 +469,7 @@ const PanelWidgetOps globalmenu_ops = {
     .type_name = "globalmenu",
     .priv_size = sizeof(GlobalmenuPriv),
     .init = globalmenu_init,
+    .destroy = globalmenu_destroy,
     .measure = globalmenu_measure,
     .paint = globalmenu_paint,
     .on_button = globalmenu_on_button,
