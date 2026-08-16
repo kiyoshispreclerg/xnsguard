@@ -274,6 +274,7 @@ static const PanelWidgetOps *g_widget_registry[] = {
     &launcher_ops,
     &volume_ops,
     &globalmenu_ops,
+    &folder_ops,
     NULL,
 };
 

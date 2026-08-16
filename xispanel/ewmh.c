@@ -11,8 +11,10 @@
 #include <X11/Xatom.h>
 #include <X11/Xutil.h>
 
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 Atom g_atom_wm_window_type;
 Atom g_atom_wm_window_type_dock;
@@ -671,4 +673,78 @@ void trim_to_width(cairo_t *cr, char *text, size_t bufsz, double max_width)
         }
     }
     text[0] = 0;
+}
+
+/* Some icon sources give only a themed name (e.g. a tray item's IconName,
+ * or a well-known name like "folder") meant to be resolved via the
+ * freedesktop icon theme spec (index.theme parsing, per-size subdirs,
+ * theme inheritance...). Full spec compliance is deliberately out of
+ * scope (see the original project plan's icon_theme.c note), so this is
+ * an intentionally unsophisticated stand-in: generate a fixed grid of
+ * candidate paths (theme base x category x size-or-"symbolic"/"scalable"
+ * x extension) and load the first hit via load_png_argb() (Imlib2,
+ * already linked -- no new dependency), rather than a real recursive/
+ * spec-aware search (which risks a synchronous multi-thousand-file
+ * directory walk on the main thread the first time an icon needs
+ * resolving -- a real stall risk on a theme with a large icon set,
+ * unacceptable for what only saves a fallback letter icon from showing).
+ * Themes disagree on directory order -- breeze nests size *under*
+ * category (".../devices/symbolic/name.svg"), Adwaita/hicolor nest
+ * category *under* size (".../scalable/devices/name.svg", confirmed
+ * against both live) -- so both orderings are tried. Good enough to turn
+ * a blank/fallback icon into a real one for the common case; finds
+ * nothing for an icon this grid doesn't happen to cover, degrading back
+ * to the fallback icon exactly like an absent pixmap already does. Also
+ * handles the (seen in the wild) case of a caller passing an absolute
+ * path as `name` directly. */
+cairo_surface_t *resolve_icon_theme_name(const char *name)
+{
+    if (!name || !name[0]) {
+        return NULL;
+    }
+    if (name[0] == '/') {
+        return load_png_argb(name);
+    }
+    static const char *bases[] = {
+        "/usr/share/icons/breeze",
+        "/usr/share/icons/breeze-dark",
+        "/usr/share/icons/Adwaita",
+        "/usr/share/icons/hicolor",
+    };
+    static const char *categories[] = {"status", "apps", "devices", "actions", "categories", "mimetypes", "places"};
+    static const char *sizedirs[] = {"symbolic", "scalable", "48x48", "32x32", "24x24", "22x22", "16x16"};
+    static const char *exts[] = {".svg", ".png"};
+    char path[PATH_MAX];
+    for (size_t b = 0; b < sizeof(bases) / sizeof(bases[0]); b++) {
+        for (size_t c = 0; c < sizeof(categories) / sizeof(categories[0]); c++) {
+            for (size_t s = 0; s < sizeof(sizedirs) / sizeof(sizedirs[0]); s++) {
+                for (size_t e = 0; e < sizeof(exts) / sizeof(exts[0]); e++) {
+                    /* breeze order: <category>/<sizedir>/<name> */
+                    snprintf(path, sizeof(path), "%s/%s/%s/%s%s", bases[b], categories[c], sizedirs[s], name,
+                             exts[e]);
+                    cairo_surface_t *surf = access(path, R_OK) == 0 ? load_png_argb(path) : NULL;
+                    if (surf) {
+                        return surf;
+                    }
+                    /* Adwaita/hicolor order: <sizedir>/<category>/<name> */
+                    snprintf(path, sizeof(path), "%s/%s/%s/%s%s", bases[b], sizedirs[s], categories[c], name,
+                             exts[e]);
+                    surf = access(path, R_OK) == 0 ? load_png_argb(path) : NULL;
+                    if (surf) {
+                        return surf;
+                    }
+                }
+            }
+        }
+    }
+    /* Flat fallback, no theme structure at all. */
+    static const char *exts2[] = {".png", ".svg", ".xpm"};
+    for (size_t e = 0; e < sizeof(exts2) / sizeof(exts2[0]); e++) {
+        snprintf(path, sizeof(path), "/usr/share/pixmaps/%s%s", name, exts2[e]);
+        cairo_surface_t *surf = access(path, R_OK) == 0 ? load_png_argb(path) : NULL;
+        if (surf) {
+            return surf;
+        }
+    }
+    return NULL;
 }

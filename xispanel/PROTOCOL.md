@@ -67,8 +67,10 @@ generation time (which would just go stale the next time the system
 theme changes) -- see "Colors and font default to the live system theme"
 below.
 
-Three record types, one per line, fields separated by tabs. Blank lines
-and lines starting with `#` are ignored.
+Three record types, one per line, fields separated by any run of spaces
+and/or tabs (mix freely, including within the same line -- there's no
+semantic difference, so hand-editing with a normal spacebar works just as
+well as tabs). Blank lines and lines starting with `#` are ignored.
 
 ```
 PANEL	<name>	<output>	<key>=<value> ...
@@ -329,6 +331,30 @@ Widget types implemented so far:
   when the tracked window (or its menu's busname/objpath) actually
   changes, not on every poll tick -- each submenu's own contents are
   fetched fresh (one `GetLayout` call) whenever it's actually opened.
+- `folder`: a single folder icon (`path=<dir>`, required) that, on click,
+  shows that folder's contents as a real cascading menu (see "Context
+  menus" above) -- every directory level gets "Abrir esta pasta"/"Abrir
+  terminal aqui" (shelling out to `xdg-open`/a terminal, see below) ahead
+  of its entries; a subfolder entry opens its own contents as a nested
+  submenu, and so on. `icon=<path>` overrides the icon (any format Imlib2
+  decodes); without it, resolves the theme's own "folder" icon (breeze/
+  Adwaita/hicolor, same lookup `tray` uses for a themed `IconName`),
+  falling back to the single-letter placeholder if that fails too.
+  `name=<text>` overrides the hover-tooltip text and fallback-placeholder
+  letter (default: the path's basename). Rebuilt fresh on every click of
+  the icon (not cached), reading *one directory level at a time* -- unlike
+  a DBusMenu tree (bounded by however deep an app's own menu structure
+  goes, fetched whole in one `GetLayout(-1)` call), a filesystem tree has
+  no natural bound, so a subfolder's contents are only ever read when its
+  submenu is actually opened (`menu.c`'s lazy-expand mechanism, see
+  "Context menus" above), not recursively up front. Each directory lists
+  at most 100 entries (with a "... mais itens" note if truncated), the
+  overall item count across every level opened so far shares `menu.c`'s
+  own cap, symlinks are never followed (rules out a symlink loop), and
+  hidden entries (leading `.`) are skipped. Clicking a file runs
+  `xdg-open` on it directly; a directory always opens its own submenu
+  instead (never fires `xdg-open` directly -- use that submenu's own
+  "Abrir esta pasta" if that's what you want).
 
 System monitor is a later phase -- see the plan this tool was built
 from; it is not implemented yet.
@@ -449,18 +475,35 @@ button opens the menu directly under *that button*, not at the raw click
 coordinates -- same convention plasmashell's taskbar context menus use.
 
 Menus with nested items (currently: the tray's/`globalmenu`'s DBusMenu
-popups) render as real **cascading submenus** -- a separate popup window
-per open nesting level, positioned beside its parent frame at the row
-that spawned it, classic Windows/GTK/Qt style -- rather than one long
-flattened+indented list. Hovering an item with children opens its own
-submenu frame after `tooltip_delay` (the same open-delay hover tooltips
-use); clicking such an item opens it immediately. Moving the pointer to a
-different item in an already-open parent frame closes whatever deeper
-frames no longer apply; moving it off of every open frame for
-`tooltip_close_delay` closes the whole menu (same grace-period idea hover
-tooltips use, see below) -- clicking a leaf item, or Escape, close it
-immediately as always. A small right-pointing arrow at an item's trailing
-edge indicates it has a submenu.
+popups, and `folder`'s directory listings) render as real **cascading
+submenus** -- a separate popup window per open nesting level, positioned
+beside its parent frame at the row that spawned it, classic Windows/GTK/Qt
+style -- rather than one long flattened+indented list. Hovering an item
+with children opens its own submenu frame after `tooltip_delay` (the same
+open-delay hover tooltips use); clicking such an item opens it
+immediately. Moving the pointer to a different item in an already-open
+parent frame closes whatever deeper frames no longer apply; moving it off
+of every open frame for `tooltip_close_delay` closes the whole menu (same
+grace-period idea hover tooltips use, see below) -- clicking a leaf item,
+or Escape, close it immediately as always. A small right-pointing arrow
+at an item's trailing edge indicates it has a submenu.
+
+A submenu's children can either be supplied up front (DBusMenu's
+`GetLayout(-1)` already returns a whole bounded subtree in one call) or
+fetched **lazily**, the first time that item's submenu is actually opened
+-- `folder` uses this so opening the icon only ever reads *that*
+directory's own entries, not the whole tree underneath it; a subfolder's
+contents aren't read from disk until you actually open *its* submenu in
+turn, however deep you go.
+
+Any frame with more items than fit the output vertically **pages**
+instead of overflowing off-screen (or silently truncating): its height is
+capped to the output's own height, with a small up/down arrow row
+reserved at the top and bottom (dim when there's no previous/next page,
+same look `tasklist`'s own task-overflow arrows use) -- clicking a bright
+arrow jumps a whole page at once, not a continuous scroll. A frame's width
+still spans every item across every page, so paging never resizes it
+mid-browse.
 
 ## Hover tooltips
 
@@ -798,8 +841,12 @@ own file" structure:
   the core API a widget file is built against (`now_ms`, `kv_get`,
   `widget_get_rect`, the `ewmh_*` helpers, `panel_menu_open`, ...).
 - `ewmh.c`: EWMH/ICCCM client-list reading and window-control actions
-  (activate/close/minimize/maximize/move), plus `_NET_WM_ICON` decoding
-  and the icon/text drawing helpers built on top of it.
+  (activate/close/minimize/maximize/move), plus `_NET_WM_ICON` decoding,
+  the icon/text drawing helpers built on top of it, and
+  `resolve_icon_theme_name()` (freedesktop icon-theme lookup by name,
+  e.g. `folder` or a tray item's `IconName` -- lives here rather than in
+  `sni.c` since it has no DBus dependency of its own and `folder` needs
+  it too).
 - `menu.c`: the generic context-menu popup described above.
 - `tooltip.c`: the generic hover-tooltip popup described above.
 - `mpris.c`: the optional (dlopen'd libdbus-1) MPRIS2 client described
@@ -825,7 +872,8 @@ own file" structure:
   isn't found via pkg-config.
 - `widgets/spacer.c`, `widgets/clock.c`, `widgets/tasklist.c`,
   `widgets/winctl.c`, `widgets/tray.c`, `widgets/launcher.c`,
-  `widgets/volume.c`: one file per widget type. Adding a new type is
+  `widgets/volume.c`, `widgets/folder.c`: one file per widget type. Adding
+  a new type is
   "write `widgets/foo.c` defining a `PanelWidgetOps foo_ops`, declare it
   `extern` in `xispanel.h`, add it to
   the registry array in `xispanel.c`" -- no other file needs to change.

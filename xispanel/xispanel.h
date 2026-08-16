@@ -291,6 +291,10 @@ void draw_icon_scaled(cairo_t *cr, cairo_surface_t *icon, double x, double y, do
 void draw_fallback_icon(cairo_t *cr, double x, double y, double size, const char *title, double fg_r, double fg_g,
                          double fg_b);
 void trim_to_width(cairo_t *cr, char *text, size_t bufsz, double max_width);
+/* Resolves a themed icon name (e.g. "folder", or a tray item's IconName)
+ * against a fixed grid of common icon-theme paths -- see ewmh.c's doc
+ * comment for the tradeoffs. NULL if nothing matched. */
+cairo_surface_t *resolve_icon_theme_name(const char *name);
 
 /* ---- context menu (menu.c) ----
  *
@@ -300,7 +304,11 @@ void trim_to_width(cairo_t *cr, char *text, size_t bufsz, double max_width);
  * submenus (separate popup frames, one beside the previous, classic-menu
  * style) via an implicit tree encoded as a flat items[]/depth[] pair --
  * see panel_menu_open_tree() below and menu.c's own header comment for
- * the dismissal (click-outside / Escape / hover-away) design notes. */
+ * the dismissal (click-outside / Escape / hover-away) design notes. Any
+ * frame with more items than fit the output vertically pages instead of
+ * overflowing off-screen: up/down arrow rows at its top/bottom edges (dim
+ * when there's no previous/next page) jump a whole page at a time, not a
+ * continuous scroll -- see menu.c's paint_frame()/frame_row_to_pos(). */
 /* Generous on purpose: a whole-tree DBusMenu fetch (globalmenu's
  * mode=closed, or a big app's tray menu) flattens *every* item across
  * *every* level into one array, so a handful of top-level menus with
@@ -331,6 +339,17 @@ typedef void (*MenuHoverRootFn)(void *ctx, int root_x, int root_y);
  * for" (e.g. globalmenu's open-mode top-level bar highlight) clear that
  * state instead of it going stale once the menu closes on its own. */
 typedef void (*MenuCloseFn)(void *ctx);
+/* Called the first time a lazily-marked item (see panel_menu_open_tree_
+ * lazy()'s `lazy` array) is actually expanded (hover-delay or click) --
+ * `parent_index` is that item's position in the *original* flat `items`
+ * array passed to open, same index space `on_select` uses. Fills
+ * out_items[]/out_lazy[] (parallel arrays, both sized max_items) with its
+ * *immediate* children only (out_lazy[i] = 1 if that child is itself an
+ * expand-on-demand container, e.g. a subdirectory) and returns how many,
+ * or <=0 if it turns out to have none after all (its arrow disappears).
+ * Only called once per item per menu session -- the result is cached in
+ * the menu's own item pool for the rest of that session. */
+typedef int (*MenuLazyFn)(void *ctx, int parent_index, MenuItem *out_items, int *out_lazy, int max_items);
 
 /* anchor_x/anchor_w: the triggering item's own widget-local [anchor_x,
  * anchor_x+anchor_w) span (e.g. one task's button within tasklist -- a
@@ -355,6 +374,21 @@ void panel_menu_open(Panel *owner_panel, PanelWidget *owner_widget, int anchor_x
 void panel_menu_open_tree(Panel *owner_panel, PanelWidget *owner_widget, int anchor_x, int anchor_w,
                            const MenuItem *items, const int *depth, int n_items, void *ctx, MenuSelectFn on_select,
                            MenuHoverRootFn on_hover_root, MenuCloseFn on_close);
+/* Same as panel_menu_open_tree(), plus a `lazy` array (parallel to
+ * `items`/`depth`, same length): `lazy[i] = 1` marks item i as having
+ * children that aren't in `items` yet and should instead be fetched via
+ * `on_lazy` (see MenuLazyFn above) the first time it's actually expanded
+ * -- for a tree with no natural bound the way a filesystem has (unlike a
+ * DBusMenu tree, which is safely fetched whole in one GetLayout(-1) call
+ * -- see dbusmenu.c), eagerly walking the *entire* thing up front is
+ * both slow and unbounded. `folder` (widgets/folder.c) uses this to only
+ * ever read a directory's contents when its submenu is actually opened,
+ * not the whole subtree on the initial click. `on_lazy` may be NULL if
+ * every `lazy[i]` is 0 (equivalent to plain panel_menu_open_tree()). */
+void panel_menu_open_tree_lazy(Panel *owner_panel, PanelWidget *owner_widget, int anchor_x, int anchor_w,
+                                const MenuItem *items, const int *depth, const int *lazy, int n_items, void *ctx,
+                                MenuSelectFn on_select, MenuLazyFn on_lazy, MenuHoverRootFn on_hover_root,
+                                MenuCloseFn on_close);
 void panel_menu_close(void);
 /* Returns 1 if `ev` belonged to the open menu (and was fully handled),
  * 0 otherwise -- xispanel.c's event loop dispatches to this first without
@@ -491,5 +525,6 @@ extern const PanelWidgetOps tray_ops;
 extern const PanelWidgetOps launcher_ops;
 extern const PanelWidgetOps volume_ops;
 extern const PanelWidgetOps globalmenu_ops;
+extern const PanelWidgetOps folder_ops;
 
 #endif

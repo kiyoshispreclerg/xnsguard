@@ -1,12 +1,24 @@
 /*
- * menu.c - generic context-menu popup, with real cascading submenus.
+ * menu.c - generic context-menu popup, with real cascading submenus,
+ * on-demand (lazy) subtree population, and paging for overflowing frames.
  *
- * Any widget can open one via panel_menu_open() (flat, one level) or
+ * Any widget can open one via panel_menu_open() (flat, one level),
  * panel_menu_open_tree() (a flat items[]/depth[] pair encoding an
- * implicit tree -- see xispanel.h) with its own item list, an opaque ctx
- * pointer, and a selection callback -- this file doesn't know or care
- * what the items mean, only how to draw/position/dismiss the popup(s)
- * and report which flat index got picked.
+ * implicit tree -- see xispanel.h), or panel_menu_open_tree_lazy() (same,
+ * plus a `lazy` array marking items whose children should be fetched on
+ * demand via a callback instead of being present up front) with its own
+ * item list, an opaque ctx pointer, and a selection callback -- this file
+ * doesn't know or care what the items mean, only how to draw/position/
+ * dismiss the popup(s) and report which flat index got picked.
+ *
+ * Internally every item's parent is tracked by an explicit flat index
+ * (PanelMenu::parent[], built once from the caller's depth[] array at
+ * open time), not by DFS-array-position contiguity -- lazily-fetched
+ * children get appended to the end of the item pool whenever their
+ * parent is first expanded, wherever m->n_items happens to be at that
+ * moment, so contiguity with their parent can't be assumed the way it
+ * can for an eagerly-supplied tree. children_of() is the one place that
+ * matters.
  *
  * A tree menu is rendered as a *stack of separate popup windows*
  * ("frames"), one per open nesting level, each positioned beside its
@@ -21,15 +33,24 @@
  * against), translated into whichever open frame's screen rect actually
  * contains that point.
  *
+ * A frame with more items than fit the output vertically *pages* instead
+ * of overflowing off-screen: its height is capped to the output's own
+ * height, reserving one row at the top and bottom for a dim/bright
+ * up/down arrow (dim = no previous/next page, same look tasklist's own
+ * overflow arrows use) -- clicking a bright arrow jumps a whole page at
+ * once, not a continuous scroll. Width still spans every item across
+ * every page, so paging never resizes the frame. See frame_row_to_pos().
+ *
  * Hovering an item with children opens its submenu as a new frame after
  * owner_panel->tooltip_delay_ms (the same open-delay tooltips use --
  * "respecting the same open/close popup delays" was an explicit design
  * goal, not just for tooltips); clicking such an item opens it
- * immediately. Moving the pointer to a different item in an already-open
- * ancestor frame closes whatever deeper frames no longer apply. Moving
- * the pointer off of every open frame for owner_panel->tooltip_close_
- * delay_ms closes the whole menu, same grace-period idea tooltip.c uses
- * -- clicking a leaf item, or Escape, close it immediately as before.
+ * immediately (fetching its children first, if lazy). Moving the pointer
+ * to a different item in an already-open ancestor frame closes whatever
+ * deeper frames no longer apply. Moving the pointer off of every open
+ * frame for owner_panel->tooltip_close_delay_ms closes the whole menu,
+ * same grace-period idea tooltip.c uses -- clicking a leaf item, or
+ * Escape, close it immediately as before.
  *
  * A click whose root coordinates fall outside every open frame is
  * "clicked outside" and just dismisses the whole menu, without
@@ -37,8 +58,9 @@
  * known, accepted simplification (click again to interact with that).
  *
  * Only one menu (root + however many of its own submenu frames are open)
- * can be open at a time -- a second panel_menu_open()/panel_menu_open_tree()
- * call closes whatever was already open first.
+ * can be open at a time -- a second panel_menu_open()/panel_menu_open_
+ * tree()/panel_menu_open_tree_lazy() call closes whatever was already
+ * open first.
  */
 #include "xispanel.h"
 
@@ -51,27 +73,39 @@
 
 #define MENU_MAX_FRAMES 6
 #define MENU_ARROW_RESERVE 16 /* extra right-edge width reserved when any item in a frame has children */
+#define MENU_PARENT_STACK_DEPTH 64 /* see depth_to_parent() -- deeper than any real menu/folder tree goes */
+
+/* Row->position sentinels -- see frame_row_to_pos(). */
+#define MENU_ROW_NONE (-1)
+#define MENU_ROW_PREV (-2)
+#define MENU_ROW_NEXT (-3)
 
 typedef struct {
     Window win;
     cairo_surface_t *surface;
     cairo_t *cr;
-    int idx[MENU_TREE_MAX_ITEMS]; /* flat indices (into PanelMenu::items/depth) shown in this frame, in order */
-    int n;
-    int hover; /* slot within idx[], -1 = none */
+    int idx[MENU_TREE_MAX_ITEMS]; /* flat indices (into PanelMenu::items/parent) shown in this frame, in order */
+    int n; /* total items across every page */
+    int paging; /* 1 if n doesn't fit in one page */
+    int items_per_page;
+    int page, page_count;
+    int visible_rows; /* rows actually rendered (== n if !paging, else items_per_page+2 for the arrow rows) */
+    int hover_row; /* on-screen row currently hovered, -1 = none */
     int width, height;
     int screen_x, screen_y; /* absolute (root) coordinates */
-    /* Which slot of the *parent* frame this frame was opened from -- lets
-     * handle_motion() tell "still hovering the branch that's open" from
-     * "hovering a different item, this frame should collapse away" for
-     * frames[i+1] relative to frames[i]. -1 for frame 0 (no parent). */
-    int spawned_from_slot;
+    /* Which idx[]-position of the *parent* frame this frame was opened
+     * from -- lets handle_motion() tell "still hovering the branch
+     * that's open" from "hovering a different item, this frame should
+     * collapse away" for frames[i+1] relative to frames[i]. -1 for frame
+     * 0 (no parent). */
+    int spawned_from_pos;
 } MenuFrame;
 
 typedef struct {
     MenuItem items[MENU_TREE_MAX_ITEMS];
-    int depth[MENU_TREE_MAX_ITEMS];
-    int has_children[MENU_TREE_MAX_ITEMS];
+    int parent[MENU_TREE_MAX_ITEMS]; /* flat index of each item's parent, -1 = top level */
+    int has_children[MENU_TREE_MAX_ITEMS]; /* already-populated children exist, or lazy[i] is still pending */
+    int lazy[MENU_TREE_MAX_ITEMS]; /* 1 = children not fetched yet, fetch via on_lazy on first expand */
     int n_items;
     int item_h;
     double font_size; /* panel_text_size()-equivalent, resolved once at open time */
@@ -83,14 +117,15 @@ typedef struct {
     PanelWidget *owner_widget;
     void *ctx;
     MenuSelectFn on_select;
+    MenuLazyFn on_lazy;
     MenuHoverRootFn on_hover_root;
     MenuCloseFn on_close;
 
-    /* Pending submenu open: frames[pending_frame]'s slot pending_slot has
-     * been continuously hovered since pending_since_ms; opens once
+    /* Pending submenu open: frames[pending_frame]'s position pending_pos
+     * has been continuously hovered since pending_since_ms; opens once
      * owner_panel->tooltip_delay_ms elapses. 0 = nothing pending. */
     uint64_t pending_since_ms;
-    int pending_frame, pending_slot;
+    int pending_frame, pending_pos;
 
     /* Pointer isn't over any open frame right now; closes the whole menu
      * once owner_panel->tooltip_close_delay_ms elapses. 0 = pointer is
@@ -151,6 +186,33 @@ static void close_frames_from(int level)
     }
 }
 
+/* Maps an on-screen row (0..visible_rows-1) to either an idx[]-position
+ * (0..n-1) or one of the MENU_ROW_* sentinels above. When not paging,
+ * row and position are the same number. */
+static int frame_row_to_pos(const MenuFrame *f, int row)
+{
+    if (!f->paging) {
+        return (row >= 0 && row < f->n) ? row : MENU_ROW_NONE;
+    }
+    if (row == 0) {
+        return MENU_ROW_PREV;
+    }
+    if (row == f->visible_rows - 1) {
+        return MENU_ROW_NEXT;
+    }
+    int pos = f->page * f->items_per_page + (row - 1);
+    return (row - 1 < f->items_per_page && pos < f->n) ? pos : MENU_ROW_NONE;
+}
+
+/* Inverse of frame_row_to_pos() for a position known to be on the
+ * *currently displayed* page (true right when it was just clicked/
+ * hovered, which is the only time this is needed -- to position a freshly
+ * opened submenu beside the row its parent item currently occupies). */
+static int frame_pos_to_row(const MenuFrame *f, int pos)
+{
+    return f->paging ? (1 + pos - f->page * f->items_per_page) : pos;
+}
+
 static void paint_frame(PanelMenu *m, MenuFrame *f)
 {
     if (!f->win) {
@@ -166,10 +228,40 @@ static void paint_frame(PanelMenu *m, MenuFrame *f)
         cairo_set_font_face(cr, g_font_face);
     }
     cairo_set_font_size(cr, m->font_size);
-    for (int s = 0; s < f->n; s++) {
-        int idx = f->idx[s];
+
+    for (int row = 0; row < f->visible_rows; row++) {
+        int y = row * m->item_h;
+        int pos = frame_row_to_pos(f, row);
+
+        if (pos == MENU_ROW_PREV || pos == MENU_ROW_NEXT) {
+            int active = (pos == MENU_ROW_PREV) ? (f->page > 0) : (f->page < f->page_count - 1);
+            if (row == f->hover_row && active) {
+                cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.12);
+                cairo_rectangle(cr, 0, y, f->width, m->item_h);
+                cairo_fill(cr);
+            }
+            double cx = f->width / 2.0;
+            double half = m->item_h / 2.0;
+            cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, active ? 0.85 : 0.25);
+            if (pos == MENU_ROW_PREV) {
+                cairo_move_to(cr, cx - 5, y + half + 3);
+                cairo_line_to(cr, cx + 5, y + half + 3);
+                cairo_line_to(cr, cx, y + half - 4);
+            } else {
+                cairo_move_to(cr, cx - 5, y + half - 3);
+                cairo_line_to(cr, cx + 5, y + half - 3);
+                cairo_line_to(cr, cx, y + half + 4);
+            }
+            cairo_close_path(cr);
+            cairo_fill(cr);
+            continue;
+        }
+        if (pos == MENU_ROW_NONE) {
+            continue;
+        }
+
+        int idx = f->idx[pos];
         MenuItem *it = &m->items[idx];
-        int y = s * m->item_h;
         if (it->is_separator) {
             cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.15);
             cairo_move_to(cr, 6, y + m->item_h / 2.0);
@@ -178,7 +270,7 @@ static void paint_frame(PanelMenu *m, MenuFrame *f)
             cairo_stroke(cr);
             continue;
         }
-        if (s == f->hover && it->enabled) {
+        if (row == f->hover_row && it->enabled) {
             cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.12);
             cairo_rectangle(cr, 0, y, f->width, m->item_h);
             cairo_fill(cr);
@@ -203,21 +295,78 @@ static void paint_frame(PanelMenu *m, MenuFrame *f)
     XFlush(g_dpy);
 }
 
-/* Fills out_idx[] (and out_n) with the flat indices of parent_idx's
- * *immediate* children (depth[parent_idx]+1), stopping at the first item
- * whose depth
- * drops back to <= depth[parent_idx] -- the boundary of parent_idx's
- * whole subtree in the flat DFS array. */
+/* Fills out_idx[]/out_n with the flat indices of every item whose parent
+ * is `parent_idx` (top-level items when parent_idx is -1), in the order
+ * they were inserted -- an eager subtree keeps its original DFS order;
+ * lazily-fetched children (appended later, elsewhere in the array) come
+ * back in their own fetch order too, since insertion order is preserved
+ * regardless of *where* in the array a child physically landed. */
 static void children_of(PanelMenu *m, int parent_idx, int *out_idx, int *out_n)
 {
     int n = 0;
-    int pd = m->depth[parent_idx];
-    for (int k = parent_idx + 1; k < m->n_items && m->depth[k] > pd && n < MENU_TREE_MAX_ITEMS; k++) {
-        if (m->depth[k] == pd + 1) {
+    for (int k = 0; k < m->n_items && n < MENU_TREE_MAX_ITEMS; k++) {
+        if (m->parent[k] == parent_idx) {
             out_idx[n++] = k;
         }
     }
     *out_n = n;
+}
+
+/* Converts a depth[] array (DFS-order tree encoding, the shape callers
+ * supply -- e.g. dbusmenu_fetch()'s out_depth) into explicit parent flat-
+ * indices. Internally every lookup goes through parent[] (see children_
+ * of()'s doc comment on why), so this conversion happens once, up front,
+ * regardless of whether the tree came in eagerly or is empty and about
+ * to be filled in lazily. */
+static void depth_to_parent(const int *depth, int *parent, int n)
+{
+    int last_at_depth[MENU_PARENT_STACK_DEPTH];
+    for (int i = 0; i < MENU_PARENT_STACK_DEPTH; i++) {
+        last_at_depth[i] = -1;
+    }
+    for (int i = 0; i < n; i++) {
+        int d = depth[i];
+        parent[i] = (d > 0 && d - 1 < MENU_PARENT_STACK_DEPTH) ? last_at_depth[d - 1] : -1;
+        if (d < MENU_PARENT_STACK_DEPTH) {
+            last_at_depth[d] = i;
+        }
+    }
+}
+
+/* If `idx` is still marked lazy, calls on_lazy() once to fetch and append
+ * its immediate children to the item pool, then clears the lazy flag (so
+ * it's never re-fetched within this menu session, even if collapsed and
+ * re-expanded) -- if it comes back empty, has_children[idx] is cleared
+ * too so its arrow disappears. No-op if `idx` isn't lazy (already
+ * resolved, or was never lazy to begin with). */
+static void expand_lazy(PanelMenu *m, int idx)
+{
+    if (!m->lazy[idx]) {
+        return;
+    }
+    m->lazy[idx] = 0;
+    if (!m->on_lazy) {
+        m->has_children[idx] = 0;
+        return;
+    }
+    int room = MENU_TREE_MAX_ITEMS - m->n_items;
+    if (room <= 0) {
+        return; /* item pool is full -- leave has_children set, just can't fetch more */
+    }
+    MenuItem tmp_items[MENU_TREE_MAX_ITEMS];
+    int tmp_lazy[MENU_TREE_MAX_ITEMS];
+    int k = m->on_lazy(m->ctx, idx, tmp_items, tmp_lazy, room);
+    if (k <= 0) {
+        m->has_children[idx] = 0;
+        return;
+    }
+    for (int i = 0; i < k && m->n_items < MENU_TREE_MAX_ITEMS; i++) {
+        int ni = m->n_items++;
+        m->items[ni] = tmp_items[i];
+        m->parent[ni] = idx;
+        m->lazy[ni] = tmp_lazy[i];
+        m->has_children[ni] = tmp_lazy[i];
+    }
 }
 
 static int measure_frame_width(PanelMenu *m, const int *idx, int n)
@@ -248,6 +397,37 @@ static int measure_frame_width(PanelMenu *m, const int *idx, int n)
     cairo_destroy(probe_cr);
     cairo_surface_destroy(probe_surf);
     return any_children ? max_w + MENU_ARROW_RESERVE : max_w;
+}
+
+/* Fills in f->width/height/paging/items_per_page/page_count/visible_rows
+ * from f->idx[]/f->n (already set by the caller) and the output's own
+ * height -- shared by the root frame's creation and every submenu
+ * frame's, so paging behaves identically at every nesting level. Width is
+ * measured across *every* page's worth of items, not just the first, so
+ * the frame never resizes as you page through it. */
+static void layout_frame(PanelMenu *m, MenuFrame *f)
+{
+    Panel *p = m->owner_panel;
+    f->width = measure_frame_width(m, f->idx, f->n);
+
+    int max_rows_fit = p->out_h / m->item_h;
+    if (max_rows_fit < 1) {
+        max_rows_fit = 1;
+    }
+    if (f->n <= max_rows_fit) {
+        f->paging = 0;
+        f->items_per_page = f->n;
+        f->page = 0;
+        f->page_count = 1;
+        f->visible_rows = f->n;
+    } else {
+        f->paging = 1;
+        f->items_per_page = max_rows_fit - 2 > 0 ? max_rows_fit - 2 : 1;
+        f->page = 0;
+        f->page_count = (f->n + f->items_per_page - 1) / f->items_per_page;
+        f->visible_rows = f->items_per_page + 2;
+    }
+    f->height = f->visible_rows * m->item_h;
 }
 
 /* Creates, maps, and paints a frame window for `f` (idx[]/n/width/height/
@@ -288,14 +468,21 @@ static int create_frame_window(PanelMenu *m, MenuFrame *f, int want_grab)
     return 1;
 }
 
-/* Opens parent_idx's (frames[parent_frame]'s slot parent_slot) children as
- * a new frame beside parent_frame, closing any previously-open deeper
- * frames first. Returns 0 (no-op) if that item has no children or the
- * cascade is already as deep as MENU_MAX_FRAMES allows. */
-static int open_submenu(PanelMenu *m, int parent_frame, int parent_slot)
+/* Opens the item at frames[parent_frame]'s idx[]-position parent_pos's
+ * children as a new frame beside parent_frame, closing any previously-
+ * open deeper frames first -- fetching them first via expand_lazy() if
+ * they haven't been resolved yet. Returns 0 (no-op) if that item turns
+ * out to have no children after all, or the cascade is already as deep
+ * as MENU_MAX_FRAMES allows. */
+static int open_submenu(PanelMenu *m, int parent_frame, int parent_pos)
 {
     MenuFrame *pf = &m->frames[parent_frame];
-    int parent_idx = pf->idx[parent_slot];
+    if (parent_pos < 0 || parent_pos >= pf->n) {
+        return 0;
+    }
+    int parent_idx = pf->idx[parent_pos];
+    expand_lazy(m, parent_idx);
+
     int child_idx[MENU_TREE_MAX_ITEMS], child_n;
     children_of(m, parent_idx, child_idx, &child_n);
     if (child_n <= 0) {
@@ -311,14 +498,14 @@ static int open_submenu(PanelMenu *m, int parent_frame, int parent_slot)
     memset(f, 0, sizeof(*f));
     memcpy(f->idx, child_idx, sizeof(int) * (size_t)child_n);
     f->n = child_n;
-    f->hover = -1;
-    f->spawned_from_slot = parent_slot;
-    f->width = measure_frame_width(m, f->idx, f->n);
-    f->height = f->n * m->item_h;
+    f->hover_row = -1;
+    f->spawned_from_pos = parent_pos;
+    layout_frame(m, f);
 
     Panel *p = m->owner_panel;
+    int parent_row = frame_pos_to_row(pf, parent_pos);
     f->screen_x = pf->screen_x + pf->width;
-    f->screen_y = pf->screen_y + parent_slot * m->item_h;
+    f->screen_y = pf->screen_y + parent_row * m->item_h;
     if (f->screen_x + f->width > p->out_x + p->out_w) {
         f->screen_x = pf->screen_x - f->width; /* flip to the left of the parent frame instead */
     }
@@ -356,24 +543,27 @@ static void select_and_close(int idx)
     }
 }
 
-/* Root coordinates -> (frame, slot) currently under the pointer, or
- * frame=-1 if the point isn't inside any open frame at all. slot is -1 if
- * inside the frame's rect but past its last item (e.g. bottom padding, or
- * an empty frame). */
-static void hit_test(PanelMenu *m, int root_x, int root_y, int *out_frame, int *out_slot)
+/* Root coordinates -> (frame, row) currently under the pointer, or
+ * frame=-1 if the point isn't inside any open frame at all. row is the
+ * raw on-screen row (0..visible_rows-1); callers resolve it to an idx[]-
+ * position or arrow sentinel via frame_row_to_pos() as needed -- kept
+ * separate so hover highlighting (which needs the raw row, since arrow
+ * rows aren't positions) and click/hover-open logic (which needs the
+ * resolved position) can each use whichever shape they need. */
+static void hit_test(PanelMenu *m, int root_x, int root_y, int *out_frame, int *out_row)
 {
     for (int i = 0; i < m->n_frames; i++) {
         MenuFrame *f = &m->frames[i];
         if (root_x >= f->screen_x && root_x < f->screen_x + f->width && root_y >= f->screen_y &&
             root_y < f->screen_y + f->height) {
-            int slot = (root_y - f->screen_y) / m->item_h;
+            int row = (root_y - f->screen_y) / m->item_h;
             *out_frame = i;
-            *out_slot = (slot >= 0 && slot < f->n) ? slot : -1;
+            *out_row = (row >= 0 && row < f->visible_rows) ? row : -1;
             return;
         }
     }
     *out_frame = -1;
-    *out_slot = -1;
+    *out_row = -1;
 }
 
 static uint64_t close_delay_ms(PanelMenu *m)
@@ -393,8 +583,8 @@ static void handle_motion(int root_x, int root_y)
         m->on_hover_root(m->ctx, root_x, root_y);
     }
 
-    int frame, slot;
-    hit_test(m, root_x, root_y, &frame, &slot);
+    int frame, row;
+    hit_test(m, root_x, root_y, &frame, &row);
     if (frame < 0) {
         if (!m->close_deadline_ms) {
             m->close_deadline_ms = now_ms() + close_delay_ms(m);
@@ -405,22 +595,24 @@ static void handle_motion(int root_x, int root_y)
     m->close_deadline_ms = 0;
 
     MenuFrame *f = &m->frames[frame];
-    if (f->hover != slot) {
-        f->hover = slot;
+    if (f->hover_row != row) {
+        f->hover_row = row;
         paint_frame(m, f);
     }
 
+    int pos = row >= 0 ? frame_row_to_pos(f, row) : MENU_ROW_NONE;
+
     /* A deeper frame is open under this one -- collapse it away unless
-     * we're still hovering exactly the slot that spawned it. */
-    if (frame + 1 < m->n_frames && m->frames[frame + 1].spawned_from_slot != slot) {
+     * we're still hovering exactly the position that spawned it. */
+    if (frame + 1 < m->n_frames && (pos < 0 || m->frames[frame + 1].spawned_from_pos != pos)) {
         close_frames_from(frame + 1);
     }
 
-    int has_open_child_here = frame + 1 < m->n_frames && m->frames[frame + 1].spawned_from_slot == slot;
-    if (slot >= 0 && m->has_children[f->idx[slot]] && !has_open_child_here) {
-        if (m->pending_frame != frame || m->pending_slot != slot) {
+    int has_open_child_here = frame + 1 < m->n_frames && pos >= 0 && m->frames[frame + 1].spawned_from_pos == pos;
+    if (pos >= 0 && m->has_children[f->idx[pos]] && !has_open_child_here) {
+        if (m->pending_frame != frame || m->pending_pos != pos) {
             m->pending_frame = frame;
-            m->pending_slot = slot;
+            m->pending_pos = pos;
             m->pending_since_ms = now_ms();
         }
     } else {
@@ -431,27 +623,51 @@ static void handle_motion(int root_x, int root_y)
 static void handle_click(int root_x, int root_y)
 {
     PanelMenu *m = g_menu;
-    int frame, slot;
-    hit_test(m, root_x, root_y, &frame, &slot);
-    if (frame < 0 || slot < 0) {
+    int frame, row;
+    hit_test(m, root_x, root_y, &frame, &row);
+    if (frame < 0) {
         panel_menu_close();
         return;
     }
-    int idx = m->frames[frame].idx[slot];
+    MenuFrame *f = &m->frames[frame];
+    int pos = row >= 0 ? frame_row_to_pos(f, row) : MENU_ROW_NONE;
+
+    if (pos == MENU_ROW_PREV) {
+        if (f->page > 0) {
+            f->page--;
+            f->hover_row = -1;
+            paint_frame(m, f);
+        }
+        return;
+    }
+    if (pos == MENU_ROW_NEXT) {
+        if (f->page < f->page_count - 1) {
+            f->page++;
+            f->hover_row = -1;
+            paint_frame(m, f);
+        }
+        return;
+    }
+    if (pos < 0) {
+        panel_menu_close();
+        return;
+    }
+    int idx = f->idx[pos];
     if (m->items[idx].is_separator || !m->items[idx].enabled) {
         panel_menu_close();
         return;
     }
     if (m->has_children[idx]) {
-        open_submenu(m, frame, slot);
+        open_submenu(m, frame, pos);
         return; /* leaf selection happens on a later click, inside the new submenu */
     }
     select_and_close(idx);
 }
 
-void panel_menu_open_tree(Panel *owner_panel, PanelWidget *owner_widget, int anchor_x, int anchor_w,
-                           const MenuItem *items, const int *depth, int n_items, void *ctx, MenuSelectFn on_select,
-                           MenuHoverRootFn on_hover_root, MenuCloseFn on_close)
+void panel_menu_open_tree_lazy(Panel *owner_panel, PanelWidget *owner_widget, int anchor_x, int anchor_w,
+                                const MenuItem *items, const int *depth, const int *lazy, int n_items, void *ctx,
+                                MenuSelectFn on_select, MenuLazyFn on_lazy, MenuHoverRootFn on_hover_root,
+                                MenuCloseFn on_close)
 {
     (void)anchor_w; /* only the leading edge is needed for a dropdown-style menu */
     if (g_menu) {
@@ -466,18 +682,22 @@ void panel_menu_open_tree(Panel *owner_panel, PanelWidget *owner_widget, int anc
         return;
     }
     memcpy(m->items, items, sizeof(MenuItem) * (size_t)n_items);
-    memcpy(m->depth, depth, sizeof(int) * (size_t)n_items);
+    memcpy(m->lazy, lazy, sizeof(int) * (size_t)n_items);
     m->n_items = n_items;
+    depth_to_parent(depth, m->parent, n_items);
     for (int i = 0; i < n_items; i++) {
-        /* Item i's children (if any) always immediately follow it in a
-         * DFS-flattened tree, at depth[i]+1 -- see dbusmenu_fetch()'s doc
-         * comment on the shape this array is expected to have. */
-        m->has_children[i] = (i + 1 < n_items && depth[i + 1] == depth[i] + 1);
+        m->has_children[i] = lazy[i] ? 1 : 0;
+    }
+    for (int i = 0; i < n_items; i++) {
+        if (m->parent[i] >= 0) {
+            m->has_children[m->parent[i]] = 1;
+        }
     }
     m->owner_panel = owner_panel;
     m->owner_widget = owner_widget;
     m->ctx = ctx;
     m->on_select = on_select;
+    m->on_lazy = on_lazy;
     m->on_hover_root = on_hover_root;
     m->on_close = on_close;
 
@@ -494,16 +714,10 @@ void panel_menu_open_tree(Panel *owner_panel, PanelWidget *owner_widget, int anc
     }
 
     MenuFrame *f0 = &m->frames[0];
-    f0->n = 0;
-    for (int i = 0; i < n_items; i++) {
-        if (depth[i] == 0 && f0->n < MENU_TREE_MAX_ITEMS) {
-            f0->idx[f0->n++] = i;
-        }
-    }
-    f0->hover = -1;
-    f0->spawned_from_slot = -1;
-    f0->width = measure_frame_width(m, f0->idx, f0->n);
-    f0->height = f0->n * m->item_h;
+    children_of(m, -1, f0->idx, &f0->n);
+    f0->hover_row = -1;
+    f0->spawned_from_pos = -1;
+    layout_frame(m, f0);
 
     /* Glued to the panel's outer edge (below a top panel, above a bottom
      * one, beside a left/right one), leading edge aligned to the anchor
@@ -542,6 +756,19 @@ void panel_menu_open_tree(Panel *owner_panel, PanelWidget *owner_widget, int anc
     paint_frame(m, f0);
 }
 
+void panel_menu_open_tree(Panel *owner_panel, PanelWidget *owner_widget, int anchor_x, int anchor_w,
+                           const MenuItem *items, const int *depth, int n_items, void *ctx, MenuSelectFn on_select,
+                           MenuHoverRootFn on_hover_root, MenuCloseFn on_close)
+{
+    if (n_items <= 0 || n_items > MENU_TREE_MAX_ITEMS) {
+        return;
+    }
+    int lazy[MENU_TREE_MAX_ITEMS];
+    memset(lazy, 0, sizeof(int) * (size_t)n_items);
+    panel_menu_open_tree_lazy(owner_panel, owner_widget, anchor_x, anchor_w, items, depth, lazy, n_items, ctx,
+                               on_select, NULL, on_hover_root, on_close);
+}
+
 void panel_menu_open(Panel *owner_panel, PanelWidget *owner_widget, int anchor_x, int anchor_w, const MenuItem *items,
                       int n_items, void *ctx, MenuSelectFn on_select)
 {
@@ -565,9 +792,9 @@ void panel_menu_tick(uint64_t now)
         return;
     }
     if (m->pending_since_ms && now - m->pending_since_ms >= open_delay_ms(m)) {
-        int pf = m->pending_frame, ps = m->pending_slot;
+        int pf = m->pending_frame, pp = m->pending_pos;
         m->pending_since_ms = 0;
-        open_submenu(m, pf, ps);
+        open_submenu(m, pf, pp);
     }
 }
 
@@ -626,11 +853,12 @@ int panel_menu_handle_event(const XEvent *ev)
             panel_menu_close();
         } else if (ks == XK_Return || ks == XK_KP_Enter) {
             MenuFrame *f = &m->frames[m->n_frames - 1];
-            if (f->hover >= 0) {
-                int idx = f->idx[f->hover];
+            int pos = f->hover_row >= 0 ? frame_row_to_pos(f, f->hover_row) : MENU_ROW_NONE;
+            if (pos >= 0) {
+                int idx = f->idx[pos];
                 if (!m->items[idx].is_separator && m->items[idx].enabled) {
                     if (m->has_children[idx]) {
-                        open_submenu(m, m->n_frames - 1, f->hover);
+                        open_submenu(m, m->n_frames - 1, pos);
                     } else {
                         select_and_close(idx);
                     }
