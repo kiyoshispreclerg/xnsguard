@@ -16,15 +16,22 @@
  * at the cost of one extra (cheap, libdbus internally dedupes) session
  * bus connection when both happen to be active at once.
  *
- * GetLayout(0, -1, []) returns the *entire* tree in one call (depth -1 =
- * unlimited), so no follow-up round-trips are needed for nested submenus.
- * Rather than building real nested-submenu UI in menu.c (a flat popup
- * today, by design -- see its own header comment), dbusmenu_fetch()
- * flattens the whole tree into a flat list, indenting each item by its
- * depth: simpler, and every menu seen in practice from real tray items
- * (fcitx5, network applets) is shallow enough that a flattened view is
- * still perfectly usable.
- */
+ * GetLayout(parent_id, depth, []) with depth=-1 returns the *entire*
+ * subtree under parent_id in one call, so no follow-up round-trips are
+ * needed for nested submenus. dbusmenu_fetch() flattens whatever subtree
+ * it's asked for into parallel out_items[]/out_ids[]/out_depth[] arrays,
+ * out_depth[i] recording item i's nesting depth relative to parent_id
+ * (not baked into the label) -- menu.c's panel_menu_open_tree() consumes
+ * that shape directly to render real cascading submenu popups (one frame
+ * per depth level, opened beside the previous). Callers that just want a
+ * single flat display with visual indentation instead (sni.c's tray Menu
+ * popup) bake it into the label themselves from out_depth before calling
+ * the plain panel_menu_open(). Callers pick parent_id/depth for their own
+ * shape of fetch -- e.g. sni.c wants the whole tree at once (parent_id=0,
+ * depth=-1), while globalmenu.c wants just the top-level item labels for
+ * its menu bar (parent_id=0, depth=1) and, once one of those is clicked
+ * (or hovered, in menu.c's cascade), that single item's own full subtree
+ * (parent_id=<its id>, depth=-1). */
 #include "xispanel.h"
 
 #include <dbus/dbus.h>
@@ -123,12 +130,14 @@ static int dbusmenu_ensure_connected(void)
 }
 
 /* Recursively flattens one (ia{sv}av) node (already positioned at a
- * DBUS_TYPE_VARIANT wrapping that struct) into out_items[]/out_ids[],
- * indenting each label by `depth`. Skips invisible items and their entire
- * subtree; disabled items are still listed (greyed out) so the layout
- * doesn't visibly shift. */
+ * DBUS_TYPE_VARIANT wrapping that struct) into out_items[]/out_ids[]/
+ * out_depth[], recording each item's nesting depth (relative to the
+ * subtree's own root) rather than baking it into the label -- callers
+ * that want a flat indented display add that themselves. Skips invisible
+ * items and their entire subtree; disabled items are still listed
+ * (greyed out) so the layout doesn't visibly shift. */
 static void dbusmenu_parse_node(DBusMessageIter *variant_iter, int depth, MenuItem *out_items, int *out_ids,
-                                 int max_items, int *n)
+                                 int *out_depth, int max_items, int *n)
 {
     if (*n >= max_items) {
         return;
@@ -212,9 +221,10 @@ static void dbusmenu_parse_node(DBusMessageIter *variant_iter, int depth, MenuIt
         mi->is_separator = is_separator;
         mi->enabled = enabled;
         if (!is_separator) {
-            snprintf(mi->label, sizeof(mi->label), "%*s%s", depth * 2, "", label);
+            snprintf(mi->label, sizeof(mi->label), "%s", label);
         }
         out_ids[*n] = id;
+        out_depth[*n] = depth;
         (*n)++;
     }
 
@@ -225,7 +235,7 @@ static void dbusmenu_parse_node(DBusMessageIter *variant_iter, int depth, MenuIt
         DBusMessageIter children;
         p_dbus_message_iter_recurse(&node, &children);
         while (p_dbus_message_iter_get_arg_type(&children) == DBUS_TYPE_VARIANT && *n < max_items) {
-            dbusmenu_parse_node(&children, depth + 1, out_items, out_ids, max_items, n);
+            dbusmenu_parse_node(&children, depth + 1, out_items, out_ids, out_depth, max_items, n);
             if (!p_dbus_message_iter_next(&children)) {
                 break;
             }
@@ -233,7 +243,8 @@ static void dbusmenu_parse_node(DBusMessageIter *variant_iter, int depth, MenuIt
     }
 }
 
-int dbusmenu_fetch(const char *busname, const char *path, MenuItem *out_items, int *out_ids, int max_items)
+int dbusmenu_fetch(const char *busname, const char *path, int32_t parent_id, int32_t depth, MenuItem *out_items,
+                    int *out_ids, int *out_depth, int max_items)
 {
     if (!dbusmenu_ensure_connected()) {
         return -1;
@@ -245,7 +256,6 @@ int dbusmenu_fetch(const char *busname, const char *path, MenuItem *out_items, i
     }
     DBusMessageIter it, str_arr;
     p_dbus_message_iter_init_append(msg, &it);
-    int32_t parent_id = 0, depth = -1;
     p_dbus_message_iter_append_basic(&it, DBUS_TYPE_INT32, &parent_id);
     p_dbus_message_iter_append_basic(&it, DBUS_TYPE_INT32, &depth);
     p_dbus_message_iter_open_container(&it, DBUS_TYPE_ARRAY, "s", &str_arr);
@@ -283,7 +293,7 @@ int dbusmenu_fetch(const char *busname, const char *path, MenuItem *out_items, i
                 DBusMessageIter children;
                 p_dbus_message_iter_recurse(&root, &children);
                 while (p_dbus_message_iter_get_arg_type(&children) == DBUS_TYPE_VARIANT && n < max_items) {
-                    dbusmenu_parse_node(&children, 0, out_items, out_ids, max_items, &n);
+                    dbusmenu_parse_node(&children, 0, out_items, out_ids, out_depth, max_items, &n);
                     if (!p_dbus_message_iter_next(&children)) {
                         break;
                     }

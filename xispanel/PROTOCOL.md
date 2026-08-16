@@ -309,8 +309,29 @@ Widget types implemented so far:
   the original ask, not yet implemented; `cmd_edit`'s external mixer
   covers that need for now.
 
-More widget types (global menu, system monitor) are later phases -- see
-the plan this tool was built from; they are not implemented yet.
+- `globalmenu`: renders the active window's exported application menu
+  (File/Edit/View/...), when it has one -- see "Global menu (appmenu)"
+  below for the underlying mechanism. `mode=open|closed` (default
+  `closed`): `open` draws the top-level menu names inline in the widget,
+  like a normal window's own menu bar (or macOS's global menu bar);
+  `closed` draws a single hamburger icon instead. In `open` mode,
+  hovering (or clicking) a top-level name (e.g. "File") opens *that
+  item's own* subtree as a real cascading submenu (see "Context menus"
+  above) anchored under the label; once one top-level menu is open,
+  moving the pointer to a *different* top-level label switches to that
+  one too, no click needed -- same behavior as a normal application's
+  menu bar. In `closed` mode, clicking the hamburger opens the *entire*
+  menu tree as a cascade instead, rooted at the top rather than one
+  top-level item. Collapses to zero width whenever the active window has
+  no exported menu (same "just don't render" fallback `tray` uses when
+  empty). Polls `_NET_ACTIVE_WINDOW` every ~300ms, same tradeoff as
+  `tasklist`/`winctl`'s polling; only re-fetches the top-level item list
+  when the tracked window (or its menu's busname/objpath) actually
+  changes, not on every poll tick -- each submenu's own contents are
+  fetched fresh (one `GetLayout` call) whenever it's actually opened.
+
+System monitor is a later phase -- see the plan this tool was built
+from; it is not implemented yet.
 
 ### Widget sizing
 
@@ -414,17 +435,32 @@ to those is a possible follow-up, not implemented yet.
 Any widget can pop up a context menu for itself or one of its own
 sub-items (e.g. `tasklist`'s per-window menu) via a generic popup system
 shared by every widget type -- the menu code itself doesn't know or care
-what the items mean, only how to draw/position/dismiss the popup. It's an
-`override-redirect` window with an exclusive pointer+keyboard grab while
-open: a click outside the menu's bounds, or Escape, dismisses it (a click
+what the items mean, only how to draw/position/dismiss the popup(s). It's
+`override-redirect` window(s) with an exclusive pointer+keyboard grab
+(held by only the first/root window) while open: a click outside every
+open frame's bounds, or Escape, dismisses the whole thing (a click
 outside is *not* re-delivered to whatever was actually underneath it --
 a known, accepted simplification; click again to interact with that).
 
-The menu is positioned glued to the panel's outer edge (below a top
+The root frame is positioned glued to the panel's outer edge (below a top
 panel, above a bottom one, beside a left/right one) with its leading edge
 aligned to whichever sub-item triggered it -- e.g. right-clicking a task
 button opens the menu directly under *that button*, not at the raw click
 coordinates -- same convention plasmashell's taskbar context menus use.
+
+Menus with nested items (currently: the tray's/`globalmenu`'s DBusMenu
+popups) render as real **cascading submenus** -- a separate popup window
+per open nesting level, positioned beside its parent frame at the row
+that spawned it, classic Windows/GTK/Qt style -- rather than one long
+flattened+indented list. Hovering an item with children opens its own
+submenu frame after `tooltip_delay` (the same open-delay hover tooltips
+use); clicking such an item opens it immediately. Moving the pointer to a
+different item in an already-open parent frame closes whatever deeper
+frames no longer apply; moving it off of every open frame for
+`tooltip_close_delay` closes the whole menu (same grace-period idea hover
+tooltips use, see below) -- clicking a leaf item, or Escape, close it
+immediately as always. A small right-pointing arrow at an item's trailing
+edge indicates it has a submenu.
 
 ## Hover tooltips
 
@@ -595,36 +631,73 @@ surface the same way `_NET_WM_ICON` already is in `ewmh.c`. Items that
 never set `IconPixmap` fall back to the same single-letter placeholder
 tasklist/winctl use, keyed off `Title`/`IconName`.
 
-Middle-click always just sends `SecondaryActivate(root_x, root_y)`
-(fire-and-forget, per spec -- DBusMenu below has no equivalent for it).
-Left- and right-click first try rendering the item's own **DBusMenu**
-(`Menu` property): a real object path there means the item expects
-*that* to be the primary interaction, not `Activate()`/`ContextMenu()`
--- confirmed against fcitx5's real SNI item, whose introspection doesn't
-even list a `ContextMenu` method (only `Activate`/`Scroll`/
-`SecondaryActivate`), while `Menu` points at a working
-`com.canonical.dbusmenu` object serving its input-method switcher. xispanel
-fetches it with a single `GetLayout(0, -1, [])` call (depth `-1` returns
-the *entire* tree recursively -- fcitx5's real menu nests the actual
-input-method list one level under a "Group" container, so this avoids a
-follow-up round-trip per level) and flattens it into menu.c's existing
-flat popup, indenting each item by its depth in the tree rather than
-building real nested-submenu UI -- every tray-item menu seen in practice
-is shallow enough that a flattened view is still perfectly usable.
-Clicking an entry sends `Event(id, "clicked", <int32 0>, 0)`
-fire-and-forget, same convention DBusMenu clients use. `menu.c`'s item
-cap was bumped from 8 to 24 to fit menus like fcitx5's (5 input methods +
-separator + Configure/Restart/Exit = 9 flattened entries) which
-previously would've silently failed to open (`panel_menu_open()` refuses
-`n_items` past its cap). Only when the `Menu` property is empty/absent
-(the spec's "no menu" convention, object path `/` or unset) does
-left-click fall back to plain `Activate(root_x, root_y)` and right-click
-to `ContextMenu(root_x, root_y)`. Tested end-to-end against a throwaway
+Left-click always sends `Activate(root_x, root_y)` -- the item's primary
+action, same convention plasmashell follows (e.g. left-click on
+OpenSnitch's tray icon opens its UI, not a menu). Middle-click always
+sends `SecondaryActivate(root_x, root_y)` (both fire-and-forget, per
+spec -- DBusMenu below has no equivalent for either). Only right-click
+first tries rendering the item's own **DBusMenu** (`Menu` property): a
+real object path there means the item expects *that* to be its
+right-click interaction, not `ContextMenu()` -- confirmed against
+fcitx5's real SNI item, whose introspection doesn't even list a
+`ContextMenu` method (only `Activate`/`Scroll`/`SecondaryActivate`),
+while `Menu` points at a working `com.canonical.dbusmenu` object serving
+its input-method switcher. xispanel fetches it with a single
+`GetLayout(0, -1, [])` call (depth `-1` returns the *entire* tree
+recursively -- fcitx5's real menu nests the actual input-method list one
+level under a "Group" container, so this avoids a follow-up round-trip
+per level) and opens it as a real cascading submenu popup via
+`dbusmenu.c`/`menu.c`'s `panel_menu_open_tree()` (see "Context menus"
+above) rather than one flattened list. Clicking a leaf entry sends
+`Event(id, "clicked", <int32 0>, 0)` fire-and-forget, same convention
+DBusMenu clients use. `menu.c`'s per-fetch item cap is 24 for the tray
+(`DBUSMENU_MAX_ITEMS`), enough to fit menus like fcitx5's (5 input
+methods + separator + Configure/Restart/Exit = 9 entries) -- larger than
+that silently truncates rather than crashing (`dbusmenu_fetch()` just
+stops filling its output arrays at `max_items`). Only when the `Menu`
+property is empty/absent (the spec's "no menu" convention, object path
+`/` or unset) does right-click fall back to plain
+`ContextMenu(root_x, root_y)`. Tested end-to-end against a throwaway
 Python (`dbus-python`) fake tray item: registration, icon fetch,
 left/middle/right click dispatch, and tooltip all confirmed working
 (before the DBusMenu client existed -- that part's been exercised
 against fcitx5's real menu directly, `ldd`/`strings` still confirm no
 build-time link to `libdbus`).
+
+### Global menu (appmenu)
+
+`globalmenu` reads whichever application menu the *active* window
+exported, using the same mechanism a working reference implementation
+already relies on (a KRunner plugin the tool's author uses day to day):
+Qt/KF5 apps set two X11 window properties directly on their own
+top-level window, no registrar service involved --
+
+- `_KDE_NET_WM_APPMENU_SERVICE_NAME` (type `STRING`): the DBus bus name
+  hosting the menu.
+- `_KDE_NET_WM_APPMENU_OBJECT_PATH` (type `STRING`): the
+  `com.canonical.dbusmenu` object path on that bus name.
+
+Despite the name, no `com.canonical.AppMenu.Registrar` service is needed
+just to *read* an already-exported menu -- that registrar only matters
+for the (different) job of being the thing apps register a window with in
+the first place, which `xispanel` doesn't need to be here. `globalmenu`
+just tracks `_NET_ACTIVE_WINDOW` (polled every ~300ms, same tradeoff as
+`tasklist`/`winctl`) and reads both properties straight off whatever
+window that points at; a window with neither property set (most GTK apps,
+apps with no menu at all) makes the widget collapse to zero width, same
+as `tray` when there are no items.
+
+Coverage is inherently partial, same caveat as the tray's `Menu`-property
+handling: this only works for apps that actually export
+`_KDE_NET_WM_APPMENU_*` (Qt/KF5 apps, and GTK apps running the
+`appmenu-gtk-module` shim) -- a GTK app with a headerbar and no exported
+menu at all just has nothing to show, and `globalmenu` reports that as
+"no menu" rather than an error.
+
+The actual `GetLayout`/`Event` protocol work is shared with the tray's
+`Menu`-property handling via `dbusmenu.c` (see "System tray" above) --
+`globalmenu` is only the EWMH property lookup, active-window tracking,
+and open/closed-mode layout on top of it.
 
 ### Volume control
 
@@ -738,9 +811,12 @@ own file" structure:
   fallback.
 - `dbusmenu.c`: the generic (dlopen'd libdbus-1, own independent session-bus
   connection) `com.canonical.dbusmenu` client -- `GetLayout`/`Event`,
-  shared by `sni.c` (a tray item's `Menu` property) and, later, the
-  `globalmenu` widget. No stub pair: only built (and only referenced) when
-  `sni.c` is, so it just doesn't get compiled when `dbus-1` is missing.
+  shared by `sni.c` (a tray item's `Menu` property) and the `globalmenu`
+  widget (a window's `_KDE_NET_WM_APPMENU_*` properties). `dbusmenu_stub.c`
+  is its build-time fallback (identical API, every function a no-op) when
+  `dbus-1` isn't found via pkg-config.
+- `widgets/globalmenu.c`: renders the active window's exported application
+  menu, described in its own section above.
 - `pulse.c`: the `pactl`-shelling volume control backend described
   above. Unconditionally compiled -- no stub pair needed, since it has no
   build-time dependency to begin with.

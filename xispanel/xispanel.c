@@ -273,6 +273,7 @@ static const PanelWidgetOps *g_widget_registry[] = {
     &tray_ops,
     &launcher_ops,
     &volume_ops,
+    &globalmenu_ops,
     NULL,
 };
 
@@ -1945,6 +1946,13 @@ static int run_as_daemon(const char *sockpath)
                 timeout_ms = delta;
             }
         }
+        uint64_t menu_wake = panel_menu_next_wake_ms();
+        if (menu_wake != 0) {
+            long delta = (long)(menu_wake > now ? menu_wake - now : 0);
+            if (timeout_ms < 0 || delta < timeout_ms) {
+                timeout_ms = delta;
+            }
+        }
 
         struct timeval tv;
         struct timeval *tvp = NULL;
@@ -2034,6 +2042,7 @@ static int run_as_daemon(const char *sockpath)
 
         now = now_ms();
         tooltip_tick(now);
+        panel_menu_tick(now);
         mpris_poll(now);
         sni_poll(now);
         for (int i = 0; i < MAX_PANELS; i++) {

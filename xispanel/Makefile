@@ -2,26 +2,26 @@ CFLAGS ?= -Wall -Wextra -O2
 PKGS := x11 xrandr cairo cairo-xlib imlib2 freetype2 fontconfig
 
 # dbus-1 (mpris.c/sni.c's MPRIS media controls + system tray, dbusmenu.c's
-# shared com.canonical.dbusmenu client) is the one *build-time* optional
-# dependency: if `pkg-config dbus-1` isn't found (no libdbus-1-dev
-# installed), we link mpris_stub.c/sni_stub.c instead (dbusmenu.c has no
-# stub -- only sni.c calls into it, and sni_stub.c doesn't) -- harmless
-# no-ops with the exact same function signatures, so xispanel.c and the
-# widgets that call into them (tasklist.c, widgets/tray.c) never need to
-# know or care which pair got built. This is on top of (not instead of)
-# mpris.c/sni.c/dbusmenu.c's own runtime dlopen() of libdbus-1.so.3: even
-# on a system that *does* have the dev headers, none of them ever links
-# libdbus-1 directly, so a system with headers but no libdbus-1.so.3
-# installed still runs fine too. See mpris.c/sni.c/dbusmenu.c/mpris_stub.c/
-# sni_stub.c.
+# shared com.canonical.dbusmenu client used by both sni.c and the
+# globalmenu widget) is the one *build-time* optional dependency: if
+# `pkg-config dbus-1` isn't found (no libdbus-1-dev installed), we link
+# mpris_stub.c/sni_stub.c/dbusmenu_stub.c instead -- harmless no-ops with
+# the exact same function signatures, so xispanel.c and the widgets that
+# call into them (tasklist.c, widgets/tray.c, widgets/globalmenu.c) never
+# need to know or care which trio got built. This is on top of (not
+# instead of) mpris.c/sni.c/dbusmenu.c's own runtime dlopen() of
+# libdbus-1.so.3: even on a system that *does* have the dev headers, none
+# of them ever links libdbus-1 directly, so a system with headers but no
+# libdbus-1.so.3 installed still runs fine too. See mpris.c/sni.c/
+# dbusmenu.c/mpris_stub.c/sni_stub.c/dbusmenu_stub.c.
 HAVE_DBUS := $(shell pkg-config --exists dbus-1 && echo yes)
 ifeq ($(HAVE_DBUS),yes)
 DBUS_SRCS := mpris.c sni.c dbusmenu.c
 DBUS_CPPFLAGS := $(shell pkg-config --cflags dbus-1)
 else
-DBUS_SRCS := mpris_stub.c sni_stub.c
+DBUS_SRCS := mpris_stub.c sni_stub.c dbusmenu_stub.c
 DBUS_CPPFLAGS :=
-$(info xispanel: dbus-1 not found via pkg-config -- building without MPRIS/tray support)
+$(info xispanel: dbus-1 not found via pkg-config -- building without MPRIS/tray/globalmenu support)
 endif
 
 # xcomposite (thumb.c's window-thumbnail capture for tasklist's
@@ -49,7 +49,7 @@ LDLIBS := $(shell pkg-config --libs $(PKGS)) $(THUMB_LDLIBS) -lm -ldl
 PREFIX ?= /usr/local
 BINDIR := $(PREFIX)/bin
 
-SRCS := xispanel.c ewmh.c menu.c tooltip.c pulse.c $(DBUS_SRCS) $(THUMB_SRCS) widgets/spacer.c widgets/clock.c widgets/tasklist.c widgets/winctl.c widgets/tray.c widgets/launcher.c widgets/volume.c
+SRCS := xispanel.c ewmh.c menu.c tooltip.c pulse.c $(DBUS_SRCS) $(THUMB_SRCS) widgets/spacer.c widgets/clock.c widgets/tasklist.c widgets/winctl.c widgets/tray.c widgets/launcher.c widgets/volume.c widgets/globalmenu.c
 OBJS := $(SRCS:.c=.o)
 
 xispanel: $(OBJS)

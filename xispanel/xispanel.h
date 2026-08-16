@@ -296,8 +296,18 @@ void trim_to_width(cairo_t *cr, char *text, size_t bufsz, double max_width);
  *
  * Generic popup: any widget can open one with its own item list, an
  * opaque ctx pointer, and a selection callback -- the menu code itself
- * doesn't know or care what the items mean. See menu.c for the dismissal
- * (click-outside / Escape) design notes. */
+ * doesn't know or care what the items mean. Supports real cascading
+ * submenus (separate popup frames, one beside the previous, classic-menu
+ * style) via an implicit tree encoded as a flat items[]/depth[] pair --
+ * see panel_menu_open_tree() below and menu.c's own header comment for
+ * the dismissal (click-outside / Escape / hover-away) design notes. */
+/* Generous on purpose: a whole-tree DBusMenu fetch (globalmenu's
+ * mode=closed, or a big app's tray menu) flattens *every* item across
+ * *every* level into one array, so a handful of top-level menus with
+ * dynamic contents (Recent Documents, a long Bookmarks list, ...) adds up
+ * fast even though any single displayed dropdown stays small -- plain
+ * ints, so the extra array size costs nothing that matters. */
+#define MENU_TREE_MAX_ITEMS 512
 typedef struct {
     char label[64];
     int enabled; /* 0 = greyed out, not selectable */
@@ -305,20 +315,57 @@ typedef struct {
 } MenuItem;
 
 typedef void (*MenuSelectFn)(Panel *panel, PanelWidget *widget, void *ctx, int index);
+/* Called on every pointer motion while any menu frame is grabbing input,
+ * with the raw root-relative pointer position -- lets an opener notice
+ * "the pointer moved over one of *my* other on-panel buttons" (e.g.
+ * globalmenu's open-mode top-level bar, switching which top-level menu
+ * is shown without requiring a click) despite the grab routing every
+ * event to the first frame's window regardless of what's physically
+ * under the pointer. Optional (NULL is fine -- most callers don't need
+ * this). */
+typedef void (*MenuHoverRootFn)(void *ctx, int root_x, int root_y);
+/* Called once, right after the whole menu (every open frame) has closed
+ * for any reason (leaf selected, Escape, click/hover-away outside) --
+ * g_menu is already gone by the time this fires. Optional (NULL is fine):
+ * lets an opener that tracks "which of my own buttons is this menu open
+ * for" (e.g. globalmenu's open-mode top-level bar highlight) clear that
+ * state instead of it going stale once the menu closes on its own. */
+typedef void (*MenuCloseFn)(void *ctx);
 
 /* anchor_x/anchor_w: the triggering item's own widget-local [anchor_x,
  * anchor_x+anchor_w) span (e.g. one task's button within tasklist -- a
- * widget with no sub-items just passes its own [0, w->len)). The menu is
- * positioned glued to the panel's outer edge with its leading edge
- * aligned to the anchor, like plasmashell's taskbar context menus --
- * *not* at the raw click coordinates. */
+ * widget with no sub-items just passes its own [0, w->len)). The menu's
+ * first (root) frame is positioned glued to the panel's outer edge with
+ * its leading edge aligned to the anchor, like plasmashell's taskbar
+ * context menus -- *not* at the raw click coordinates. */
 void panel_menu_open(Panel *owner_panel, PanelWidget *owner_widget, int anchor_x, int anchor_w, const MenuItem *items,
                       int n_items, void *ctx, MenuSelectFn on_select);
+/* Same as panel_menu_open(), but `items`/`depth` together encode an
+ * implicit tree instead of one flat level: `depth[i]` is item i's nesting
+ * depth (0 = top level), and item i's children are whichever immediately
+ * following items have depth[i]+1, up to (not including) the next item
+ * at depth <= depth[i] -- the same shape dbusmenu_fetch()'s optional
+ * out_depth produces. Hovering an item with children opens its own
+ * subtree as a *new* popup frame beside the current one (after
+ * owner_panel->tooltip_delay_ms, same open-delay as tooltips); clicking
+ * it opens immediately. `on_select`'s index is always the item's position
+ * in the original flat `items` array, regardless of which frame it was
+ * clicked in. `on_hover_root`/`on_close` are optional, see MenuHoverRootFn/
+ * MenuCloseFn above. */
+void panel_menu_open_tree(Panel *owner_panel, PanelWidget *owner_widget, int anchor_x, int anchor_w,
+                           const MenuItem *items, const int *depth, int n_items, void *ctx, MenuSelectFn on_select,
+                           MenuHoverRootFn on_hover_root, MenuCloseFn on_close);
 void panel_menu_close(void);
 /* Returns 1 if `ev` belonged to the open menu (and was fully handled),
  * 0 otherwise -- xispanel.c's event loop dispatches to this first without
  * needing to know anything about the menu's internals. */
 int panel_menu_handle_event(const XEvent *ev);
+/* Call periodically from the main loop (like tooltip_tick()/
+ * tooltip_next_wake_ms()) -- drives the hover-open-submenu and
+ * hover-away-closes-everything delays, which are time-based and not
+ * necessarily tied to an incoming X event. */
+void panel_menu_tick(uint64_t now);
+uint64_t panel_menu_next_wake_ms(void);
 
 /* ---- hover tooltip (tooltip.c) ----
  *
@@ -382,13 +429,27 @@ int sni_menu_open(int idx, Panel *panel, PanelWidget *widget, int anchor_x, int 
  * object", not where that pair came from. Same optional-dlopen'd-
  * libdbus-1 philosophy as mpris.c/sni.c, with its own independent
  * session-bus connection (not shared with sni.c's). */
-#define DBUSMENU_MAX_ITEMS 24
-/* Fetches GetLayout(0,-1,[]) and flattens the whole tree (indented by
- * depth) into out_items[]/out_ids[] (parallel arrays, both sized
- * max_items). Returns the number of items flattened (>= 0, possibly 0 for
- * an empty menu), or -1 if libdbus-1/the session bus/the call itself
- * failed. */
-int dbusmenu_fetch(const char *busname, const char *path, MenuItem *out_items, int *out_ids, int max_items);
+/* Same cap as MENU_TREE_MAX_ITEMS (menu.c's whole-tree fetch buffer) --
+ * sni.c's own tray-Menu fetch can hit a large real menu just as easily
+ * as globalmenu's whole-tree mode=closed fetch does. */
+#define DBUSMENU_MAX_ITEMS MENU_TREE_MAX_ITEMS
+/* Fetches GetLayout(parent_id, depth, []) and flattens the returned
+ * subtree into out_items[]/out_ids[]/out_depth[] (parallel arrays, all
+ * sized max_items) -- out_depth[i] is item i's nesting depth *relative to
+ * parent_id* (0 = parent_id's immediate children), the same shape
+ * panel_menu_open_tree() (menu.c) consumes to build real cascading
+ * submenu popups; out_items[i].label is always the raw, un-indented
+ * label (callers that want a single flat display with visual indentation
+ * -- e.g. sni.c's tray Menu popup -- add that themselves from out_depth).
+ * parent_id=0 means the menu's root; depth=-1 means unlimited (the whole
+ * subtree in one call), depth=1 means only parent_id's immediate children
+ * (their own children, if any, won't be included -- useful for just
+ * listing a menu bar's top-level item labels without pulling in every
+ * submenu up front). Returns the number of items flattened (>= 0,
+ * possibly 0 for an empty menu), or -1 if libdbus-1/the session bus/the
+ * call itself failed. */
+int dbusmenu_fetch(const char *busname, const char *path, int32_t parent_id, int32_t depth, MenuItem *out_items,
+                    int *out_ids, int *out_depth, int max_items);
 /* Fire-and-forget Event(id, "clicked", ...) for one of the ids returned by
  * a prior dbusmenu_fetch() at the same busname/path. */
 void dbusmenu_send_event(const char *busname, const char *path, int32_t id);
@@ -429,5 +490,6 @@ extern const PanelWidgetOps winctl_ops;
 extern const PanelWidgetOps tray_ops;
 extern const PanelWidgetOps launcher_ops;
 extern const PanelWidgetOps volume_ops;
+extern const PanelWidgetOps globalmenu_ops;
 
 #endif

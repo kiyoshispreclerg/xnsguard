@@ -833,6 +833,7 @@ void sni_context_menu(int idx, int x, int y)
 static char g_dbusmenu_busname[128];
 static char g_dbusmenu_path[128];
 static int g_dbusmenu_ids[DBUSMENU_MAX_ITEMS];
+static int g_dbusmenu_depth[DBUSMENU_MAX_ITEMS];
 static MenuItem g_dbusmenu_items[DBUSMENU_MAX_ITEMS];
 static int g_dbusmenu_n = 0;
 
@@ -847,14 +848,15 @@ static void sni_dbusmenu_select(Panel *panel, PanelWidget *widget, void *ctx, in
     dbusmenu_send_event(g_dbusmenu_busname, g_dbusmenu_path, g_dbusmenu_ids[index]);
 }
 
-/* Opens the hovered item's DBusMenu as a flat popup (see the file comment
- * above), if it has one. Returns 1 if it did (and a menu was opened, even
- * if fetching the layout failed after the property check -- callers
- * shouldn't also fall back to ContextMenu() in that case, since a Menu
- * property being set at all means the item doesn't expect ContextMenu()
- * to be called), 0 if the item has no Menu property (empty or "/", the
- * spec's "no menu" convention) so the caller should fall back to
- * ContextMenu()/Activate() instead. */
+/* Opens the hovered item's DBusMenu as a cascading popup (real nested
+ * submenu frames -- see menu.c's panel_menu_open_tree()), if it has one.
+ * Returns 1 if it did (and a menu was opened, even if fetching the
+ * layout failed after the property check -- callers shouldn't also fall
+ * back to ContextMenu() in that case, since a Menu property being set at
+ * all means the item doesn't expect ContextMenu() to be called), 0 if the
+ * item has no Menu property (empty or "/", the spec's "no menu"
+ * convention) so the caller should fall back to ContextMenu()/Activate()
+ * instead. */
 int sni_menu_open(int idx, Panel *panel, PanelWidget *widget, int anchor_x, int anchor_w)
 {
     if (idx < 0 || idx >= g_n_items || !sni_ensure_connected()) {
@@ -874,13 +876,15 @@ int sni_menu_open(int idx, Panel *panel, PanelWidget *widget, int anchor_x, int 
         return 0;
     }
 
-    int n = dbusmenu_fetch(busname, menu_path, g_dbusmenu_items, g_dbusmenu_ids, DBUSMENU_MAX_ITEMS);
+    int n = dbusmenu_fetch(busname, menu_path, 0, -1, g_dbusmenu_items, g_dbusmenu_ids, g_dbusmenu_depth,
+                            DBUSMENU_MAX_ITEMS);
     if (n <= 0) {
         return 1; /* has a Menu property, just couldn't fetch/parse it right now -- still don't fall back */
     }
     g_dbusmenu_n = n;
     snprintf(g_dbusmenu_busname, sizeof(g_dbusmenu_busname), "%s", busname);
     snprintf(g_dbusmenu_path, sizeof(g_dbusmenu_path), "%s", menu_path);
-    panel_menu_open(panel, widget, anchor_x, anchor_w, g_dbusmenu_items, g_dbusmenu_n, NULL, sni_dbusmenu_select);
+    panel_menu_open_tree(panel, widget, anchor_x, anchor_w, g_dbusmenu_items, g_dbusmenu_depth, g_dbusmenu_n, NULL,
+                          sni_dbusmenu_select, NULL, NULL);
     return 1;
 }
