@@ -155,6 +155,13 @@ struct Panel {
      * open tooltip actually closes (0 = instant close). Defaults to a
      * bit less than tooltip_delay_ms -- see tooltip.c. */
     int tooltip_close_delay_ms;
+    /* off by default. When set, show_popup() reuses the existing tooltip
+     * window across widgets/content instead of destroying and recreating
+     * it each time (XMoveResizeWindow + cairo_xlib_surface_set_size, then
+     * a full repaint) -- see tooltip.c's show_popup(). Lets a compositor's
+     * "geometry change" animation smooth the move/resize between tooltips
+     * instead of a create/destroy flicker. */
+    int tooltip_reuse_window;
 
     /* theme */
     double bg_r, bg_g, bg_b, bg_a;

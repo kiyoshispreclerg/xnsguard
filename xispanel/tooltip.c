@@ -693,11 +693,28 @@ static void show_popup(void)
     if (!g_panel || !g_widget || (!g_has_group && !g_text[0])) {
         return;
     }
-    destroy_popup();
 
-    TooltipPopup *pop = calloc(1, sizeof(TooltipPopup));
-    if (!pop) {
-        return;
+    /* tooltip_reuse=1: keep the same X window (and Cairo surface) across
+     * successive tooltips instead of destroying and recreating it. Only
+     * the window's geometry/content changes (XMoveResizeWindow +
+     * cairo_xlib_surface_set_size below), which lets a compositor's
+     * "geometry change" animation (e.g. KWin) smooth the transition
+     * instead of a create/destroy flicker. Every layout field pop gets
+     * written below is set unconditionally by show_popup_single_layout()/
+     * show_popup_group_layout() whenever it's actually read by
+     * paint_popup() (gated behind the same g_has_mpris/g_has_thumb/
+     * g_has_group flags), so leftover values from a previous popup's
+     * layout are never drawn -- no need to zero the struct out again. */
+    int reuse = g_panel->tooltip_reuse_window && g_popup != NULL;
+    TooltipPopup *pop;
+    if (reuse) {
+        pop = g_popup;
+    } else {
+        destroy_popup();
+        pop = calloc(1, sizeof(TooltipPopup));
+        if (!pop) {
+            return;
+        }
     }
 
     if (g_has_group) {
@@ -733,25 +750,31 @@ static void show_popup(void)
         }
     }
 
-    XSetWindowAttributes attrs;
-    memset(&attrs, 0, sizeof(attrs));
-    attrs.override_redirect = True;
-    attrs.colormap = p->cmap;
-    attrs.border_pixel = 0;
-    attrs.background_pixel = 0;
-    attrs.event_mask = ExposureMask | EnterWindowMask | LeaveWindowMask | ButtonPressMask;
+    if (reuse) {
+        XMoveResizeWindow(g_dpy, pop->win, screen_x, screen_y, (unsigned)pop->width, (unsigned)pop->height);
+        cairo_xlib_surface_set_size(pop->surface, pop->width, pop->height);
+        XRaiseWindow(g_dpy, pop->win);
+    } else {
+        XSetWindowAttributes attrs;
+        memset(&attrs, 0, sizeof(attrs));
+        attrs.override_redirect = True;
+        attrs.colormap = p->cmap;
+        attrs.border_pixel = 0;
+        attrs.background_pixel = 0;
+        attrs.event_mask = ExposureMask | EnterWindowMask | LeaveWindowMask | ButtonPressMask;
 
-    pop->win = XCreateWindow(g_dpy, g_root, screen_x, screen_y, (unsigned)pop->width, (unsigned)pop->height, 0,
-                              p->depth, InputOutput, p->visual,
-                              CWOverrideRedirect | CWColormap | CWBorderPixel | CWBackPixel | CWEventMask, &attrs);
-    XChangeProperty(g_dpy, pop->win, g_atom_wm_window_type, XA_ATOM, 32, PropModeReplace,
-                     (unsigned char *)&g_atom_wm_window_type_tooltip, 1);
+        pop->win = XCreateWindow(g_dpy, g_root, screen_x, screen_y, (unsigned)pop->width, (unsigned)pop->height, 0,
+                                  p->depth, InputOutput, p->visual,
+                                  CWOverrideRedirect | CWColormap | CWBorderPixel | CWBackPixel | CWEventMask, &attrs);
+        XChangeProperty(g_dpy, pop->win, g_atom_wm_window_type, XA_ATOM, 32, PropModeReplace,
+                         (unsigned char *)&g_atom_wm_window_type_tooltip, 1);
 
-    pop->surface = cairo_xlib_surface_create(g_dpy, pop->win, p->visual, pop->width, pop->height);
-    pop->cr = cairo_create(pop->surface);
+        pop->surface = cairo_xlib_surface_create(g_dpy, pop->win, p->visual, pop->width, pop->height);
+        pop->cr = cairo_create(pop->surface);
 
-    XMapWindow(g_dpy, pop->win);
-    XRaiseWindow(g_dpy, pop->win);
+        XMapWindow(g_dpy, pop->win);
+        XRaiseWindow(g_dpy, pop->win);
+    }
 
     g_popup = pop;
     paint_popup();
@@ -822,7 +845,16 @@ void tooltip_notice_motion(Panel *p, int axis_pos)
     int closable = 0;
     void *ctx = NULL;
     if (!hit->ops->get_tooltip(hit, local_x, buf, sizeof(buf), &ax, &aw, &closable, &ctx)) {
-        tooltip_close();
+        /* Inside a widget that has tooltips (tasklist, tray) but between
+         * two sub-items (button/icon padding) -- same grace period as the
+         * "no tooltip at all" branch above, not an instant close, so a
+         * quick pass over that padding doesn't kill a tooltip the pointer
+         * is still effectively near (and, with tooltip_reuse=1, so the
+         * still-open window is there to reuse once it reaches the next
+         * sub-item instead of having already been torn down). */
+        if (g_panel == p && g_widget) {
+            g_close_deadline_ms = now_ms() + close_delay_ms();
+        }
         return;
     }
 
@@ -851,8 +883,14 @@ void tooltip_notice_motion(Panel *p, int axis_pos)
         return;
     }
 
-    /* Different item: restart the delay timer. */
-    destroy_popup();
+    /* Different item: restart the delay timer. In tooltip_reuse mode,
+     * leave a currently-shown popup's window up (still showing the old
+     * item's content) instead of destroying it here -- once the new
+     * item's delay elapses, show_popup() will move/resize/repaint that
+     * same window rather than recreating one from scratch. */
+    if (!(p->tooltip_reuse_window && g_shown)) {
+        destroy_popup();
+    }
     g_shown = 0;
     g_panel = p;
     g_widget = hit;

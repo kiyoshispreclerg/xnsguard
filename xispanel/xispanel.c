@@ -1560,6 +1560,7 @@ static void apply_panel_kv(Panel *p, const char *kvline)
     if (p->tooltip_close_delay_ms < 0) {
         p->tooltip_close_delay_ms = 0;
     }
+    p->tooltip_reuse_window = kv_get_int(kvline, "tooltip_reuse", p->tooltip_reuse_window) != 0;
 }
 
 static void apply_theme_kv(Panel *p, const char *kvline)
