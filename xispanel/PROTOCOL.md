@@ -112,6 +112,11 @@ PANEL	top	*	edge=top	pct=100	thickness=32	mode=dock
 - `tooltip_delay`: milliseconds of hover over a widget before its tooltip
   appears (default `500`). `0` makes it instant. Only matters for widgets
   that implement a tooltip at all -- see "Hover tooltips" below.
+- `tooltip_close_delay`: milliseconds of grace after the pointer leaves the
+  widget or the tooltip popup before it actually closes (default `300`,
+  a bit less than the open delay). `0` closes instantly. Lets the pointer
+  cross from the widget into the popup itself (e.g. to click something in
+  it) without the popup vanishing out from under it.
 
 ### `WIDGET`
 
@@ -440,8 +445,9 @@ doesn't move.
 Unlike the context menu, the tooltip takes no pointer/keyboard grab --
 it's meant to coexist with normal desktop interaction, not take it over.
 Every tooltip (whether interactive or not) shares one hover-intent
-dismissal rule: leaving the source widget starts a ~200ms grace period
-before it actually closes, cancelled if the pointer enters the popup
+dismissal rule: leaving the source widget starts a grace period (the
+panel's `tooltip_close_delay`, default 300ms, `0` = instant -- see `PANEL`
+above) before it actually closes, cancelled if the pointer enters the popup
 itself (there's no gap between panel and popup, so that's one continuous
 motion) -- this lets an interactive tooltip's contents actually be
 reachable with the mouse instead of vanishing the instant the pointer

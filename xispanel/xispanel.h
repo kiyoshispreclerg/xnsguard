@@ -151,6 +151,10 @@ struct Panel {
     /* ms of hover over a widget before its tooltip appears (0 = instant).
      * See tooltip.c. */
     int tooltip_delay_ms;
+    /* ms of grace after the pointer leaves the widget/popup before an
+     * open tooltip actually closes (0 = instant close). Defaults to a
+     * bit less than tooltip_delay_ms -- see tooltip.c. */
+    int tooltip_close_delay_ms;
 
     /* theme */
     double bg_r, bg_g, bg_b, bg_a;

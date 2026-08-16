@@ -34,9 +34,11 @@
 #include <string.h>
 
 /* Show-delay is per-panel and configurable (PANEL's tooltip_delay=<ms>,
- * default 500, 0 = instant) -- see Panel::tooltip_delay_ms. */
+ * default 500, 0 = instant) -- see Panel::tooltip_delay_ms. Close-delay
+ * (hover-intent grace window before an actual close) is likewise per-panel
+ * and configurable (tooltip_close_delay=<ms>, default 300, 0 = instant) --
+ * see Panel::tooltip_close_delay_ms and close_delay_ms() below. */
 #define TOOLTIP_REFRESH_MS 1000 /* how often to re-poll get_tooltip() while shown */
-#define TOOLTIP_CLOSE_GRACE_MS 200 /* hover-intent window before an actual close */
 #define TOOLTIP_GAP 0 /* no dead zone between panel and popup, so the pointer
                         * can cross directly from one to the other */
 #define TOOLTIP_PAD_X 10
@@ -238,6 +240,15 @@ static void query_group(PanelWidget *w, int local_x)
 static double tooltip_font_size(void)
 {
     return g_panel && g_panel->font_size_px > 0 ? g_panel->font_size_px : TOOLTIP_FONT_SIZE;
+}
+
+/* g_panel->tooltip_close_delay_ms if a panel is currently tracked, else the
+ * historical fixed default -- mirrors tooltip_font_size()'s fallback
+ * shape. Used both when the pointer leaves the source widget and when it
+ * leaves the popup itself, so both dismissal paths share one setting. */
+static uint64_t close_delay_ms(void)
+{
+    return (uint64_t)(g_panel ? g_panel->tooltip_close_delay_ms : 300);
 }
 
 /* Splits g_text on '\n' into up to TOOLTIP_MAX_LINES lines and measures
@@ -794,7 +805,14 @@ void tooltip_notice_motion(Panel *p, int axis_pos)
     }
 
     if (!hit || !hit->ops->get_tooltip) {
-        tooltip_close();
+        /* Moved onto a widget (or dead space, e.g. a spacer) that has no
+         * tooltip of its own -- same hover-intent grace period as actually
+         * leaving the panel (tooltip_notice_leave()), not an instant close,
+         * so a quick pass over a spacer between two tooltip-bearing widgets
+         * doesn't kill a tooltip the pointer is still effectively near. */
+        if (g_panel == p && g_widget) {
+            g_close_deadline_ms = now_ms() + close_delay_ms();
+        }
         return;
     }
 
@@ -861,7 +879,7 @@ void tooltip_notice_leave(Panel *p)
          * (clock, winctl) -- one consistent hover behavior for every
          * tooltip rather than two different dismissal rules to reason
          * about. */
-        g_close_deadline_ms = now_ms() + TOOLTIP_CLOSE_GRACE_MS;
+        g_close_deadline_ms = now_ms() + close_delay_ms();
     }
 }
 
@@ -997,7 +1015,7 @@ int tooltip_handle_event(const XEvent *ev)
         return 1;
     }
     if (ev->type == LeaveNotify && ev->xcrossing.window == g_popup->win) {
-        g_close_deadline_ms = now_ms() + TOOLTIP_CLOSE_GRACE_MS;
+        g_close_deadline_ms = now_ms() + close_delay_ms();
         return 1;
     }
     if (ev->type == ButtonPress && ev->xbutton.window == g_popup->win) {

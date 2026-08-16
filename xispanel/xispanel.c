@@ -1445,6 +1445,7 @@ static Panel *alloc_panel(const char *name, const char *output)
             p->thickness_cfg = 32;
             p->mode = MODE_DOCK;
             p->tooltip_delay_ms = 500;
+            p->tooltip_close_delay_ms = 300;
             p->bg_r = 0.12;
             p->bg_g = 0.12;
             p->bg_b = 0.12;
@@ -1552,6 +1553,10 @@ static void apply_panel_kv(Panel *p, const char *kvline)
     p->tooltip_delay_ms = kv_get_int(kvline, "tooltip_delay", p->tooltip_delay_ms);
     if (p->tooltip_delay_ms < 0) {
         p->tooltip_delay_ms = 0;
+    }
+    p->tooltip_close_delay_ms = kv_get_int(kvline, "tooltip_close_delay", p->tooltip_close_delay_ms);
+    if (p->tooltip_close_delay_ms < 0) {
+        p->tooltip_close_delay_ms = 0;
     }
 }
 
