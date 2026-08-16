@@ -1600,14 +1600,40 @@ static void load_config(void)
             continue;
         }
 
-        char *fields[16];
+        /* Splits on any run of spaces/tabs (not just tab) -- join_fields()
+         * below always reassembles the kv-value tail with single spaces
+         * between tokens regardless of how many pieces it was split into,
+         * so this is a lossless normalization, not a behavior change: a
+         * config line can now be hand-edited with plain spaces instead of
+         * requiring literal tabs between fields. */
+        char *fields[48];
         int nf = 0;
         char *p = line;
-        fields[nf++] = p;
-        while (nf < 16 && (p = strchr(p, '\t'))) {
+        while (*p == ' ' || *p == '\t') {
+            p++;
+        }
+        if (*p) {
+            fields[nf++] = p;
+        }
+        while (nf < 48) {
+            while (*p && *p != ' ' && *p != '\t') {
+                p++;
+            }
+            if (!*p) {
+                break;
+            }
             *p = 0;
             p++;
+            while (*p == ' ' || *p == '\t') {
+                p++;
+            }
+            if (!*p) {
+                break;
+            }
             fields[nf++] = p;
+        }
+        if (nf == 0) {
+            continue; /* line was whitespace-only after trimming */
         }
 
         if (strcmp(fields[0], "PANEL") == 0 && nf >= 3) {
