@@ -966,9 +966,15 @@ static void handle_popup_click(int local_x, int local_y)
         for (int i = 0; i < 3; i++) {
             int bx = g_popup->mpris_btn_x[i];
             if (local_x >= bx && local_x < bx + s && local_y >= by && local_y < by + s) {
+                /* Unlike the thumbnail/close-icon zones, media transport
+                 * buttons only perform their action -- the tooltip stays
+                 * open so play/pause/next/prev can be clicked repeatedly
+                 * without reopening the popup each time. Re-query mpris
+                 * right away so a play<->pause icon flip shows up
+                 * immediately instead of waiting for the ~1s periodic
+                 * refresh. */
                 char busname[128];
                 snprintf(busname, sizeof(busname), "%s", g_mpris_busname);
-                tooltip_close();
                 if (i == 0) {
                     mpris_previous(busname);
                 } else if (i == 1) {
@@ -976,6 +982,8 @@ static void handle_popup_click(int local_x, int local_y)
                 } else {
                     mpris_next(busname);
                 }
+                query_mpris(g_widget, g_local_x);
+                paint_popup();
                 return;
             }
         }

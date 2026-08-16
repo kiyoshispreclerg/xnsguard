@@ -488,7 +488,11 @@ hovered window's PID (`_NET_WM_PID`) matches an active
 `org.mpris.MediaPlayer2.*` player on the session bus (matched via
 `org.freedesktop.DBus.GetConnectionUnixProcessID`) -- same idea as
 plasmashell's taskbar tooltips showing media controls for whichever app
-happens to be playing something.
+happens to be playing something. Clicking previous/play-pause/next only
+performs that action and repaints the popup (to reflect a play<->pause
+icon flip right away) -- unlike clicking the thumbnail (activates the
+window) or its close icon (closes it), a media-control click does *not*
+dismiss the tooltip, so the buttons stay reachable for repeated clicks.
 
 This is fully **optional at both build time and runtime**. At build
 time, the Makefile checks `pkg-config --exists dbus-1`; if it's missing,
