@@ -106,6 +106,8 @@ static void run_terminal_at(const char *dir)
     run_detached(cmd);
 }
 
+static void folder_open_menu(PanelWidget *w);
+
 static int folder_init(PanelWidget *w)
 {
     FolderPriv *fp = w->priv;
@@ -134,6 +136,10 @@ static int folder_init(PanelWidget *w)
     if (!fp->icon) {
         fp->icon = resolve_icon_theme_name("folder");
     }
+    char hotkey[64];
+    if (kv_get(w->config_kv, "hotkey", hotkey, sizeof(hotkey)) && hotkey[0]) {
+        hotkey_register(w, hotkey, folder_open_menu);
+    }
     return 0;
 }
 
@@ -143,6 +149,7 @@ static void folder_destroy(PanelWidget *w)
     if (fp->icon) {
         cairo_surface_destroy(fp->icon);
     }
+    hotkey_unregister_widget(w);
 }
 
 static void folder_measure(PanelWidget *w, int cross_axis, int *out_len, int *out_min_len)
@@ -359,6 +366,30 @@ static void folder_select(Panel *panel, PanelWidget *widget, void *ctx, int inde
     }
 }
 
+/* Shared by the click handler and the (optional) hotkey= binding -- both
+ * open the same menu, anchored the same way (the widget's own [0, w->len)
+ * span), just triggered differently. */
+static void folder_open_menu(PanelWidget *w)
+{
+    FolderPriv *fp = w->priv;
+    if (!fp->path[0]) {
+        return;
+    }
+    fp->n_items = 0; /* fresh session -- see the file comment on why this isn't cached */
+
+    MenuItem items[MENU_TREE_MAX_ITEMS];
+    int depth[MENU_TREE_MAX_ITEMS];
+    int lazy[MENU_TREE_MAX_ITEMS];
+    int n = build_one_level(fp, fp->path, 0, items, lazy, MENU_TREE_MAX_ITEMS);
+    fp->n_items = n;
+    if (n <= 0) {
+        return;
+    }
+    memset(depth, 0, sizeof(int) * (size_t)n);
+    panel_menu_open_tree_lazy(w->panel, w, 0, w->len, items, depth, lazy, n, w, folder_select, folder_lazy_children,
+                               NULL, NULL);
+}
+
 static int folder_on_button(PanelWidget *w, int button, int local_x, int local_y, int root_x, int root_y)
 {
     (void)local_x;
@@ -369,19 +400,7 @@ static int folder_on_button(PanelWidget *w, int button, int local_x, int local_y
     if (button != Button1 || !fp->path[0]) {
         return 0;
     }
-    fp->n_items = 0; /* fresh session -- see the file comment on why this isn't cached */
-
-    MenuItem items[MENU_TREE_MAX_ITEMS];
-    int depth[MENU_TREE_MAX_ITEMS];
-    int lazy[MENU_TREE_MAX_ITEMS];
-    int n = build_one_level(fp, fp->path, 0, items, lazy, MENU_TREE_MAX_ITEMS);
-    fp->n_items = n;
-    if (n <= 0) {
-        return 1;
-    }
-    memset(depth, 0, sizeof(int) * (size_t)n);
-    panel_menu_open_tree_lazy(w->panel, w, 0, w->len, items, depth, lazy, n, w, folder_select, folder_lazy_children,
-                               NULL, NULL);
+    folder_open_menu(w);
     return 1;
 }
 

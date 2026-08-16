@@ -49,7 +49,7 @@ LDLIBS := $(shell pkg-config --libs $(PKGS)) $(THUMB_LDLIBS) -lm -ldl
 PREFIX ?= /usr/local
 BINDIR := $(PREFIX)/bin
 
-SRCS := xispanel.c ewmh.c menu.c tooltip.c pulse.c $(DBUS_SRCS) $(THUMB_SRCS) widgets/spacer.c widgets/clock.c widgets/tasklist.c widgets/winctl.c widgets/tray.c widgets/launcher.c widgets/volume.c widgets/globalmenu.c widgets/folder.c
+SRCS := xispanel.c ewmh.c menu.c tooltip.c hotkey.c pulse.c $(DBUS_SRCS) $(THUMB_SRCS) widgets/spacer.c widgets/clock.c widgets/tasklist.c widgets/winctl.c widgets/tray.c widgets/launcher.c widgets/volume.c widgets/globalmenu.c widgets/folder.c
 OBJS := $(SRCS:.c=.o)
 
 xispanel: $(OBJS)

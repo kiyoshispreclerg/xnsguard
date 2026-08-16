@@ -368,7 +368,38 @@ Widget types implemented so far:
   hidden entries (leading `.`) are skipped. Clicking a file runs
   `xdg-open` on it directly; a directory always opens its own submenu
   instead (never fires `xdg-open` directly -- use that submenu's own
-  "Abrir esta pasta" if that's what you want).
+  "Abrir esta pasta" if that's what you want). `hotkey=<spec>` (optional)
+  binds a global keyboard shortcut that opens the same menu the icon's
+  click does -- see "Global hotkeys" below.
+
+### Global hotkeys
+
+Any widget can offer its own `hotkey=<spec>`-style config option(s) bound
+to one of that widget's own built-in actions -- currently just `folder`'s
+single `hotkey=<spec>` (opens its menu, same as clicking the icon), but
+the mechanism (`hotkey.c`) is generic: a future `volume` could add
+`hotkey_up=`/`hotkey_down=`/`hotkey_mute=`, each bound to its own action,
+independently of every other widget's bindings. There is deliberately no
+user-programmable "run this shell command" binding -- only *which*
+already-coded action a given hotkey triggers is configurable, not the
+action itself.
+
+`<spec>` is `<Mod>+<Mod>+...+<Key>`, modifiers in any order and
+case-insensitive (`Ctrl`/`Control`, `Alt`, `Shift`, `Meta`/`Super`/`Win`
+all map to the expected X modifier mask -- `Meta`/`Super`/`Win` are
+synonyms for the same "Windows key" modifier, `Mod4Mask`), the last
+`+`-separated token is a plain X keysym name (`d`, `F5`, `space`, ...
+anything `XStringToKeysym()` accepts). `hotkey=Meta+D` grabs Super+D.
+
+Registered via `XGrabKey()` on the root window as soon as the owning
+widget initializes (so it works even while every panel is autohidden --
+these are true global shortcuts, not panel-local), in all four Lock/
+NumLock modifier-state combinations so Caps Lock/Num Lock being on
+doesn't matter. A spec that fails to parse, or a key already grabbed by
+something else on the display (WM, another app), is logged to stderr and
+otherwise ignored -- it never stops the rest of that widget (or the panel)
+from working. Ungrabbed and forgotten on panel reload/widget teardown, so
+`RELOAD` (IPC) or a RandR hotplug reload never leaks a stale grab.
 
 System monitor is a later phase -- see the plan this tool was built
 from; it is not implemented yet.
@@ -881,6 +912,8 @@ own file" structure:
   it too).
 - `menu.c`: the generic context-menu popup described above.
 - `tooltip.c`: the generic hover-tooltip popup described above.
+- `hotkey.c`: the global-hotkey grab table described in "Global hotkeys"
+  above.
 - `mpris.c`: the optional (dlopen'd libdbus-1) MPRIS2 client described
   above; `mpris_stub.c` is its build-time fallback (identical API,
   every function a no-op) when `dbus-1` isn't found via pkg-config --

@@ -409,6 +409,33 @@ int panel_menu_handle_event(const XEvent *ev);
 void panel_menu_tick(uint64_t now);
 uint64_t panel_menu_next_wake_ms(void);
 
+/* ---- global hotkeys (hotkey.c) ----
+ *
+ * Lets a widget bind one of its own config_kv options (e.g. folder's
+ * `hotkey=<spec>`) to a fixed, code-defined action -- there's no generic
+ * "run this shell command" binding, only "which built-in action this
+ * particular hotkey triggers" is configurable. `spec` is parsed as
+ * `<Mod>+<Mod>+...+<Key>` (any order, case-insensitive modifier names --
+ * Ctrl/Control, Alt, Shift, Meta/Super/Win -- last token is a plain X
+ * keysym name, e.g. "d", "F5", "space", passed straight to
+ * XStringToKeysym()). Call from a widget's ops->init(); the underlying
+ * XGrabKey() happens immediately (g_dpy/g_root are already set up by the
+ * time any widget's init() runs). */
+typedef void (*HotkeyFn)(PanelWidget *w);
+/* Returns 1 on success, 0 if the spec couldn't be parsed or the grab
+ * table is full (logs why either way) -- callers can ignore the return
+ * value if a bad hotkey= shouldn't be fatal to the rest of the widget. */
+int hotkey_register(PanelWidget *w, const char *spec, HotkeyFn fn);
+/* Ungrabs and forgets every hotkey registered for `w` -- call from a
+ * widget's ops->destroy() so panel reloads (RELOAD IPC command, RandR
+ * hotplug) don't leak grabs or leave stale PanelWidget pointers around. */
+void hotkey_unregister_widget(PanelWidget *w);
+/* Returns 1 if `ev` was a KeyPress matching a registered hotkey (and its
+ * HotkeyFn was invoked), 0 otherwise -- xispanel.c's event loop dispatches
+ * to this the same way it does panel_menu_handle_event()/tooltip_handle_
+ * event(). */
+int hotkey_handle_event(const XEvent *ev);
+
 /* ---- hover tooltip (tooltip.c) ----
  *
  * Purely informational, no pointer/keyboard grab: positioned just outside
