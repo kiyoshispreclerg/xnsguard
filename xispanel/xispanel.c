@@ -277,6 +277,7 @@ static const PanelWidgetOps *g_widget_registry[] = {
     &globalmenu_ops,
     &folder_ops,
     &xisserve_ops,
+    &notif_ops,
     NULL,
 };
 
@@ -1919,6 +1920,7 @@ static int run_as_daemon(const char *sockpath)
 
     ewmh_init_atoms();
     modtap_init(); /* bare-modifier ("tap Meta alone") hotkeys, see hotkey.c/modtap.c */
+    toast_init(); /* wires notifd.c's arrived callback to the toast popups, see toast.c */
     g_atom_net_wm_state = XInternAtom(g_dpy, "_NET_WM_STATE", False);
     g_atom_net_wm_state_skip_taskbar = XInternAtom(g_dpy, "_NET_WM_STATE_SKIP_TASKBAR", False);
     g_atom_net_wm_state_skip_pager = XInternAtom(g_dpy, "_NET_WM_STATE_SKIP_PAGER", False);
@@ -2016,6 +2018,13 @@ static int run_as_daemon(const char *sockpath)
                 timeout_ms = delta;
             }
         }
+        uint64_t toast_wake = toast_next_wake_ms();
+        if (toast_wake != 0) {
+            long delta = (long)(toast_wake > now ? toast_wake - now : 0);
+            if (timeout_ms < 0 || delta < timeout_ms) {
+                timeout_ms = delta;
+            }
+        }
 
         /* mpris_poll()/sni_poll()/notifd_poll() are only actually called
          * once per select() wake, on whatever cadence *this* loop wakes
@@ -2088,6 +2097,8 @@ static int run_as_daemon(const char *sockpath)
                 } else if (tooltip_handle_event(&ev)) {
                     /* consumed by the tooltip popup (just Expose -- it
                      * takes no grab and never handles clicks) */
+                } else if (toast_handle_event(&ev)) {
+                    /* consumed by a toast popup (click-to-dismiss, Expose) */
                 } else if (ev.type == ButtonPress) {
                     int is_sensor = 0;
                     Panel *p = find_panel_by_window(ev.xbutton.window, &is_sensor);
@@ -2132,6 +2143,7 @@ static int run_as_daemon(const char *sockpath)
         now = now_ms();
         tooltip_tick(now);
         panel_menu_tick(now);
+        toast_tick(now);
         mpris_poll(now);
         sni_poll(now);
         notifd_poll(now);

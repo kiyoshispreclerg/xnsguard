@@ -639,6 +639,35 @@ void notifd_mark_read(unsigned int id); /* no-op if id isn't currently held */
  * picks a default, 0 = never auto-expire) into a concrete value. */
 typedef void (*NotifArrivedFn)(const NotifEntry *e, int expire_timeout_ms);
 void notifd_set_arrived_callback(NotifArrivedFn fn);
+/* Overrides the ms substituted for a Notify() call that didn't request its
+ * own expire_timeout (protocol's "< 0 = server picks a default" case) --
+ * widgets/notif.c's timeout= config key. No-op for ms <= 0. Never affects
+ * a sender's own explicit expire_timeout request. */
+void notifd_set_default_expire_ms(int ms);
+
+/* ---- notification toast popups (toast.c) ----
+ *
+ * Own floating override-redirect windows, one per visible toast, stacked
+ * in a fixed corner of the (default-screen) desktop -- deliberately not
+ * built on tooltip.c (informational, no click) or menu.c (takes a pointer
+ * grab, single popup at a time): a toast needs neither hover-intent timing
+ * nor an input grab, and several can be visible at once. Wired to notifd.c
+ * purely via notifd_set_arrived_callback() -- toast.c never polls notifd_
+ * count() itself, only ever reacts to genuinely new arrivals. Clicking a
+ * toast dismisses it early and marks the underlying notification read
+ * (notifd_mark_read()); otherwise it auto-dismisses after its own
+ * expire_timeout_ms (0 = never auto-expire, per the Notify() spec). */
+void toast_init(void); /* call once at startup, after ewmh_init_atoms() (needs g_atom_wm_window_type*) */
+void toast_tick(uint64_t now); /* dismiss expired toasts -- call alongside tooltip_tick()/panel_menu_tick() */
+uint64_t toast_next_wake_ms(void); /* 0 = no toast pending expiry, else fold into the main loop's timeout */
+int toast_handle_event(const XEvent *ev); /* 1 if `ev` belonged to a toast popup (click-to-dismiss, Expose) */
+/* Which screen corner toasts stack from -- one global setting (not
+ * per-panel: there's only ever one toast stack, regardless of how many
+ * `notif` widgets/panels exist), set by widgets/notif.c's corner=
+ * config key from whichever panel/instance last touched it. Default is
+ * TOAST_CORNER_BOTTOM_RIGHT. */
+typedef enum { TOAST_CORNER_BOTTOM_RIGHT, TOAST_CORNER_BOTTOM_LEFT, TOAST_CORNER_TOP_RIGHT, TOAST_CORNER_TOP_LEFT } ToastCorner;
+void toast_set_corner(ToastCorner corner);
 
 /* ---- volume control: shells out to `pactl`, no libpulse linked (pulse.c) ----
  *
@@ -695,5 +724,6 @@ extern const PanelWidgetOps volume_ops;
 extern const PanelWidgetOps globalmenu_ops;
 extern const PanelWidgetOps folder_ops;
 extern const PanelWidgetOps xisserve_ops;
+extern const PanelWidgetOps notif_ops;
 
 #endif

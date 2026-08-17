@@ -51,6 +51,11 @@ static int g_head = 0; /* index of the oldest held entry */
 static int g_count = 0;
 static unsigned int g_next_id = 1;
 static NotifArrivedFn g_arrived_fn = NULL;
+/* Overridable via notifd_set_default_expire_ms() (widgets/notif.c's
+ * timeout= config) -- only applies to a Notify() call that didn't request
+ * its own expire_timeout (the < 0 "server picks a default" case per the
+ * spec), never overrides a sender's explicit request. */
+static int g_default_expire_ms = NOTIFD_DEFAULT_EXPIRE_MS;
 
 static void *g_libdbus = NULL;
 static int g_load_attempted = 0;
@@ -307,7 +312,7 @@ done:
     if (!summary[0] && !body[0]) {
         return 0; /* nothing worth showing */
     }
-    int expire_ms = expire_timeout >= 0 ? expire_timeout : NOTIFD_DEFAULT_EXPIRE_MS;
+    int expire_ms = expire_timeout >= 0 ? expire_timeout : g_default_expire_ms;
     unsigned int id_before = g_next_id;
     ring_append(app_name, app_icon, summary, body, expire_ms);
     return id_before;
@@ -434,4 +439,11 @@ void notifd_mark_read(unsigned int id)
 void notifd_set_arrived_callback(NotifArrivedFn fn)
 {
     g_arrived_fn = fn;
+}
+
+void notifd_set_default_expire_ms(int ms)
+{
+    if (ms > 0) {
+        g_default_expire_ms = ms;
+    }
 }

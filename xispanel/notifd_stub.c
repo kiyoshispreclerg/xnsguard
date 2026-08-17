@@ -37,3 +37,8 @@ void notifd_set_arrived_callback(NotifArrivedFn fn)
 {
     (void)fn;
 }
+
+void notifd_set_default_expire_ms(int ms)
+{
+    (void)ms;
+}
