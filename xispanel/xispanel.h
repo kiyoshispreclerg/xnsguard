@@ -303,11 +303,6 @@ void ewmh_get_state_flags(Window w, int *minimized, int *maximized);
 Window ewmh_get_active_window(void);
 int ewmh_get_number_of_desktops(void);
 int ewmh_get_current_desktop(void); /* -1 if unavailable */
-/* _NET_WORKAREA for the current desktop -- 1 on success (fills all four
- * out params), 0 if unavailable (WM doesn't maintain it), in which case
- * the out params are left untouched and the caller should fall back to
- * the full screen size. */
-int ewmh_get_workarea(int *out_x, int *out_y, int *out_w, int *out_h);
 int ewmh_skip_taskbar(Window w); /* 1 if a taskbar should never list this window */
 int ewmh_window_in_rect(Window w, int rx, int ry, int rw, int rh); /* 1 if w's center is inside the rect */
 int ewmh_window_has_input_focus(Window w); /* 1 if w (or a descendant) holds real X input focus */
@@ -666,13 +661,40 @@ void toast_init(void); /* call once at startup, after ewmh_init_atoms() (needs g
 void toast_tick(uint64_t now); /* dismiss expired toasts -- call alongside tooltip_tick()/panel_menu_tick() */
 uint64_t toast_next_wake_ms(void); /* 0 = no toast pending expiry, else fold into the main loop's timeout */
 int toast_handle_event(const XEvent *ev); /* 1 if `ev` belonged to a toast popup (click-to-dismiss, Expose) */
-/* Which screen corner toasts stack from -- one global setting (not
- * per-panel: there's only ever one toast stack, regardless of how many
- * `notif` widgets/panels exist), set by widgets/notif.c's corner=
- * config key from whichever panel/instance last touched it. Default is
- * TOAST_CORNER_BOTTOM_RIGHT. */
-typedef enum { TOAST_CORNER_BOTTOM_RIGHT, TOAST_CORNER_BOTTOM_LEFT, TOAST_CORNER_TOP_RIGHT, TOAST_CORNER_TOP_LEFT } ToastCorner;
+/* Which anchor toasts stack from -- one global setting (not per-panel:
+ * there's only ever one toast stack, regardless of how many `notif`
+ * widgets/panels exist), set by widgets/notif.c's corner= config key
+ * from whichever panel/instance last touched it. Default is
+ * TOAST_CORNER_BOTTOM_RIGHT. The three CENTER variants stack downward
+ * from the anchor point, same direction as TOP -- see toast.c's
+ * toast_screen_pos() doc comment. */
+typedef enum {
+    TOAST_CORNER_BOTTOM_RIGHT,
+    TOAST_CORNER_BOTTOM_LEFT,
+    TOAST_CORNER_BOTTOM_CENTER,
+    TOAST_CORNER_TOP_RIGHT,
+    TOAST_CORNER_TOP_LEFT,
+    TOAST_CORNER_TOP_CENTER,
+    TOAST_CORNER_CENTER_LEFT,
+    TOAST_CORNER_CENTER_RIGHT,
+} ToastCorner;
 void toast_set_corner(ToastCorner corner);
+/* Confines the toast stack to this rect (screen coordinates) instead of
+ * the whole default screen -- widgets/notif.c calls this from its own
+ * init() with its panel's *output* geometry (out_x/out_y/out_w/out_h),
+ * shrunk by that panel's own dock strip if it reserves one, so toasts
+ * only ever appear on the monitor that actually hosts the notif widget
+ * and never sit under its own panel. One global rect, same "last
+ * `notif` widget to init() wins" rule as toast_set_corner(). */
+void toast_set_output_rect(int x, int y, int w, int h);
+/* Mirrors a panel's own theme (bg/fg, including alpha) onto the toast
+ * popups -- widgets/notif.c calls this from its own init() with its
+ * panel's bg_r/g/b/a and fg_r/g/b/a (see struct Panel in this header).
+ * Repaints every currently-shown toast immediately so a config RELOAD
+ * that changes the panel's theme is reflected without waiting for the
+ * next arrival/expiry. */
+void toast_set_colors(double bg_r, double bg_g, double bg_b, double bg_a, double fg_r, double fg_g, double fg_b,
+                       double fg_a);
 
 /* ---- volume control: shells out to `pactl`, no libpulse linked (pulse.c) ----
  *

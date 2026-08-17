@@ -12,15 +12,22 @@
  * notification centers use -- there's no per-item read/unread affordance
  * in the menu itself.
  *
- * corner= (bottom-right (default), bottom-left, top-right, top-left) and
- * timeout=<ms> (default 5000) don't affect this widget's own layout at
- * all -- both are forwarded straight to the single global toast stack
+ * corner= (bottom-right (default), bottom-left, bottom-center, top-right,
+ * top-left, top-center, center-left, center-right) and timeout=<ms>
+ * (default 5000) don't affect this widget's own layout at all -- both
+ * are forwarded straight to the single global toast stack
  * (toast_set_corner()/notifd_set_default_expire_ms() in xispanel.h),
  * since only one stack of toast popups exists regardless of how many
  * `notif` widgets/panels are configured. The last `notif` widget to
  * init() (or reload) wins if more than one sets either. timeout= only
  * changes what a sender that didn't request its own expire_timeout gets
  * -- see notifd_set_default_expire_ms()'s doc comment.
+ *
+ * The toast stack is also confined to *this* widget's own panel's
+ * output (toast_set_output_rect(), see xispanel.h) -- never the whole
+ * multi-monitor screen -- and painted in this panel's own bg/fg theme
+ * colors (toast_set_colors()), so toasts visually match the panel that
+ * owns the bell icon rather than using a hardcoded look.
  */
 #include "../xispanel.h"
 
@@ -40,13 +47,58 @@ static ToastCorner parse_corner(const char *s)
     if (!strcmp(s, "bottom-left") || !strcmp(s, "bl")) {
         return TOAST_CORNER_BOTTOM_LEFT;
     }
+    if (!strcmp(s, "bottom-center") || !strcmp(s, "bc")) {
+        return TOAST_CORNER_BOTTOM_CENTER;
+    }
     if (!strcmp(s, "top-right") || !strcmp(s, "tr")) {
         return TOAST_CORNER_TOP_RIGHT;
     }
     if (!strcmp(s, "top-left") || !strcmp(s, "tl")) {
         return TOAST_CORNER_TOP_LEFT;
     }
+    if (!strcmp(s, "top-center") || !strcmp(s, "tc")) {
+        return TOAST_CORNER_TOP_CENTER;
+    }
+    if (!strcmp(s, "center-left") || !strcmp(s, "cl")) {
+        return TOAST_CORNER_CENTER_LEFT;
+    }
+    if (!strcmp(s, "center-right") || !strcmp(s, "cr")) {
+        return TOAST_CORNER_CENTER_RIGHT;
+    }
     return TOAST_CORNER_BOTTOM_RIGHT;
+}
+
+/* This panel's own output, shrunk by its own dock strip (if it reserves
+ * one) -- see toast_set_output_rect()'s doc comment. Only this panel's
+ * own strip is accounted for (not any *other* panel/dock that might
+ * also sit on the same output), same pragmatic scope the rest of this
+ * feature keeps: exactly right for the common single-panel-per-output
+ * setup, a reasonable approximation otherwise. */
+static void compute_output_rect(Panel *p, int *out_x, int *out_y, int *out_w, int *out_h)
+{
+    *out_x = p->out_x;
+    *out_y = p->out_y;
+    *out_w = p->out_w;
+    *out_h = p->out_h;
+    if (p->mode != MODE_DOCK) {
+        return;
+    }
+    switch (p->edge) {
+    case EDGE_TOP:
+        *out_y += p->thickness;
+        *out_h -= p->thickness;
+        break;
+    case EDGE_BOTTOM:
+        *out_h -= p->thickness;
+        break;
+    case EDGE_LEFT:
+        *out_x += p->thickness;
+        *out_w -= p->thickness;
+        break;
+    case EDGE_RIGHT:
+        *out_w -= p->thickness;
+        break;
+    }
 }
 
 static int notif_init(PanelWidget *w)
@@ -62,16 +114,39 @@ static int notif_init(PanelWidget *w)
     if (timeout_ms > 0) {
         notifd_set_default_expire_ms(timeout_ms);
     }
+
+    /* Deliberately NOT syncing output rect/colors here: init() runs from
+     * load_config(), which calls a WIDGET line's init() the moment it's
+     * parsed -- *before* any THEME line for this panel (conventionally
+     * listed after its WIDGET lines) has been applied, and before
+     * panel_activate() has resolved out_x/out_y/out_w/out_h/thickness at
+     * all (that only happens afterward, once every PANEL/WIDGET/THEME
+     * line has been read -- see reload_all_panels()). Reading the
+     * panel's bg/fg colors or out_x/out_y/out_w/out_h this early would
+     * capture stale pre-THEME/pre-geometry values. See notif_on_tick(). */
     w->next_tick_ms = now_ms();
     return 0;
 }
 
 static void notif_on_tick(PanelWidget *w, uint64_t now)
 {
-    /* No per-widget state to refresh -- just keeps the badge's unread
-     * count current (it can change purely from notifd_poll() receiving a
-     * new Notify() call, with no X event of our own to react to). Same
-     * ~1s cadence as tray.c's own on_tick. */
+    /* Keeps the badge's unread count current (it can change purely from
+     * notifd_poll() receiving a new Notify() call, with no X event of our
+     * own to react to) -- same ~1s cadence as tray.c's own on_tick.
+     *
+     * Also where output rect/colors actually get synced to toast.c (see
+     * notif_init()'s doc comment for why not there) -- cheap to just
+     * always re-sync rather than trying to hook "geometry/theme just
+     * became final": both setters below are no-ops when nothing actually
+     * changed, and this also means a later RELOAD that changes the
+     * panel's theme or a monitor being reconfigured keeps toasts in
+     * sync within a second, not just once at startup. */
+    Panel *p = w->panel;
+    int ox, oy, ow, oh;
+    compute_output_rect(p, &ox, &oy, &ow, &oh);
+    toast_set_output_rect(ox, oy, ow, oh);
+    toast_set_colors(p->bg_r, p->bg_g, p->bg_b, p->bg_a, p->fg_r, p->fg_g, p->fg_b, p->fg_a);
+
     w->next_tick_ms = now + 1000;
     w->panel->dirty = 1;
 }

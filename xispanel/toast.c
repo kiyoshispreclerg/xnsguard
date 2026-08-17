@@ -68,6 +68,19 @@ static Toast g_toasts[TOAST_ARRAY_CAP];
 static int g_n = 0;
 static ToastCorner g_corner = TOAST_CORNER_BOTTOM_RIGHT;
 
+/* The rect toasts are confined to -- set by widgets/notif.c's init() to
+ * its own panel's output, minus that panel's own dock strip (see
+ * toast_set_output_rect()'s doc comment). area_w == 0 means "never set",
+ * in which case toast_area() falls back to the whole default screen. */
+static int g_area_x = 0, g_area_y = 0, g_area_w = 0, g_area_h = 0;
+
+/* Panel theme colors, mirrored from widgets/notif.c's own panel via
+ * toast_set_colors() -- defaults match the original hardcoded look
+ * (dark, near-opaque background / white text) until a notif widget
+ * actually sets them. */
+static double g_bg_r = 0.12, g_bg_g = 0.12, g_bg_b = 0.12, g_bg_a = 0.92;
+static double g_fg_r = 1.0, g_fg_g = 1.0, g_fg_b = 1.0, g_fg_a = 1.0;
+
 static Visual *g_visual = NULL;
 static int g_depth = 0;
 static Colormap g_cmap = None;
@@ -91,17 +104,19 @@ static void ensure_visual(void)
     }
 }
 
-/* The rectangle toasts are allowed to occupy: _NET_WORKAREA for the
- * current desktop (the WM's own "full screen minus every dock/panel's
- * strut" rect) when a WM maintains it, falling back to the raw display
- * size otherwise (the previous, panel-unaware behavior) -- see
- * ewmh_get_workarea()'s doc comment. Re-read on every call rather than
- * cached: it's cheap (one XGetWindowProperty), and a panel being added/
- * removed/resized should be reflected the next time it matters (a new
- * toast arriving) without any extra plumbing to invalidate a cache. */
+/* The rect toasts are confined to: whatever widgets/notif.c last set via
+ * toast_set_output_rect() (its own panel's *output*, not the whole
+ * possibly-multi-monitor screen -- see that function's doc comment),
+ * falling back to the whole default screen if no notif widget has set
+ * one yet. */
 static void toast_area(int *out_x, int *out_y, int *out_w, int *out_h)
 {
-    if (!ewmh_get_workarea(out_x, out_y, out_w, out_h)) {
+    if (g_area_w > 0 && g_area_h > 0) {
+        *out_x = g_area_x;
+        *out_y = g_area_y;
+        *out_w = g_area_w;
+        *out_h = g_area_h;
+    } else {
         *out_x = 0;
         *out_y = 0;
         *out_w = DisplayWidth(g_dpy, g_screen);
@@ -112,7 +127,7 @@ static void toast_area(int *out_x, int *out_y, int *out_w, int *out_h)
 /* How many toasts fit stacked in the current toast_area() without any of
  * them spilling past its far edge -- see the file comment on why this
  * replaces a fixed count. Always >= 1: a single toast is let through even
- * if it technically overflows a tiny/unusual workarea, same "never just
+ * if it technically overflows a tiny/unusual area, same "never just
  * silently show nothing" spirit as the rest of xispanel's degrade-
  * gracefully helpers. */
 static int toast_capacity(void)
@@ -132,21 +147,39 @@ static int toast_capacity(void)
 
 /* Screen position for the toast currently at array index `idx` (0 =
  * oldest) -- the newest toast (index g_n-1) sits closest to g_corner,
- * older ones stacked away from it along the screen's vertical edge (up
- * from a bottom corner, down from a top corner). Positioned within
- * toast_area() (the WM's workarea when available), not the raw screen,
- * so toasts never sit under another panel/dock either. */
+ * older ones stacked away from it. Positioned within toast_area(), not
+ * the raw screen, so toasts stay on the right output and never sit under
+ * a panel. Horizontal anchor (left/center/right) and vertical anchor
+ * (top/center/bottom) are independent; the vertical anchor also decides
+ * stack direction -- top stacks downward, bottom stacks upward, center
+ * stacks downward from the vertical midpoint (an arbitrary but
+ * unambiguous default, same as top's). */
 static void toast_screen_pos(int idx, int *out_x, int *out_y)
 {
     int from_corner = g_n - 1 - idx;
     int ax, ay, aw, ah;
     toast_area(&ax, &ay, &aw, &ah);
-    int at_left = (g_corner == TOAST_CORNER_TOP_LEFT || g_corner == TOAST_CORNER_BOTTOM_LEFT);
-    int at_top = (g_corner == TOAST_CORNER_TOP_LEFT || g_corner == TOAST_CORNER_TOP_RIGHT);
-    *out_x = at_left ? ax + TOAST_MARGIN : ax + aw - TOAST_MARGIN - TOAST_W;
-    int base_y = at_top ? ay + TOAST_MARGIN : ay + ah - TOAST_MARGIN - TOAST_H;
+
+    int at_left = (g_corner == TOAST_CORNER_TOP_LEFT || g_corner == TOAST_CORNER_CENTER_LEFT ||
+                   g_corner == TOAST_CORNER_BOTTOM_LEFT);
+    int at_right = (g_corner == TOAST_CORNER_TOP_RIGHT || g_corner == TOAST_CORNER_CENTER_RIGHT ||
+                    g_corner == TOAST_CORNER_BOTTOM_RIGHT);
+    int at_top = (g_corner == TOAST_CORNER_TOP_LEFT || g_corner == TOAST_CORNER_TOP_CENTER ||
+                  g_corner == TOAST_CORNER_TOP_RIGHT);
+    int at_bottom = (g_corner == TOAST_CORNER_BOTTOM_LEFT || g_corner == TOAST_CORNER_BOTTOM_CENTER ||
+                     g_corner == TOAST_CORNER_BOTTOM_RIGHT);
+
+    if (at_left) {
+        *out_x = ax + TOAST_MARGIN;
+    } else if (at_right) {
+        *out_x = ax + aw - TOAST_MARGIN - TOAST_W;
+    } else {
+        *out_x = ax + (aw - TOAST_W) / 2;
+    }
+
+    int base_y = at_top ? ay + TOAST_MARGIN : at_bottom ? ay + ah - TOAST_MARGIN - TOAST_H : ay + (ah - TOAST_H) / 2;
     int step = from_corner * (TOAST_H + TOAST_GAP);
-    *out_y = at_top ? base_y + step : base_y - step;
+    *out_y = at_bottom ? base_y - step : base_y + step;
 }
 
 static void paint_toast(Toast *t)
@@ -154,11 +187,11 @@ static void paint_toast(Toast *t)
     cairo_t *cr = t->cr;
     cairo_save(cr);
     cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
-    cairo_set_source_rgba(cr, 0.12, 0.12, 0.12, 0.92);
+    cairo_set_source_rgba(cr, g_bg_r, g_bg_g, g_bg_b, g_bg_a);
     cairo_paint(cr);
     cairo_restore(cr);
 
-    cairo_set_source_rgba(cr, 1, 1, 1, 0.15);
+    cairo_set_source_rgba(cr, g_fg_r, g_fg_g, g_fg_b, 0.15);
     cairo_set_line_width(cr, 1);
     cairo_rectangle(cr, 0.5, 0.5, TOAST_W - 1, TOAST_H - 1);
     cairo_stroke(cr);
@@ -171,12 +204,12 @@ static void paint_toast(Toast *t)
         text_w = TOAST_W - text_x - TOAST_PAD;
     }
 
-    cairo_set_source_rgb(cr, 1, 1, 1);
+    cairo_set_source_rgba(cr, g_fg_r, g_fg_g, g_fg_b, g_fg_a);
     const char *summary = t->summary[0] ? t->summary : t->app_name;
     pango_show_text_boxed(cr, text_x, TOAST_PAD - 2, TOAST_SUMMARY_SIZE + 6, text_w, TOAST_SUMMARY_SIZE, summary,
                            NULL);
     if (t->body[0]) {
-        cairo_set_source_rgba(cr, 1, 1, 1, 0.75);
+        cairo_set_source_rgba(cr, g_fg_r, g_fg_g, g_fg_b, g_fg_a * 0.75);
         pango_show_text_boxed(cr, text_x, TOAST_PAD - 2 + TOAST_SUMMARY_SIZE + 6, TOAST_BODY_SIZE + 6, text_w,
                                TOAST_BODY_SIZE, t->body, NULL);
     }
@@ -307,6 +340,40 @@ void toast_set_corner(ToastCorner corner)
     }
     g_corner = corner;
     reposition_all();
+}
+
+/* See g_area_x/y/w/h's doc comment. reposition_all() is a no-op when
+ * g_n == 0 (nothing showing yet), which is the common case (this is set
+ * from a widget's init(), before any toast has ever arrived). */
+void toast_set_output_rect(int x, int y, int w, int h)
+{
+    if (g_area_x == x && g_area_y == y && g_area_w == w && g_area_h == h) {
+        return;
+    }
+    g_area_x = x;
+    g_area_y = y;
+    g_area_w = w;
+    g_area_h = h;
+    reposition_all();
+}
+
+void toast_set_colors(double bg_r, double bg_g, double bg_b, double bg_a, double fg_r, double fg_g, double fg_b,
+                       double fg_a)
+{
+    g_bg_r = bg_r;
+    g_bg_g = bg_g;
+    g_bg_b = bg_b;
+    g_bg_a = bg_a;
+    g_fg_r = fg_r;
+    g_fg_g = fg_g;
+    g_fg_b = fg_b;
+    g_fg_a = fg_a;
+    for (int i = 0; i < g_n; i++) {
+        paint_toast(&g_toasts[i]);
+    }
+    if (g_n > 0) {
+        XFlush(g_dpy);
+    }
 }
 
 void toast_tick(uint64_t now)

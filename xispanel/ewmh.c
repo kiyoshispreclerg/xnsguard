@@ -43,7 +43,6 @@ static Atom g_atom_wm_change_state;
 static Atom g_atom_net_wm_state_skip_taskbar;
 static Atom g_atom_net_wm_window_type_desktop;
 static Atom g_atom_net_wm_icon_geometry;
-static Atom g_atom_net_workarea;
 
 #define ICON_PROP_MAX_LONGS 200000
 
@@ -76,7 +75,6 @@ void ewmh_init_atoms(void)
     g_atom_net_wm_state_skip_taskbar = XInternAtom(g_dpy, "_NET_WM_STATE_SKIP_TASKBAR", False);
     g_atom_net_wm_window_type_desktop = XInternAtom(g_dpy, "_NET_WM_WINDOW_TYPE_DESKTOP", False);
     g_atom_net_wm_icon_geometry = XInternAtom(g_dpy, "_NET_WM_ICON_GEOMETRY", False);
-    g_atom_net_workarea = XInternAtom(g_dpy, "_NET_WORKAREA", False);
 }
 
 /* Tells the window manager/compositor where this task's taskbar button is
@@ -440,41 +438,6 @@ int ewmh_get_current_desktop(void)
         XFree(prop);
     }
     return desktop;
-}
-
-/* Reads _NET_WORKAREA(x,y,w,h) for the current desktop (one WM-maintained
- * CARDINAL[4] entry per desktop, indexed by ewmh_get_current_desktop()) --
- * the usable screen area with every dock/panel's strut already subtracted
- * by the WM, so callers that want to avoid overlapping panels (toast.c's
- * dynamic stacking cap) don't need to know about struts themselves.
- * Returns 0 (leaving the output args untouched) if the property is
- * missing entirely (a WM that doesn't maintain it) or the current desktop
- * has no entry -- callers should fall back to the full screen size. */
-int ewmh_get_workarea(int *out_x, int *out_y, int *out_w, int *out_h)
-{
-    int desktop = ewmh_get_current_desktop();
-    if (desktop < 0) {
-        desktop = 0;
-    }
-    Atom actual_type;
-    int actual_format;
-    unsigned long n_items, bytes_after;
-    unsigned char *prop = NULL;
-    int ok = 0;
-    if (XGetWindowProperty(g_dpy, g_root, g_atom_net_workarea, 0, (long)(desktop + 1) * 4, False, XA_CARDINAL,
-                            &actual_type, &actual_format, &n_items, &bytes_after, &prop) == Success &&
-        prop) {
-        if (n_items >= (unsigned long)(desktop + 1) * 4) {
-            long *vals = (long *)(void *)prop;
-            *out_x = (int)vals[desktop * 4 + 0];
-            *out_y = (int)vals[desktop * 4 + 1];
-            *out_w = (int)vals[desktop * 4 + 2];
-            *out_h = (int)vals[desktop * 4 + 3];
-            ok = 1;
-        }
-        XFree(prop);
-    }
-    return ok;
 }
 
 static void ewmh_send_client_message(Window w, Atom message_type, long l0, long l1, long l2, long l3, long l4)
