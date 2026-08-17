@@ -46,13 +46,31 @@ THUMB_LDLIBS :=
 $(info xispanel: xcomposite/xdamage not found via pkg-config -- building without window thumbnails)
 endif
 
-CPPFLAGS := $(shell pkg-config --cflags $(PKGS)) $(DBUS_CPPFLAGS) $(THUMB_CPPFLAGS)
-LDLIBS := $(shell pkg-config --libs $(PKGS)) $(THUMB_LDLIBS) -lm -ldl
+# xtst (the X Record extension -- modtap.c's "tap this modifier alone"
+# global-hotkey detection, see hotkey.c's bare-modifier hotkey= spec)
+# is linked normally like xcomposite/xdamage above, no dlopen equivalent
+# since it's an X extension over the already-open connection. Without
+# libxtst-dev, modtap_stub.c (always reports unavailable, hotkey.c then
+# just logs and ignores a bare-modifier spec) is linked instead.
+HAVE_XTST := $(shell pkg-config --exists xtst && echo yes)
+ifeq ($(HAVE_XTST),yes)
+MODTAP_SRCS := modtap.c
+MODTAP_CPPFLAGS := $(shell pkg-config --cflags xtst)
+MODTAP_LDLIBS := $(shell pkg-config --libs xtst)
+else
+MODTAP_SRCS := modtap_stub.c
+MODTAP_CPPFLAGS :=
+MODTAP_LDLIBS :=
+$(info xispanel: xtst not found via pkg-config -- building without bare-modifier ("tap Meta alone") hotkeys)
+endif
+
+CPPFLAGS := $(shell pkg-config --cflags $(PKGS)) $(DBUS_CPPFLAGS) $(THUMB_CPPFLAGS) $(MODTAP_CPPFLAGS)
+LDLIBS := $(shell pkg-config --libs $(PKGS)) $(THUMB_LDLIBS) $(MODTAP_LDLIBS) -lm -ldl
 
 PREFIX ?= /usr/local
 BINDIR := $(PREFIX)/bin
 
-SRCS := xispanel.c ewmh.c menu.c tooltip.c hotkey.c pulse.c $(DBUS_SRCS) $(THUMB_SRCS) widgets/spacer.c widgets/clock.c widgets/tasklist.c widgets/winctl.c widgets/tray.c widgets/launcher.c widgets/volume.c widgets/globalmenu.c widgets/folder.c
+SRCS := xispanel.c ewmh.c menu.c tooltip.c hotkey.c $(MODTAP_SRCS) pulse.c $(DBUS_SRCS) $(THUMB_SRCS) widgets/spacer.c widgets/clock.c widgets/tasklist.c widgets/winctl.c widgets/tray.c widgets/launcher.c widgets/volume.c widgets/globalmenu.c widgets/folder.c widgets/xisserve.c
 OBJS := $(SRCS:.c=.o)
 
 xispanel: $(OBJS)

@@ -232,6 +232,13 @@ extern Display *g_dpy;
 extern Window g_root;
 extern int g_screen;
 extern cairo_font_face_t *g_font_face;
+/* System UI font family name, as detected once at startup (see
+ * detect_system_font_family() in xispanel.c) -- "" if detection failed
+ * and fontconfig's generic default is in use instead. Exposed as a plain
+ * string (not just the cairo_font_face_t above) for widgets that need to
+ * hand the font name to an external process, e.g. xisserve's widget
+ * passing it through so the launcher popup can match. */
+extern char g_font_family[128];
 
 /* ---- small helpers widgets rely on (xispanel.c) ---- */
 uint64_t now_ms(void);
@@ -426,7 +433,16 @@ uint64_t panel_menu_next_wake_ms(void);
  * keysym name, e.g. "d", "F5", "space", passed straight to
  * XStringToKeysym()). Call from a widget's ops->init(); the underlying
  * XGrabKey() happens immediately (g_dpy/g_root are already set up by the
- * time any widget's init() runs). */
+ * time any widget's init() runs).
+ *
+ * `spec` may also be a *bare* modifier name with no '+' and no trailing
+ * key (e.g. "Meta") -- fires when that modifier is pressed and released
+ * with no other key pressed in between (tap-to-open, like plasmashell's
+ * "press Meta to open the launcher"), transparently routed to modtap.c
+ * instead of a plain XGrabKey -- see modtap.c's own file comment for why
+ * a bare-modifier grab can't just use XGrabKey directly. Falls back to
+ * "unavailable, logged, spec ignored" if xispanel was built without the
+ * X Record extension (see modtap_stub.c). */
 typedef void (*HotkeyFn)(PanelWidget *w);
 /* Returns 1 on success, 0 if the spec couldn't be parsed or the grab
  * table is full (logs why either way) -- callers can ignore the return
@@ -441,6 +457,32 @@ void hotkey_unregister_widget(PanelWidget *w);
  * to this the same way it does panel_menu_handle_event()/tooltip_handle_
  * event(). */
 int hotkey_handle_event(const XEvent *ev);
+
+/* ---- modifier-tap-alone global hotkeys (modtap.c) ----
+ *
+ * Only called by hotkey.c (widgets never touch this directly -- see
+ * hotkey_register()'s doc comment above for the widget-facing bare-
+ * modifier hotkey= syntax). Detects "this modifier was pressed and
+ * released with nothing else pressed in between" -- something plain
+ * XGrabKey has no way to express (it can only match a fixed keycode+
+ * modifier-state combination on press; there's no "and nothing else
+ * happened before the matching release" condition). Implemented via the
+ * X Record extension: a passive, non-exclusive, whole-display keyboard
+ * event monitor (a second, dedicated Display connection, since enabling
+ * a RECORD context takes over that connection's protocol stream) --
+ * unlike XGrabKey this doesn't claim the modifier's keycode exclusively,
+ * so it coexists cleanly with an existing combo using the same modifier
+ * (e.g. folder's hotkey=Meta+D): pressing D while the tap-candidate
+ * Meta press is pending marks it interrupted, so only the Meta+D grab
+ * fires, not the bare-Meta tap. Optional at build time (needs libXtst's
+ * Record extension headers) -- modtap_stub.c is the always-unavailable
+ * fallback. */
+int modtap_init(void); /* call once at startup, right after XOpenDisplay(); returns 1 if available */
+int modtap_available(void);
+int modtap_register(unsigned int modmask, PanelWidget *w, HotkeyFn fn); /* modmask: Control/Mod1/Shift/Mod4Mask */
+void modtap_unregister_widget(PanelWidget *w);
+int modtap_fd(void); /* -1 if unavailable -- fold into the main loop's select() readset */
+void modtap_process(void); /* call when modtap_fd() is readable */
 
 /* ---- hover tooltip (tooltip.c) ----
  *
@@ -583,5 +625,6 @@ extern const PanelWidgetOps launcher_ops;
 extern const PanelWidgetOps volume_ops;
 extern const PanelWidgetOps globalmenu_ops;
 extern const PanelWidgetOps folder_ops;
+extern const PanelWidgetOps xisserve_ops;
 
 #endif

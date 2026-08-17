@@ -97,6 +97,7 @@ Display *g_dpy;
 Window g_root;
 int g_screen;
 cairo_font_face_t *g_font_face;
+char g_font_family[128]; /* filled once at startup, see detect_system_font_family() in main() */
 
 static int g_rr_event_base;
 static volatile sig_atomic_t g_quit = 0;
@@ -275,6 +276,7 @@ static const PanelWidgetOps *g_widget_registry[] = {
     &volume_ops,
     &globalmenu_ops,
     &folder_ops,
+    &xisserve_ops,
     NULL,
 };
 
@@ -1907,15 +1909,15 @@ static int run_as_daemon(const char *sockpath)
     imlib_context_set_anti_alias(1);
     imlib_context_set_dither(1);
 
-    char sys_font[128];
-    detect_system_font_family(sys_font, sizeof(sys_font));
-    if (init_font(sys_font) != 0) {
+    detect_system_font_family(g_font_family, sizeof(g_font_family));
+    if (init_font(g_font_family) != 0) {
         fprintf(stderr, "xispanel: could not resolve a default font via fontconfig\n");
-    } else if (sys_font[0]) {
-        fprintf(stderr, "xispanel: using system font '%s'\n", sys_font);
+    } else if (g_font_family[0]) {
+        fprintf(stderr, "xispanel: using system font '%s'\n", g_font_family);
     }
 
     ewmh_init_atoms();
+    modtap_init(); /* bare-modifier ("tap Meta alone") hotkeys, see hotkey.c/modtap.c */
     g_atom_net_wm_state = XInternAtom(g_dpy, "_NET_WM_STATE", False);
     g_atom_net_wm_state_skip_taskbar = XInternAtom(g_dpy, "_NET_WM_STATE_SKIP_TASKBAR", False);
     g_atom_net_wm_state_skip_pager = XInternAtom(g_dpy, "_NET_WM_STATE_SKIP_PAGER", False);
@@ -1956,12 +1958,19 @@ static int run_as_daemon(const char *sockpath)
     XFlush(g_dpy);
 
     int xfd = ConnectionNumber(g_dpy);
+    int modtapfd = modtap_fd();
     while (!g_quit) {
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(listenfd, &rfds);
         FD_SET(xfd, &rfds);
         int maxfd = listenfd > xfd ? listenfd : xfd;
+        if (modtapfd >= 0) {
+            FD_SET(modtapfd, &rfds);
+            if (modtapfd > maxfd) {
+                maxfd = modtapfd;
+            }
+        }
 
         uint64_t now = now_ms();
         long timeout_ms = -1;
@@ -2096,6 +2105,10 @@ static int run_as_daemon(const char *sockpath)
                     }
                 }
             }
+        }
+
+        if (modtapfd >= 0 && r > 0 && FD_ISSET(modtapfd, &rfds)) {
+            modtap_process();
         }
 
         now = now_ms();

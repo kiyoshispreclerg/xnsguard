@@ -371,6 +371,31 @@ Widget types implemented so far:
   "Abrir esta pasta" if that's what you want). `hotkey=<spec>` (optional)
   binds a global keyboard shortcut that opens the same menu the icon's
   click does -- see "Global hotkeys" below.
+- `xisserve`: a single button that launches the separate `xisserve`
+  process (`../xisserve/`, a GTK2 krunner/kickoff-style application
+  launcher kept out-of-process -- see `xisserve/README.md`'s "Why a
+  separate process"). `cmd=<path>` overrides the binary (default
+  `xisserve`, resolved via `$PATH`); `icon=`/`name=` are the same
+  icon-or-fallback-letter/tooltip-text options every other icon widget
+  here uses (default name `Applications`). On every left-click, runs
+  `cmd` detached with this button's own on-screen anchor rectangle, the
+  panel's edge and resolved output rectangle, and the panel's own theme
+  (bg/fg color, system font family + resolved text size) as command-line
+  flags -- see `../xisserve/PROTOCOL.md` for the exact flag set. xisserve
+  is expected to be a singleton that treats a second invocation as
+  "reposition/retheme and toggle visibility" (same `flock` pattern
+  `xisback`/`xisguard` use), so this widget never tracks any PID or
+  socket state itself -- every click just runs the same command.
+  `hotkey=<spec>` (optional) binds a global keyboard shortcut that runs
+  this exact same launch action -- see "Global hotkeys" below. Needs a
+  real trailing key (e.g. `Meta+Space`); a bare modifier like `Meta`
+  alone isn't accepted (`XGrabKey` has no notion of "this modifier
+  released without any other key pressed in between" -- a naive grab on
+  just the modifier's own keycode would fire on every press of it,
+  including as the first half of any other Meta+something combo already
+  bound elsewhere, e.g. `folder`'s own `hotkey=Meta+D`). For a real "tap
+  Meta alone" key, remap a tap into a synthetic keysym upstream with a
+  tool like `xcape` and point `hotkey=` at that synthetic key instead.
 
 ### Global hotkeys
 
@@ -990,8 +1015,8 @@ own file" structure:
   isn't found via pkg-config.
 - `widgets/spacer.c`, `widgets/clock.c`, `widgets/tasklist.c`,
   `widgets/winctl.c`, `widgets/tray.c`, `widgets/launcher.c`,
-  `widgets/volume.c`, `widgets/folder.c`: one file per widget type. Adding
-  a new type is
+  `widgets/volume.c`, `widgets/folder.c`, `widgets/xisserve.c`: one file
+  per widget type. Adding a new type is
   "write `widgets/foo.c` defining a `PanelWidgetOps foo_ops`, declare it
   `extern` in `xispanel.h`, add it to
   the registry array in `xispanel.c`" -- no other file needs to change.

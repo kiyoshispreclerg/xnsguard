@@ -1,7 +1,8 @@
 /*
  * xisserve - GTK2 application launcher (kickoff/krunner-style), companion
- * to xispanel's `launcher` widget stub (see ../xispanel/widgets/launcher.c
- * -- pins individual shortcuts today, no search/no .desktop parsing).
+ * to xispanel's `xisserve` widget (see ../xispanel/widgets/xisserve.c --
+ * already implemented and shipping; `launcher` stays the simple
+ * pin-a-shortcut widget, no search/no .desktop parsing).
  *
  * Named after volleyball's serve (the play that starts the point) --
  * xisstart was the other name floated (Windows-Start-menu callback) but
@@ -22,24 +23,34 @@
  * and dbusmenu.c already do the DBus side of that same lookup in C, so
  * this can reuse the same mechanism rather than reinventing it.
  *
- * Positioning: xispanel's `launcher` widget will invoke this with its own
- * on-screen anchor coordinates (argv, not embedding/reparenting -- see
- * the session notes this was discussed in: reparenting would make
- * xispanel an XEmbed-style host for a second toolkit, real complexity for
- * a component that renders as a floating popup on top of everything
- * anyway, not literally inside the panel). xisserve creates its own
+ * Positioning: xispanel's `xisserve` widget (../xispanel/widgets/
+ * xisserve.c, already implemented and shipping) invokes this with its
+ * own on-screen anchor coordinates, panel edge/output geometry, and
+ * theme (argv, not embedding/reparenting -- reparenting would make
+ * xispanel an XEmbed-style host for a second toolkit, real complexity
+ * for a component that renders as a floating popup on top of everything
+ * anyway, not literally inside the panel). See PROTOCOL.md for the
+ * exact flag set (--anchor-x/-y/-w/-h, --edge, --output-x/-y/-w/-h,
+ * --bg/--fg, --font/--font-size) and the singleton/toggle behavior this
+ * binary is expected to implement -- xisserve creates its own
  * override-redirect-equivalent GTK popup window at that position.
  *
  * Not implemented yet -- this is a skeleton: confirms GTK2 initializes
  * and a window appears, nothing else. TODO once real work starts here:
- *   - Accept --anchor-x/--anchor-y (or similar) argv, position the
- *     window there instead of letting the WM place it.
+ *   - Parse the argv flags PROTOCOL.md documents, position the window
+ *     accordingly instead of letting the WM place it.
+ *   - flock-based singleton (same pattern as xisback/xisguard) plus
+ *     whatever IPC relays a second invocation's argv into the first
+ *     instance as a reposition+toggle -- see PROTOCOL.md's "Singleton /
+ *     toggle behavior" section.
  *   - .desktop entry parsing + XDG icon theme resolution, incremental
  *     search-as-you-type.
  *   - DBusMenu-based in-app action search (see the HUD note above).
  *   - Same open question as xisnotif re: matching the KDE Plasma color
  *     scheme and system font in GTK2 -- see xisnotif/README.md, applies
- *     here identically.
+ *     here identically (the --bg/--fg/--font/--font-size flags cover
+ *     the panel's own theme; the color-*scheme* question is about GTK2
+ *     widget chrome beyond just those four values).
  */
 #include <gtk/gtk.h>
 

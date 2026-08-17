@@ -61,6 +61,28 @@ static unsigned int numlock_mask(void)
     return mask;
 }
 
+/* Recognizes a *bare* modifier name (no '+', nothing else) -- routed to
+ * modtap.c instead of a plain XGrabKey, see hotkey_register()'s doc
+ * comment in xispanel.h. */
+static int parse_bare_modifier(const char *spec, unsigned int *out_mask)
+{
+    if (strchr(spec, '+')) {
+        return 0;
+    }
+    if (!strcasecmp(spec, "Ctrl") || !strcasecmp(spec, "Control")) {
+        *out_mask = ControlMask;
+    } else if (!strcasecmp(spec, "Alt")) {
+        *out_mask = Mod1Mask;
+    } else if (!strcasecmp(spec, "Shift")) {
+        *out_mask = ShiftMask;
+    } else if (!strcasecmp(spec, "Meta") || !strcasecmp(spec, "Super") || !strcasecmp(spec, "Win")) {
+        *out_mask = Mod4Mask;
+    } else {
+        return 0;
+    }
+    return 1;
+}
+
 /* Parses "<Mod>+<Mod>+...+<Key>" -- see the doc comment on hotkey_
  * register() in xispanel.h for the accepted modifier names/key format. */
 static int parse_hotkey_spec(const char *spec, unsigned int *out_mods, KeyCode *out_keycode)
@@ -135,6 +157,10 @@ static void ungrab_variants(KeyCode kc, unsigned int mods)
 
 int hotkey_register(PanelWidget *w, const char *spec, HotkeyFn fn)
 {
+    unsigned int bare_mask;
+    if (parse_bare_modifier(spec, &bare_mask)) {
+        return modtap_register(bare_mask, w, fn);
+    }
     if (g_n_hotkeys >= HOTKEY_MAX) {
         fprintf(stderr, "xispanel: hotkey: too many hotkeys registered, ignoring '%s'\n", spec);
         return 0;
@@ -168,6 +194,7 @@ void hotkey_unregister_widget(PanelWidget *w)
             i++;
         }
     }
+    modtap_unregister_widget(w);
 }
 
 int hotkey_handle_event(const XEvent *ev)
