@@ -128,27 +128,34 @@ static int notif_init(PanelWidget *w)
     return 0;
 }
 
-static void notif_on_tick(PanelWidget *w, uint64_t now)
+static int notif_on_tick(PanelWidget *w, uint64_t now)
 {
-    /* Keeps the badge's unread count current (it can change purely from
-     * notifd_poll() receiving a new Notify() call, with no X event of our
-     * own to react to) -- same ~1s cadence as tray.c's own on_tick.
-     *
-     * Also where output rect/colors actually get synced to toast.c (see
+    NotifPriv *np = w->priv;
+    w->next_tick_ms = now + 1000;
+
+    /* Where output rect/colors actually get synced to toast.c (see
      * notif_init()'s doc comment for why not there) -- cheap to just
      * always re-sync rather than trying to hook "geometry/theme just
-     * became final": both setters below are no-ops when nothing actually
-     * changed, and this also means a later RELOAD that changes the
-     * panel's theme or a monitor being reconfigured keeps toasts in
-     * sync within a second, not just once at startup. */
+     * became final": both setters are no-ops when nothing changed, and
+     * this also keeps toasts in sync within a second of a later RELOAD
+     * changing the panel's theme or a monitor being reconfigured. This
+     * affects the *toasts*, not this widget's own paint, so it doesn't
+     * by itself warrant a panel repaint. */
     Panel *p = w->panel;
     int ox, oy, ow, oh;
     compute_output_rect(p, &ox, &oy, &ow, &oh);
     toast_set_output_rect(ox, oy, ow, oh);
     toast_set_colors(p->bg_r, p->bg_g, p->bg_b, p->bg_a, p->fg_r, p->fg_g, p->fg_b, p->fg_a);
 
-    w->next_tick_ms = now + 1000;
-    w->panel->dirty = 1;
+    /* The one thing this widget draws that changes on its own (a new
+     * Notify() arriving, or a toast/menu marking one read) is the unread
+     * badge -- repaint only when that count changes. */
+    unsigned int unread = (unsigned int)notifd_unread_count();
+    if (unread == np->last_shown_count) {
+        return 0;
+    }
+    np->last_shown_count = unread;
+    return 1;
 }
 
 static void notif_measure(PanelWidget *w, int cross_axis, int *out_len, int *out_min_len)

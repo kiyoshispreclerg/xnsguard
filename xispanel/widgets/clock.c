@@ -78,13 +78,19 @@ static int clock_init(PanelWidget *w)
     return 0;
 }
 
-static void clock_on_tick(PanelWidget *w, uint64_t now)
+static int clock_on_tick(PanelWidget *w, uint64_t now)
 {
     ClockPriv *cp = w->priv;
+    w->next_tick_ms = now + 1000;
+    char old[sizeof(cp->text)];
+    snprintf(old, sizeof(old), "%s", cp->text);
     struct tm tmv;
     localtime_in_tz(cp->tz, &tmv);
     strftime(cp->text, sizeof(cp->text), cp->format, &tmv);
-    w->next_tick_ms = now + 1000;
+    /* Only repaint when the rendered string actually changed -- a
+     * %H:%M clock ticks every second but its text changes once a
+     * minute, so 59 of every 60 ticks now cost nothing. */
+    return strcmp(old, cp->text) != 0;
 }
 
 static void clock_measure(PanelWidget *w, int cross_axis, int *out_len, int *out_min_len)

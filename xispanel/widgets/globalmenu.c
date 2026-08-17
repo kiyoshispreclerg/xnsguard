@@ -218,7 +218,7 @@ static void globalmenu_refetch_top(GlobalmenuPriv *gp)
     gp->n_top = n > 0 ? n : 0;
 }
 
-static void globalmenu_on_tick(PanelWidget *w, uint64_t now)
+static int globalmenu_on_tick(PanelWidget *w, uint64_t now)
 {
     GlobalmenuPriv *gp = w->priv;
     w->next_tick_ms = now + GLOBALMENU_POLL_MS;
@@ -231,7 +231,7 @@ static void globalmenu_on_tick(PanelWidget *w, uint64_t now)
      * ACTIVE_WINDOW changing at all. */
     Window effective = globalmenu_passes_filters(w, active) ? active : None;
     if (effective == gp->tracked_win) {
-        return;
+        return 0;
     }
     gp->tracked_win = effective;
 
@@ -241,19 +241,24 @@ static void globalmenu_on_tick(PanelWidget *w, uint64_t now)
         read_string_prop(effective, g_atom_appmenu_path, objpath, sizeof(objpath));
     }
     int had_menu = gp->has_menu;
+    int changed = 0;
     gp->has_menu = busname[0] && objpath[0];
     if (gp->has_menu && (strcmp(gp->busname, busname) || strcmp(gp->objpath, objpath))) {
         snprintf(gp->busname, sizeof(gp->busname), "%s", busname);
         snprintf(gp->objpath, sizeof(gp->objpath), "%s", objpath);
-        globalmenu_refetch_top(gp);
+        globalmenu_refetch_top(gp); /* open-mode top-level labels changed */
+        changed = 1;
     } else if (!gp->has_menu) {
         gp->busname[0] = 0;
         gp->objpath[0] = 0;
         gp->n_top = 0;
     }
+    /* has_menu flipping changes measure() (0 vs a real width), so the
+     * whole panel needs re-laying-out+repainting either way. */
     if (had_menu != gp->has_menu) {
-        w->panel->dirty = 1;
+        changed = 1;
     }
+    return changed;
 }
 
 /* Recomputes each top-level button's hit-rect from the widget's real

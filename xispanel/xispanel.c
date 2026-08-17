@@ -2145,19 +2145,30 @@ static int run_as_daemon(const char *sockpath)
         panel_menu_tick(now);
         toast_tick(now);
         mpris_poll(now);
-        sni_poll(now);
+        /* mpris feeds tooltips only (no widget paints it), so it doesn't
+         * mark panels dirty. sni feeds the tray widget's paint, so a
+         * change there does -- and since any panel could host a tray
+         * widget, mark them all (tray changes are rare, so the occasional
+         * repaint of a tray-less panel is cheaper than tracking which
+         * panel owns the tray). notifd's badge latency is covered by the
+         * notif widget's own on_tick polling unread count. */
+        int tray_changed = sni_poll(now);
         notifd_poll(now);
         for (int i = 0; i < MAX_PANELS; i++) {
             Panel *p = &g_panels[i];
             if (!p->in_use) {
                 continue;
             }
+            if (tray_changed) {
+                p->dirty = 1;
+            }
             panel_autohide_tick(p, now);
             for (int j = 0; j < p->n_widgets; j++) {
                 PanelWidget *w = &p->widgets[j];
                 if (w->next_tick_ms != 0 && now >= w->next_tick_ms && w->ops->on_tick) {
-                    w->ops->on_tick(w, now);
-                    p->dirty = 1;
+                    if (w->ops->on_tick(w, now)) {
+                        p->dirty = 1;
+                    }
                 }
             }
             if (p->dirty && p->mapped) {

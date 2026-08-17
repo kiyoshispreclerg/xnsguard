@@ -51,7 +51,15 @@ typedef struct {
     void (*measure)(PanelWidget *w, int cross_axis, int *out_len, int *out_min_len);
     void (*paint)(PanelWidget *w, cairo_t *cr);
     int (*on_button)(PanelWidget *w, int button, int local_x, int local_y, int root_x, int root_y);
-    void (*on_tick)(PanelWidget *w, uint64_t now);
+    /* Periodic poll (cadence set by the widget via w->next_tick_ms). Must
+     * return 1 only if something the widget *draws* actually changed since
+     * last tick (so the panel needs repainting), 0 otherwise -- returning
+     * 1 unconditionally forces a full panel repaint on every tick even
+     * when nothing changed, which is exactly the idle-CPU cost this
+     * contract exists to avoid. A widget with no periodic visible state
+     * (or none that changed) still reschedules its next tick and returns
+     * 0. */
+    int (*on_tick)(PanelWidget *w, uint64_t now);
     /* Optional (NULL is fine -- most widgets don't need this): fills buf
      * with tooltip text (lines separated by '\n') to show after the
      * pointer hovers over local_x (widget-local, main-axis) for a bit.
@@ -551,7 +559,10 @@ void mpris_previous(const char *busname);
  * tray icons register with (falling back to just reading another
  * process's watcher if one already exists) -- see sni.c for how that's
  * done without pulling DBus watch/timeout objects into the select() loop. */
-void sni_poll(uint64_t now); /* call periodically from the main loop */
+/* call periodically from the main loop; returns 1 if the tray's drawn
+ * appearance changed (so a panel with a tray widget needs repainting),
+ * 0 otherwise -- lets the loop avoid a repaint when nothing changed. */
+int sni_poll(uint64_t now);
 int sni_count(void);
 const char *sni_title(int idx); /* "" if idx out of range */
 cairo_surface_t *sni_icon(int idx); /* NULL if unknown/idx out of range */

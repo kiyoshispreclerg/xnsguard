@@ -125,7 +125,7 @@ static void tasklist_destroy(PanelWidget *w)
     }
 }
 
-static void tasklist_on_tick(PanelWidget *w, uint64_t now)
+static int tasklist_on_tick(PanelWidget *w, uint64_t now)
 {
     TasklistPriv *tp = w->priv;
     w->next_tick_ms = now + 800;
@@ -133,7 +133,7 @@ static void tasklist_on_tick(PanelWidget *w, uint64_t now)
     Window *list = NULL;
     int n = 0;
     if (!ewmh_get_client_list(&list, &n)) {
-        return;
+        return 0;
     }
     if (n > MAX_TASKS) {
         n = MAX_TASKS;
@@ -193,6 +193,14 @@ static void tasklist_on_tick(PanelWidget *w, uint64_t now)
     memcpy(tp->tasks, fresh, sizeof(TaskEntry) * (size_t)n_fresh);
     tp->n_tasks = n_fresh;
     tp->n_desktops = ewmh_get_number_of_desktops();
+
+    /* TODO(idle-cpu slice 2): return 1 unconditionally for now, so
+     * tasklist still repaints every 800ms even when nothing changed --
+     * the one remaining periodic repaint after slice 1. Change detection
+     * here needs to cover the task set (win/title/desktop/min/max/icon),
+     * the active-window highlight, and n_desktops; deferred to keep this
+     * slice small and testable. */
+    return 1;
 }
 
 /* Groups tasks[] entries sharing the same WM_CLASS (res_class -- the

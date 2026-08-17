@@ -44,9 +44,16 @@ static int tray_init(PanelWidget *w)
     return 0;
 }
 
-static void tray_on_tick(PanelWidget *w, uint64_t now)
+static int tray_on_tick(PanelWidget *w, uint64_t now)
 {
+    /* The tray's data is owned by sni.c, refreshed by sni_poll() in the
+     * main loop, which already tells the loop when to repaint (see
+     * sni_poll()'s return value). So this widget's own tick has nothing
+     * to detect and never asks for a repaint itself -- it only keeps a
+     * tick scheduled so the loop stays warm enough to call sni_poll() at
+     * its own cadence even on an otherwise-idle panel. */
     w->next_tick_ms = now + 1000;
+    return 0;
 }
 
 /* icon_px: side length of each (square) icon. slot: icon_px + one

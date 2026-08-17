@@ -7,9 +7,10 @@
  */
 #include "xispanel.h"
 
-void sni_poll(uint64_t now)
+int sni_poll(uint64_t now)
 {
     (void)now;
+    return 0;
 }
 
 int sni_count(void)

@@ -49,12 +49,16 @@ static int volume_init(PanelWidget *w)
     return 0;
 }
 
-static void volume_on_tick(PanelWidget *w, uint64_t now)
+static int volume_on_tick(PanelWidget *w, uint64_t now)
 {
     VolumePriv *vp = w->priv;
     w->next_tick_ms = now + 1000;
+    int o_have_sink = vp->have_sink, o_sink_pct = vp->sink_pct, o_sink_muted = vp->sink_muted;
+    int o_have_source = vp->have_source, o_source_pct = vp->source_pct, o_source_muted = vp->source_muted;
     vp->have_sink = pulse_get_sink_state("@DEFAULT_SINK@", &vp->sink_pct, &vp->sink_muted);
     vp->have_source = pulse_get_source_state("@DEFAULT_SOURCE@", &vp->source_pct, &vp->source_muted);
+    return o_have_sink != vp->have_sink || o_sink_pct != vp->sink_pct || o_sink_muted != vp->sink_muted ||
+           o_have_source != vp->have_source || o_source_pct != vp->source_pct || o_source_muted != vp->source_muted;
 }
 
 static void volume_measure(PanelWidget *w, int cross_axis, int *out_len, int *out_min_len)

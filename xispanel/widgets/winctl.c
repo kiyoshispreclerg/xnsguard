@@ -237,10 +237,18 @@ static void winctl_destroy(PanelWidget *w)
     }
 }
 
-static void winctl_on_tick(PanelWidget *w, uint64_t now)
+static int winctl_on_tick(PanelWidget *w, uint64_t now)
 {
     WinctlPriv *wp = w->priv;
     w->next_tick_ms = now + 300;
+
+    /* Snapshot everything winctl_paint() draws, so this tick only asks
+     * for a repaint when one of them actually changed (the active window
+     * usually isn't changing 3x/sec while the user works in it). */
+    int o_applies = wp->active_applies, o_min = wp->minimized, o_max = wp->maximized;
+    char o_title[sizeof(wp->title)];
+    snprintf(o_title, sizeof(o_title), "%s", wp->title);
+    cairo_surface_t *o_icon = wp->icon;
 
     Window active = ewmh_get_active_window();
     if (active != wp->active_win) {
@@ -281,6 +289,9 @@ static void winctl_on_tick(PanelWidget *w, uint64_t now)
         wp->minimized = 0;
         wp->maximized = 0;
     }
+
+    return o_applies != wp->active_applies || o_min != wp->minimized || o_max != wp->maximized ||
+           o_icon != wp->icon || strcmp(o_title, wp->title) != 0;
 }
 
 static void winctl_measure(PanelWidget *w, int cross_axis, int *out_len, int *out_min_len)

@@ -562,16 +562,52 @@ static void sni_handle_incoming(void)
  * net -- see below). Also drains+handles incoming requests, answering
  * them if we're the watcher. Called at most once every SNI_POLL_MS from
  * the main loop. */
-void sni_poll(uint64_t now)
+/* Cheap FNV-1a signature over exactly what the tray widget draws (item
+ * count, each title's bytes, each icon surface's identity -- a re-fetched
+ * icon is always a freshly-allocated surface, so a pointer compare
+ * catches icon changes too). Compared against the previous poll's value
+ * so sni_poll() can tell the main loop whether the tray needs a repaint
+ * at all, instead of the old "repaint every tick unconditionally". */
+static unsigned long sni_display_sig(void)
+{
+    unsigned long h = 1469598103934665603UL; /* FNV offset basis */
+    h = (h ^ (unsigned)g_n_items) * 1099511628211UL;
+    for (int i = 0; i < g_n_items; i++) {
+        for (const char *s = g_items[i].title; *s; s++) {
+            h = (h ^ (unsigned char)*s) * 1099511628211UL;
+        }
+        h = (h ^ 0xff) * 1099511628211UL; /* title terminator, so "ab"+"c" != "a"+"bc" */
+        uintptr_t ip = (uintptr_t)g_items[i].icon;
+        for (unsigned k = 0; k < sizeof(ip); k++) {
+            h = (h ^ (unsigned char)(ip >> (k * 8))) * 1099511628211UL;
+        }
+    }
+    return h;
+}
+
+static unsigned long g_last_display_sig = 0;
+
+/* 1 if the tray's drawn appearance changed since the last call. */
+static int sni_take_sig_change(void)
+{
+    unsigned long sig = sni_display_sig();
+    if (sig == g_last_display_sig) {
+        return 0;
+    }
+    g_last_display_sig = sig;
+    return 1;
+}
+
+int sni_poll(uint64_t now)
 {
     if (now < g_next_poll_ms) {
-        return;
+        return 0;
     }
     g_next_poll_ms = now + SNI_POLL_MS;
 
     if (!sni_ensure_connected()) {
         g_n_items = 0;
-        return;
+        return sni_take_sig_change();
     }
 
     sni_handle_incoming();
@@ -696,6 +732,8 @@ void sni_poll(uint64_t now)
     }
     memcpy(g_items, alive, sizeof(SniItem) * (size_t)n_alive);
     g_n_items = n_alive;
+
+    return sni_take_sig_change();
 }
 
 int sni_count(void)
