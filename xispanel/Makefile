@@ -22,12 +22,12 @@ PKGS := x11 xrandr cairo cairo-xlib imlib2 freetype2 fontconfig pango pangocairo
 # dbusmenu.c/mpris_stub.c/sni_stub.c/dbusmenu_stub.c.
 HAVE_DBUS := $(shell pkg-config --exists dbus-1 && echo yes)
 ifeq ($(HAVE_DBUS),yes)
-DBUS_SRCS := mpris.c sni.c dbusmenu.c
+DBUS_SRCS := mpris.c sni.c dbusmenu.c notifd.c
 DBUS_CPPFLAGS := $(shell pkg-config --cflags dbus-1)
 else
-DBUS_SRCS := mpris_stub.c sni_stub.c dbusmenu_stub.c
+DBUS_SRCS := mpris_stub.c sni_stub.c dbusmenu_stub.c notifd_stub.c
 DBUS_CPPFLAGS :=
-$(info xispanel: dbus-1 not found via pkg-config -- building without MPRIS/tray/globalmenu support)
+$(info xispanel: dbus-1 not found via pkg-config -- building without MPRIS/tray/globalmenu/notifications support)
 endif
 
 # xcomposite + xdamage (thumb.c's window-thumbnail capture for tasklist's

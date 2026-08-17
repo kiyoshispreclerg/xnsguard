@@ -599,6 +599,47 @@ int dbusmenu_fetch(const char *busname, const char *path, int32_t parent_id, int
  * a prior dbusmenu_fetch() at the same busname/path. */
 void dbusmenu_send_event(const char *busname, const char *path, int32_t id);
 
+/* ---- desktop notifications: org.freedesktop.Notifications server (notifd.c) ----
+ *
+ * Same optional dlopen'd-libdbus-1 philosophy as mpris.c/sni.c. Unlike
+ * SNI (which has a real Watcher/Host model letting xispanel attach as a
+ * "second host" alongside an existing tray), only one process can ever
+ * own org.freedesktop.Notifications at a time -- if something else
+ * already does (checked once at startup via NameHasOwner, same check
+ * sni.c does for its watcher names), xispanel just stays permanently
+ * dormant rather than fighting for it; sni.c's compromise (own more than
+ * one, or add together the union of watchers) has no equivalent here.
+ *
+ * Storage is owned here, not by the widget: a capped in-memory ring
+ * buffer (NOTIFD_MAX, oldest evicted) of whatever arrived this session --
+ * lost on restart, no on-disk log. A widget only ever reads through the
+ * accessors below; it never stores anything of its own. */
+#define NOTIFD_SUMMARY_MAX 128
+#define NOTIFD_BODY_MAX 256
+#define NOTIFD_APP_NAME_MAX 64
+typedef struct {
+    unsigned int id;
+    char app_name[NOTIFD_APP_NAME_MAX];
+    char summary[NOTIFD_SUMMARY_MAX];
+    char body[NOTIFD_BODY_MAX];
+    cairo_surface_t *icon; /* NULL if none/unresolved -- never freed by the caller, owned by notifd.c */
+    int read; /* 0 = unread, counts toward notifd_unread_count() */
+    uint64_t received_ms;
+} NotifEntry;
+void notifd_poll(uint64_t now); /* call periodically from the main loop, e.g. alongside sni_poll() */
+int notifd_count(void); /* currently held, oldest first */
+const NotifEntry *notifd_get(int idx); /* NULL if idx out of range */
+int notifd_unread_count(void);
+void notifd_mark_read(unsigned int id); /* no-op if id isn't currently held */
+/* Optional: called once, right when a new Notify() call is parsed and
+ * appended -- lets a toast-popup mechanism react to genuinely new
+ * arrivals without polling notifd_count() for changes itself.
+ * expire_timeout_ms is the sender's requested display time, already
+ * resolved from the protocol's raw -1/0/N semantics (< 0 = server
+ * picks a default, 0 = never auto-expire) into a concrete value. */
+typedef void (*NotifArrivedFn)(const NotifEntry *e, int expire_timeout_ms);
+void notifd_set_arrived_callback(NotifArrivedFn fn);
+
 /* ---- volume control: shells out to `pactl`, no libpulse linked (pulse.c) ----
  *
  * Unconditionally compiled (no headers/library needed to build this file

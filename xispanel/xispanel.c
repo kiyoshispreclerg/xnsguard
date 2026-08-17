@@ -2017,6 +2017,23 @@ static int run_as_daemon(const char *sockpath)
             }
         }
 
+        /* mpris_poll()/sni_poll()/notifd_poll() are only actually called
+         * once per select() wake, on whatever cadence *this* loop wakes
+         * up at -- they don't get their own timer the way widget ticks
+         * do. If nothing above scheduled a wake (no widget with its own
+         * on_tick, e.g. a panel of just spacer/launcher/folder widgets),
+         * timeout_ms is still -1 here and select() would block
+         * indefinitely, silently starving those DBus pollers until some
+         * unrelated X/IPC event happens to nudge the loop -- confirmed
+         * live: a real Notify() call timed out completely against a
+         * spacer-only panel until this fallback was added. 1000ms is
+         * looser than any of their own poll intervals, so it never
+         * tightens the common case (some widget's own tick already
+         * bounds the wake tighter than this whenever one exists). */
+        if (timeout_ms < 0) {
+            timeout_ms = 1000;
+        }
+
         struct timeval tv;
         struct timeval *tvp = NULL;
         if (timeout_ms >= 0) {
@@ -2117,6 +2134,7 @@ static int run_as_daemon(const char *sockpath)
         panel_menu_tick(now);
         mpris_poll(now);
         sni_poll(now);
+        notifd_poll(now);
         for (int i = 0; i < MAX_PANELS; i++) {
             Panel *p = &g_panels[i];
             if (!p->in_use) {
