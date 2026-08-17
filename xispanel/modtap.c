@@ -51,8 +51,9 @@ static XRecordContext g_rec_ctx;
 static int g_available = 0;
 
 /* Which modifier (if any) is the current tap candidate -- i.e. its own
- * key went down while no other key was held -- and whether anything has
- * interrupted it (any other key press) since. 0 = no candidate. */
+ * key went down while nothing else was held -- and whether anything has
+ * interrupted it (any other key press, or a mouse click) since. 0 = no
+ * candidate. */
 static unsigned int g_candidate_mask = 0;
 static int g_interrupted = 0;
 
@@ -115,6 +116,12 @@ static void record_callback(XPointer closure, XRecordInterceptData *data)
             g_candidate_mask = 0;
             g_interrupted = 0;
         }
+    } else if (type == ButtonPress && g_candidate_mask != 0) {
+        /* A click while the modifier is held (e.g. Meta held down to
+         * drag/resize a window, or just clicking something with Meta
+         * still down from an unrelated combo) must not also fire the
+         * bare-modifier tap on release. */
+        g_interrupted = 1;
     }
     XRecordFreeData(data);
 }
@@ -137,8 +144,16 @@ int modtap_init(void)
         return 0;
     }
     memset(range, 0, sizeof(*range));
+    /* KeyPress(2)..ButtonRelease(5): keyboard events (candidate tracking
+     * itself) plus mouse button events (just to detect a click as an
+     * interruption -- ButtonRelease is watched too since the range must
+     * be contiguous, but carries no handling of its own in
+     * record_callback()). Deliberately stops short of MotionNotify(6):
+     * the pointer moves constantly, so treating plain motion as an
+     * interruption would make a bare-modifier tap nearly impossible to
+     * land. */
     range->device_events.first = KeyPress;
-    range->device_events.last = KeyRelease;
+    range->device_events.last = ButtonRelease;
     XRecordClientSpec spec = XRecordAllClients;
     XRecordRange *ranges[1] = {range};
     /* Both the context and its enable call must happen on the *same*

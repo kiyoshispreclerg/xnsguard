@@ -463,18 +463,20 @@ int hotkey_handle_event(const XEvent *ev);
  * Only called by hotkey.c (widgets never touch this directly -- see
  * hotkey_register()'s doc comment above for the widget-facing bare-
  * modifier hotkey= syntax). Detects "this modifier was pressed and
- * released with nothing else pressed in between" -- something plain
- * XGrabKey has no way to express (it can only match a fixed keycode+
- * modifier-state combination on press; there's no "and nothing else
- * happened before the matching release" condition). Implemented via the
- * X Record extension: a passive, non-exclusive, whole-display keyboard
- * event monitor (a second, dedicated Display connection, since enabling
- * a RECORD context takes over that connection's protocol stream) --
- * unlike XGrabKey this doesn't claim the modifier's keycode exclusively,
- * so it coexists cleanly with an existing combo using the same modifier
- * (e.g. folder's hotkey=Meta+D): pressing D while the tap-candidate
- * Meta press is pending marks it interrupted, so only the Meta+D grab
- * fires, not the bare-Meta tap. Optional at build time (needs libXtst's
+ * released with no other key press or mouse click in between" --
+ * something plain XGrabKey has no way to express (it can only match a
+ * fixed keycode+modifier-state combination on press; there's no "and
+ * nothing else happened before the matching release" condition).
+ * Implemented via the X Record extension: a passive, non-exclusive,
+ * whole-display keyboard+button event monitor (a second, dedicated
+ * Display connection, since enabling a RECORD context takes over that
+ * connection's protocol stream) -- unlike XGrabKey this doesn't claim
+ * the modifier's keycode exclusively, so it coexists cleanly with an
+ * existing combo using the same modifier (e.g. folder's
+ * hotkey=Meta+D): pressing D while the tap-candidate Meta press is
+ * pending marks it interrupted, so only the Meta+D grab fires, not the
+ * bare-Meta tap; a mouse click while the modifier is held interrupts it
+ * the same way. Optional at build time (needs libXtst's
  * Record extension headers) -- modtap_stub.c is the always-unavailable
  * fallback. */
 int modtap_init(void); /* call once at startup, right after XOpenDisplay(); returns 1 if available */
