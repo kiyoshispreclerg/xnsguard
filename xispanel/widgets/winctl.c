@@ -240,7 +240,12 @@ static void winctl_destroy(PanelWidget *w)
 static int winctl_on_tick(PanelWidget *w, uint64_t now)
 {
     WinctlPriv *wp = w->priv;
-    w->next_tick_ms = now + 300;
+    /* Slow fallback only: active-window / title / max-min-state changes now
+     * arrive as PropertyNotify events that re-poll this widget immediately
+     * (see ewmh_watch_init() and the PropertyNotify handler in xispanel.c),
+     * so this periodic tick just backstops anything the event path might
+     * miss rather than being the primary refresh. */
+    w->next_tick_ms = now + 2000;
 
     /* Snapshot everything winctl_paint() draws, so this tick only asks
      * for a repaint when one of them actually changed (the active window

@@ -440,6 +440,59 @@ int ewmh_get_current_desktop(void)
     return desktop;
 }
 
+/* --- event-driven property watching (see the doc comments in xispanel.h) ---
+ *
+ * Selects PropertyChangeMask on the root window (for _NET_ACTIVE_WINDOW/
+ * _NET_CLIENT_LIST/_NET_CURRENT_DESKTOP/_NET_NUMBER_OF_DESKTOPS) and on
+ * every client-list window (for _NET_WM_STATE/WM_STATE/_NET_WM_NAME/
+ * WM_NAME -- title and max/min state, which live on the windows
+ * themselves, not the root). Lets the main loop re-poll the polling
+ * widgets (tasklist/winctl/globalmenu) the instant one of these changes
+ * instead of only catching it on the slow fallback tick. */
+void ewmh_watch_windows(void)
+{
+    Window *list = NULL;
+    int n = 0;
+    if (!ewmh_get_client_list(&list, &n)) {
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        /* Additive per-client: doesn't disturb the window's owner or the
+         * WM (each X client has its own independent event mask on a
+         * window), and re-selecting an already-watched window is a
+         * harmless no-op. A window destroyed between the list read and
+         * here just yields a BadWindow the global error handler ignores. */
+        XSelectInput(g_dpy, list[i], PropertyChangeMask);
+    }
+    XFree(list);
+}
+
+void ewmh_watch_init(void)
+{
+    XSelectInput(g_dpy, g_root, PropertyChangeMask);
+    ewmh_watch_windows();
+}
+
+int ewmh_property_event_is_relevant(const XPropertyEvent *ev, int *out_client_list_changed)
+{
+    if (out_client_list_changed) {
+        *out_client_list_changed = 0;
+    }
+    Atom a = ev->atom;
+    if (ev->window == g_root) {
+        if (a == g_atom_net_client_list) {
+            if (out_client_list_changed) {
+                *out_client_list_changed = 1;
+            }
+            return 1;
+        }
+        return a == g_atom_net_active_window || a == g_atom_net_current_desktop ||
+               a == g_atom_net_number_of_desktops;
+    }
+    /* A watched client window: title or max/min-state change. */
+    return a == g_atom_net_wm_state || a == g_atom_wm_state || a == g_atom_net_wm_name || a == XA_WM_NAME;
+}
+
 static void ewmh_send_client_message(Window w, Atom message_type, long l0, long l1, long l2, long l3, long l4)
 {
     XEvent ev;

@@ -311,6 +311,24 @@ void ewmh_get_state_flags(Window w, int *minimized, int *maximized);
 Window ewmh_get_active_window(void);
 int ewmh_get_number_of_desktops(void);
 int ewmh_get_current_desktop(void); /* -1 if unavailable */
+/* ---- event-driven property watching (ewmh.c) ----
+ *
+ * Lets the polling widgets (tasklist/winctl/globalmenu) react the instant
+ * a relevant window-manager property changes, instead of only on their
+ * slow fallback tick. ewmh_watch_init() (call once at startup, after
+ * ewmh_init_atoms()) selects PropertyChangeMask on the root window and on
+ * every current client-list window. ewmh_property_event_is_relevant()
+ * classifies an incoming PropertyNotify: returns 1 if a widget re-poll is
+ * warranted, and sets *out_client_list_changed when it was specifically
+ * _NET_CLIENT_LIST (the caller should then re-run ewmh_watch_windows() to
+ * start watching any newly-mapped windows). Root properties cover
+ * active-window/client-list/current-desktop/desktop-count; per-window
+ * properties (watched on each client window) cover title and
+ * maximize/minimize state, which live on the windows themselves, not the
+ * root. */
+void ewmh_watch_init(void);
+void ewmh_watch_windows(void);
+int ewmh_property_event_is_relevant(const XPropertyEvent *ev, int *out_client_list_changed);
 int ewmh_skip_taskbar(Window w); /* 1 if a taskbar should never list this window */
 int ewmh_window_in_rect(Window w, int rx, int ry, int rw, int rh); /* 1 if w's center is inside the rect */
 int ewmh_window_has_input_focus(Window w); /* 1 if w (or a descendant) holds real X input focus */

@@ -1958,6 +1958,11 @@ static int run_as_daemon(const char *sockpath)
 
     write_default_config_if_missing();
     reload_all_panels();
+    /* Watch the root + every client window for the properties the polling
+     * widgets (tasklist/winctl/globalmenu) care about, so they re-poll the
+     * instant one changes rather than only on their slow fallback tick --
+     * see ewmh_watch_init() and the PropertyNotify handling below. */
+    ewmh_watch_init();
     XFlush(g_dpy);
 
     int xfd = ConnectionNumber(g_dpy);
@@ -2131,6 +2136,33 @@ static int run_as_daemon(const char *sockpath)
                     Panel *p = find_panel_by_window(ev.xexpose.window, &is_sensor);
                     if (p && !is_sensor) {
                         p->dirty = 1;
+                    }
+                } else if (ev.type == PropertyNotify) { 
+                    /* A WM property the polling widgets depend on changed
+                     * (active window, client list, current desktop, or a
+                     * window's title/max/min state) -- make every widget
+                     * with a tick re-poll this iteration instead of waiting
+                     * out its fallback interval. Each on_tick still returns
+                     * "changed?" so a spurious event that doesn't actually
+                     * alter anything drawn costs a cheap re-read, not a
+                     * repaint. See ewmh_watch_init(). */
+                    int client_list_changed = 0;
+                    if (ewmh_property_event_is_relevant(&ev.xproperty, &client_list_changed)) {
+                        if (client_list_changed) {
+                            ewmh_watch_windows(); /* start watching any newly-mapped windows */
+                        }
+                        uint64_t pn = now_ms();
+                        for (int i = 0; i < MAX_PANELS; i++) {
+                            if (!g_panels[i].in_use) {
+                                continue;
+                            }
+                            for (int j = 0; j < g_panels[i].n_widgets; j++) {
+                                PanelWidget *w = &g_panels[i].widgets[j];
+                                if (w->ops->on_tick && w->next_tick_ms != 0) {
+                                    w->next_tick_ms = pn;
+                                }
+                            }
+                        }
                     }
                 }
             }

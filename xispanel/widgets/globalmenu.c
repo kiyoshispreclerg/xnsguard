@@ -51,7 +51,12 @@
 #include <string.h>
 
 #define GLOBALMENU_MAX_TOP 16
-#define GLOBALMENU_POLL_MS 300 /* active-window tracking cadence, same as winctl.c */
+/* Slow fallback cadence: active-window changes now arrive as PropertyNotify
+ * events that re-poll this widget immediately (see ewmh_watch_init() +
+ * xispanel.c's PropertyNotify handler), so this just backstops the event
+ * path rather than being the primary refresh -- same 2000ms as winctl.c/
+ * tasklist.c. */
+#define GLOBALMENU_POLL_MS 2000
 #define GLOBALMENU_ITEM_PAD 14 /* horizontal padding around each top-level label, both sides */
 #define GLOBALMENU_ICON_PAD 8 /* padding around the hamburger icon, closed mode */
 

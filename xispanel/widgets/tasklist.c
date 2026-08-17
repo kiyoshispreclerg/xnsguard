@@ -169,7 +169,12 @@ static void tasklist_destroy(PanelWidget *w)
 static int tasklist_on_tick(PanelWidget *w, uint64_t now)
 {
     TasklistPriv *tp = w->priv;
-    w->next_tick_ms = now + 800;
+    /* Slow fallback only: window open/close/desktop-switch (root props) and
+     * per-window title/max/min-state changes now arrive as PropertyNotify
+     * events that re-poll this widget immediately (see ewmh_watch_init() +
+     * xispanel.c's PropertyNotify handler), so this periodic tick just
+     * backstops the event path. */
+    w->next_tick_ms = now + 2000;
 
     Window *list = NULL;
     int n = 0;
