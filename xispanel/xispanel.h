@@ -170,6 +170,14 @@ struct Panel {
      * "geometry change" animation smooth the move/resize between tooltips
      * instead of a create/destroy flicker. */
     int tooltip_reuse_window;
+    /* Extra padding (px) added only to tooltip/toast popups, on top of
+     * their own normal TOOLTIP_PAD_X/Y/TOAST_PAD constants -- separate
+     * from the panel's own `spacing`, so a panel can stay packed tight
+     * while its tooltips/toasts get more breathing room from their edges.
+     * 0 by default (no change from before this existed). See tooltip.c's
+     * show_popup_single_layout()/show_popup_group_layout() and toast.c's
+     * paint_toast(). */
+    int tooltip_toast_padding_extra;
 
     /* theme */
     double bg_r, bg_g, bg_b, bg_a;
@@ -283,6 +291,12 @@ double panel_text_size(const Panel *p);
  * (see panel_load_bg_image()) and available to any widget that wants to
  * load an image of its own, e.g. `launcher`'s icon= key. */
 cairo_surface_t *load_png_argb(const char *path);
+/* Draws `src` (sw x sh) into cr's current (0,0)-(dw,dh) rect as a 9-slice
+ * (see panel_load_bg_image()'s doc comment in xispanel.c for the technique).
+ * Exported so tooltip.c/toast.c can paint their popups with the same panel
+ * bitmap theme instead of always falling back to a flat color. */
+void panel_draw_9slice(cairo_t *cr, cairo_surface_t *src, int sw, int sh, int l, int t, int r, int b, double dw,
+                        double dh);
 /* Runs `cmd` via `sh -c`, detached (double-forked via setsid()) and never
  * waited on -- SIGCHLD is set to SIG_IGN in main() so the child is
  * auto-reaped by the kernel instead of becoming a zombie, same pattern
@@ -463,6 +477,11 @@ void panel_menu_open_tree_lazy(Panel *owner_panel, PanelWidget *owner_widget, in
                                 MenuSelectFn on_select, MenuLazyFn on_lazy, MenuHoverRootFn on_hover_root,
                                 MenuCloseFn on_close);
 void panel_menu_close(void);
+/* 1 if any menu (root or submenu, from any widget) is currently open --
+ * tooltip.c uses this to suppress tooltips while a menu is up, so the menu
+ * stays open until the user explicitly clicks elsewhere instead of a
+ * tooltip popping up and stealing attention/screen space over it. */
+int panel_menu_is_open(void);
 /* Returns 1 if `ev` belonged to the open menu (and was fully handled),
  * 0 otherwise -- xispanel.c's event loop dispatches to this first without
  * needing to know anything about the menu's internals. */
@@ -724,6 +743,15 @@ void toast_set_output_rect(int x, int y, int w, int h);
  * next arrival/expiry. */
 void toast_set_colors(double bg_r, double bg_g, double bg_b, double bg_a, double fg_r, double fg_g, double fg_b,
                        double fg_a);
+/* Mirrors a panel's bitmap theme (bg_image_surface + 9-slice insets) onto
+ * the toast popups, same "widgets/notif.c re-syncs from on_tick" pattern
+ * as toast_set_colors() above. `surface` NULL means the panel has no
+ * bitmap theme -- toasts fall back to the flat color from
+ * toast_set_colors(). */
+void toast_set_bg_image(cairo_surface_t *surface, int slice_l, int slice_t, int slice_r, int slice_b);
+/* Mirrors a panel's tooltip_toast_padding_extra onto the toast popups --
+ * same on_tick re-sync pattern as toast_set_colors() above. */
+void toast_set_padding_extra(int extra);
 
 /* ---- volume control: shells out to `pactl`, no libpulse linked (pulse.c) ----
  *

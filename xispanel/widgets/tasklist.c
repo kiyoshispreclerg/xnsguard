@@ -737,6 +737,23 @@ static int tasklist_on_button(PanelWidget *w, int button, int local_x, int local
     TasklistPriv *tp = w->priv;
     tasklist_layout_visible(w);
 
+    /* Mouse wheel pages the tasklist from anywhere over the widget, not
+     * just over the up/down arrow pair -- same direction convention as
+     * the arrows (wheel up = earlier tasks, wheel down = later). */
+    if (tp->scrollable && (button == Button4 || button == Button5)) {
+        if (button == Button4) {
+            if (tp->scroll_offset > 0) {
+                tp->scroll_offset--;
+            }
+        } else {
+            if (tp->n_visible > 0 && tp->vis_idx[tp->n_visible - 1] < tp->n_display - 1) {
+                tp->scroll_offset++;
+            }
+        }
+        w->panel->dirty = 1;
+        return 1;
+    }
+
     if (tp->scrollable && local_x >= tp->arrow_x && button == Button1) {
         if (local_y < w->thickness / 2) {
             if (tp->scroll_offset > 0) {

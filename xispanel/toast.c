@@ -81,6 +81,19 @@ static int g_area_x = 0, g_area_y = 0, g_area_w = 0, g_area_h = 0;
 static double g_bg_r = 0.12, g_bg_g = 0.12, g_bg_b = 0.12, g_bg_a = 0.92;
 static double g_fg_r = 1.0, g_fg_g = 1.0, g_fg_b = 1.0, g_fg_a = 1.0;
 
+/* Borrowed from the owning panel (not owned/freed here -- see
+ * toast_set_bg_image()'s doc comment); NULL means "no bitmap theme, use
+ * the flat g_bg_* color above". */
+static cairo_surface_t *g_bg_image = NULL;
+static int g_bg_slice_l = 0, g_bg_slice_t = 0, g_bg_slice_r = 0, g_bg_slice_b = 0;
+
+/* Mirrors the owning panel's tooltip_toast_padding_extra (see that field's
+ * doc comment in xispanel.h) -- added on top of TOAST_PAD when positioning
+ * the icon/text inside the fixed TOAST_W x TOAST_H box, so a toast's
+ * content can be pulled in from the box's edges independently of the
+ * panel's own spacing. */
+static int g_pad_extra = 0;
+
 static Visual *g_visual = NULL;
 static int g_depth = 0;
 static Colormap g_cmap = None;
@@ -187,8 +200,18 @@ static void paint_toast(Toast *t)
     cairo_t *cr = t->cr;
     cairo_save(cr);
     cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
-    cairo_set_source_rgba(cr, g_bg_r, g_bg_g, g_bg_b, g_bg_a);
+    cairo_set_source_rgba(cr, 0, 0, 0, 0);
     cairo_paint(cr);
+    cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+    if (g_bg_image) {
+        int sw = cairo_image_surface_get_width(g_bg_image);
+        int sh = cairo_image_surface_get_height(g_bg_image);
+        panel_draw_9slice(cr, g_bg_image, sw, sh, g_bg_slice_l, g_bg_slice_t, g_bg_slice_r, g_bg_slice_b, TOAST_W,
+                           TOAST_H);
+    } else {
+        cairo_set_source_rgba(cr, g_bg_r, g_bg_g, g_bg_b, g_bg_a);
+        cairo_paint(cr);
+    }
     cairo_restore(cr);
 
     cairo_set_source_rgba(cr, g_fg_r, g_fg_g, g_fg_b, 0.15);
@@ -196,21 +219,21 @@ static void paint_toast(Toast *t)
     cairo_rectangle(cr, 0.5, 0.5, TOAST_W - 1, TOAST_H - 1);
     cairo_stroke(cr);
 
-    double text_x = TOAST_PAD;
-    double text_w = TOAST_W - TOAST_PAD * 2;
+    int pad = TOAST_PAD + g_pad_extra;
+    double text_x = pad;
+    double text_w = TOAST_W - pad * 2;
     if (t->icon) {
-        draw_icon_scaled(cr, t->icon, TOAST_PAD, (TOAST_H - TOAST_ICON) / 2.0, TOAST_ICON);
-        text_x = TOAST_PAD * 2 + TOAST_ICON;
-        text_w = TOAST_W - text_x - TOAST_PAD;
+        draw_icon_scaled(cr, t->icon, pad, (TOAST_H - TOAST_ICON) / 2.0, TOAST_ICON);
+        text_x = pad * 2 + TOAST_ICON;
+        text_w = TOAST_W - text_x - pad;
     }
 
     cairo_set_source_rgba(cr, g_fg_r, g_fg_g, g_fg_b, g_fg_a);
     const char *summary = t->summary[0] ? t->summary : t->app_name;
-    pango_show_text_boxed(cr, text_x, TOAST_PAD - 2, TOAST_SUMMARY_SIZE + 6, text_w, TOAST_SUMMARY_SIZE, summary,
-                           NULL);
+    pango_show_text_boxed(cr, text_x, pad - 2, TOAST_SUMMARY_SIZE + 6, text_w, TOAST_SUMMARY_SIZE, summary, NULL);
     if (t->body[0]) {
         cairo_set_source_rgba(cr, g_fg_r, g_fg_g, g_fg_b, g_fg_a * 0.75);
-        pango_show_text_boxed(cr, text_x, TOAST_PAD - 2 + TOAST_SUMMARY_SIZE + 6, TOAST_BODY_SIZE + 6, text_w,
+        pango_show_text_boxed(cr, text_x, pad - 2 + TOAST_SUMMARY_SIZE + 6, TOAST_BODY_SIZE + 6, text_w,
                                TOAST_BODY_SIZE, t->body, NULL);
     }
 }
@@ -368,6 +391,51 @@ void toast_set_colors(double bg_r, double bg_g, double bg_b, double bg_a, double
     g_fg_g = fg_g;
     g_fg_b = fg_b;
     g_fg_a = fg_a;
+    for (int i = 0; i < g_n; i++) {
+        paint_toast(&g_toasts[i]);
+    }
+    if (g_n > 0) {
+        XFlush(g_dpy);
+    }
+}
+
+/* Mirrors widgets/notif.c's own panel's bg_image_surface/bg_slice_* (see
+ * toast_set_colors()'s doc comment for why this lives in notif.c's
+ * on_tick rather than init()). `surface` is borrowed -- owned by the
+ * Panel struct and reloaded/freed by panel_load_bg_image(), never by
+ * this file -- so a panel-image RELOAD is picked up automatically the
+ * next time notif_on_tick() re-syncs, without toast.c needing to know
+ * anything happened. NULL falls back to the flat g_bg_* color. */
+void toast_set_bg_image(cairo_surface_t *surface, int slice_l, int slice_t, int slice_r, int slice_b)
+{
+    if (g_bg_image == surface && g_bg_slice_l == slice_l && g_bg_slice_t == slice_t && g_bg_slice_r == slice_r &&
+        g_bg_slice_b == slice_b) {
+        return;
+    }
+    g_bg_image = surface;
+    g_bg_slice_l = slice_l;
+    g_bg_slice_t = slice_t;
+    g_bg_slice_r = slice_r;
+    g_bg_slice_b = slice_b;
+    for (int i = 0; i < g_n; i++) {
+        paint_toast(&g_toasts[i]);
+    }
+    if (g_n > 0) {
+        XFlush(g_dpy);
+    }
+}
+
+/* Mirrors widgets/notif.c's own panel's tooltip_toast_padding_extra, same
+ * on_tick re-sync pattern as toast_set_colors()/toast_set_bg_image(). */
+void toast_set_padding_extra(int extra)
+{
+    if (extra < 0) {
+        extra = 0;
+    }
+    if (g_pad_extra == extra) {
+        return;
+    }
+    g_pad_extra = extra;
     for (int i = 0; i < g_n; i++) {
         paint_toast(&g_toasts[i]);
     }

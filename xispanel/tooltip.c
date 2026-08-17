@@ -47,6 +47,8 @@
 #define TOOLTIP_PAD_Y 6
 #define TOOLTIP_FONT_SIZE 13.0
 #define TOOLTIP_MAX_LINES 4
+#define TOOLTIP_MAX_LINE_W 420 /* ellipsize a single line past this width, so one huge
+                                 * window title can't blow the popup up huge */
 #define TOOLTIP_CLOSE_ICON 14
 #define MPRIS_BTN_SIZE 22
 #define MPRIS_BTN_GAP 4
@@ -124,6 +126,21 @@ static uint64_t g_last_thumb_paint_ms = 0;
 static int g_shown = 0;
 static int g_closable = 0;
 static void *g_ctx = NULL;
+
+/* TOOLTIP_PAD_X/Y plus the owning panel's tooltip_toast_padding_extra (see
+ * that field's doc comment in xispanel.h) -- lets a panel stay packed
+ * tight while its tooltips get more room from their own edges. Falls back
+ * to the plain constant if g_panel isn't set yet (shouldn't normally
+ * happen: these are only called while laying out/painting an actual
+ * popup, which always has g_panel set first). */
+static int pad_x(void)
+{
+    return TOOLTIP_PAD_X + (g_panel ? g_panel->tooltip_toast_padding_extra : 0);
+}
+static int pad_y(void)
+{
+    return TOOLTIP_PAD_Y + (g_panel ? g_panel->tooltip_toast_padding_extra : 0);
+}
 
 /* Set alongside g_text whenever the current hover target implements
  * get_tooltip_mpris() and reports an active player -- see mpris.c and
@@ -330,13 +347,13 @@ static int measure_lines(cairo_t *cr, double font_size, char lines[TOOLTIP_MAX_L
     int max_w = 0;
     for (int i = 0; i < n; i++) {
         double lw;
-        pango_text_extents_ellipsized(cr, lines[i], font_size, 0, &lw, NULL);
+        pango_text_extents_ellipsized(cr, lines[i], font_size, TOOLTIP_MAX_LINE_W, &lw, NULL);
         if ((int)lw > max_w) {
             max_w = (int)lw;
         }
     }
     *out_text_w = max_w;
-    *out_h = (int)(n * line_h) + TOOLTIP_PAD_Y * 2;
+    *out_h = (int)(n * line_h) + pad_y() * 2;
     return n;
 }
 
@@ -423,9 +440,20 @@ static void paint_popup(void)
     Panel *p = g_panel;
     cairo_t *cr = g_popup->back_cr;
     cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
-    cairo_set_source_rgba(cr, p->bg_r, p->bg_g, p->bg_b, p->bg_a);
+    cairo_set_source_rgba(cr, 0, 0, 0, 0);
     cairo_paint(cr);
     cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+    if (p->bg_image_surface) {
+        /* Follow the owning panel's bitmap theme, same 9-slice used for
+         * the panel's own background, instead of always a flat color. */
+        int sw = cairo_image_surface_get_width(p->bg_image_surface);
+        int sh = cairo_image_surface_get_height(p->bg_image_surface);
+        panel_draw_9slice(cr, p->bg_image_surface, sw, sh, p->bg_slice_l, p->bg_slice_t, p->bg_slice_r,
+                           p->bg_slice_b, g_popup->width, g_popup->height);
+    } else {
+        cairo_set_source_rgba(cr, p->bg_r, p->bg_g, p->bg_b, p->bg_a);
+        cairo_paint(cr);
+    }
     cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.15);
     cairo_rectangle(cr, 0.5, 0.5, g_popup->width - 1, g_popup->height - 1);
     cairo_set_line_width(cr, 1);
@@ -439,7 +467,7 @@ static void paint_popup(void)
 
     if (g_has_thumb) {
         double thumb_x = (g_popup->width - THUMB_W) / 2.0;
-        if (!thumb_paint(cr, g_thumb_win, thumb_x, 0, THUMB_W, THUMB_H)) {
+        if (!thumb_paint(cr, g_thumb_win, thumb_x, pad_y(), THUMB_W, THUMB_H)) {
             /* Window closed/unmapped between query_thumb() and now, or
              * the compositor just stopped -- fall through with just the
              * reserved blank space rather than resizing the popup
@@ -457,8 +485,8 @@ static void paint_popup(void)
 
     cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, p->fg_a);
     for (int i = 0; i < n; i++) {
-        double ty = content_y0 + TOOLTIP_PAD_Y + i * line_h;
-        pango_show_text_boxed(cr, TOOLTIP_PAD_X, ty, line_h, 0, fsz, lines[i], NULL);
+        double ty = content_y0 + pad_y() + i * line_h;
+        pango_show_text_boxed(cr, pad_x(), ty, line_h, TOOLTIP_MAX_LINE_W, fsz, lines[i], NULL);
     }
 
     if (g_closable) {
@@ -547,18 +575,18 @@ static void show_popup_single_layout(TooltipPopup *pop)
     cairo_surface_destroy(probe_surf);
 
     int close_reserve = g_closable ? (TOOLTIP_CLOSE_ICON + 6) : 0;
-    pop->width = text_w + TOOLTIP_PAD_X * 2 + close_reserve;
+    pop->width = text_w + pad_x() * 2 + close_reserve;
     /* `body_h`/`pop->height` below are relative to content_y0, i.e. they
      * don't yet know about the thumbnail reserved above them -- that's
      * added once, right at the end, by shifting everything down. */
     int body_h = text_h;
-    if (g_closable && body_h < TOOLTIP_CLOSE_ICON + TOOLTIP_PAD_Y * 2) {
-        body_h = TOOLTIP_CLOSE_ICON + TOOLTIP_PAD_Y * 2;
+    if (g_closable && body_h < TOOLTIP_CLOSE_ICON + pad_y() * 2) {
+        body_h = TOOLTIP_CLOSE_ICON + pad_y() * 2;
     }
     int close_y_in_body = (body_h - TOOLTIP_CLOSE_ICON) / 2;
 
     if (g_has_mpris) {
-        int mpris_row_w = 3 * MPRIS_BTN_SIZE + 2 * MPRIS_BTN_GAP + TOOLTIP_PAD_X * 2;
+        int mpris_row_w = 3 * MPRIS_BTN_SIZE + 2 * MPRIS_BTN_GAP + pad_x() * 2;
         if (mpris_row_w > pop->width) {
             pop->width = mpris_row_w;
         }
@@ -572,11 +600,11 @@ static void show_popup_single_layout(TooltipPopup *pop)
     }
 
     if (g_has_thumb) {
-        int thumb_row_w = THUMB_W + TOOLTIP_PAD_X * 2;
+        int thumb_row_w = THUMB_W + pad_x() * 2;
         if (thumb_row_w > pop->width) {
             pop->width = thumb_row_w;
         }
-        pop->content_y0 = THUMB_H + THUMB_MARGIN;
+        pop->content_y0 = pad_y() + THUMB_H + THUMB_MARGIN;
     } else {
         pop->content_y0 = 0;
     }
@@ -696,8 +724,8 @@ static void show_popup_group_layout(TooltipPopup *pop)
     for (int i = 0; i < total_cells && i < TOOLTIP_GROUP_MAX_ITEMS; i++) {
         int row = i / cols;
         int col = i % cols;
-        int ix = TOOLTIP_PAD_X + col * (cell_w + GROUP_CELL_GAP);
-        int iy = TOOLTIP_PAD_Y + row * (cell_h + GROUP_ROW_GAP);
+        int ix = pad_x() + col * (cell_w + GROUP_CELL_GAP);
+        int iy = pad_y() + row * (cell_h + GROUP_ROW_GAP);
         pop->group_item_x[i] = ix;
         pop->group_item_y[i] = iy;
         pop->group_item_w[i] = cell_w;
@@ -723,8 +751,8 @@ static void show_popup_group_layout(TooltipPopup *pop)
         used_rows = 1;
     }
     (void)rows;
-    pop->width = TOOLTIP_PAD_X * 2 + used_cols * cell_w + (used_cols - 1) * GROUP_CELL_GAP;
-    pop->height = TOOLTIP_PAD_Y * 2 + used_rows * cell_h + (used_rows - 1) * GROUP_ROW_GAP;
+    pop->width = pad_x() * 2 + used_cols * cell_w + (used_cols - 1) * GROUP_CELL_GAP;
+    pop->height = pad_y() * 2 + used_rows * cell_h + (used_rows - 1) * GROUP_ROW_GAP;
     if (pop->width < 1) {
         pop->width = 1;
     }
@@ -894,6 +922,15 @@ static int refresh_text(void)
 
 void tooltip_notice_motion(Panel *p, int axis_pos)
 {
+    if (panel_menu_is_open()) {
+        /* A menu is up somewhere -- don't track hover or open a tooltip
+         * over it (or anything else) until the user closes it. */
+        if (g_widget) {
+            tooltip_close();
+        }
+        return;
+    }
+
     PanelWidget *hit = NULL;
     for (int i = 0; i < p->n_widgets; i++) {
         PanelWidget *w = &p->widgets[i];
@@ -999,6 +1036,15 @@ void tooltip_notice_leave(Panel *p)
 
 void tooltip_tick(uint64_t now)
 {
+    if (panel_menu_is_open()) {
+        /* A menu opened (e.g. via click) while a tooltip's delay timer was
+         * still running, with no further motion event to catch it in
+         * tooltip_notice_motion() -- close/suppress here too. */
+        if (g_widget) {
+            tooltip_close();
+        }
+        return;
+    }
     if (g_close_deadline_ms && now >= g_close_deadline_ms) {
         tooltip_close();
         return;

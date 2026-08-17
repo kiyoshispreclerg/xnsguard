@@ -146,6 +146,8 @@ static int notif_on_tick(PanelWidget *w, uint64_t now)
     compute_output_rect(p, &ox, &oy, &ow, &oh);
     toast_set_output_rect(ox, oy, ow, oh);
     toast_set_colors(p->bg_r, p->bg_g, p->bg_b, p->bg_a, p->fg_r, p->fg_g, p->fg_b, p->fg_a);
+    toast_set_bg_image(p->bg_image_surface, p->bg_slice_l, p->bg_slice_t, p->bg_slice_r, p->bg_slice_b);
+    toast_set_padding_extra(p->tooltip_toast_padding_extra);
 
     /* The one thing this widget draws that changes on its own (a new
      * Notify() arriving, or a toast/menu marking one read) is the unread

@@ -1034,8 +1034,8 @@ static void draw_slice_region(cairo_t *cr, cairo_surface_t *src, int sx, int sy,
  * corners. Insets are silently clamped if they don't fit inside the
  * source image (a theme author's slice file shouldn't be able to corrupt
  * rendering, just look wrong). */
-static void draw_9slice(cairo_t *cr, cairo_surface_t *src, int sw, int sh, int l, int t, int r, int b, double dw,
-                         double dh)
+void panel_draw_9slice(cairo_t *cr, cairo_surface_t *src, int sw, int sh, int l, int t, int r, int b, double dw,
+                        double dh)
 {
     if (l + r > sw) {
         l = r = 0;
@@ -1209,8 +1209,8 @@ static void panel_repaint(Panel *p)
         cairo_paint(p->buf_cr);
         int sw = cairo_image_surface_get_width(p->bg_image_surface);
         int sh = cairo_image_surface_get_height(p->bg_image_surface);
-        draw_9slice(p->buf_cr, p->bg_image_surface, sw, sh, p->bg_slice_l, p->bg_slice_t, p->bg_slice_r,
-                    p->bg_slice_b, p->w, p->h);
+        panel_draw_9slice(p->buf_cr, p->bg_image_surface, sw, sh, p->bg_slice_l, p->bg_slice_t, p->bg_slice_r,
+                           p->bg_slice_b, p->w, p->h);
     } else {
         cairo_set_source_rgba(p->buf_cr, p->bg_r, p->bg_g, p->bg_b, p->bg_a);
         cairo_paint(p->buf_cr);
@@ -1589,6 +1589,10 @@ static void apply_panel_kv(Panel *p, const char *kvline)
         p->tooltip_close_delay_ms = 0;
     }
     p->tooltip_reuse_window = kv_get_int(kvline, "tooltip_reuse", p->tooltip_reuse_window) != 0;
+    p->tooltip_toast_padding_extra = kv_get_int(kvline, "padding_extra", p->tooltip_toast_padding_extra);
+    if (p->tooltip_toast_padding_extra < 0) {
+        p->tooltip_toast_padding_extra = 0;
+    }
 }
 
 static void apply_theme_kv(Panel *p, const char *kvline)

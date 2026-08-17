@@ -48,9 +48,15 @@
  * immediately (fetching its children first, if lazy). Moving the pointer
  * to a different item in an already-open ancestor frame closes whatever
  * deeper frames no longer apply. Moving the pointer off of every open
- * frame for owner_panel->tooltip_close_delay_ms closes the whole menu,
- * same grace-period idea tooltip.c uses -- clicking a leaf item, or
- * Escape, close it immediately as before.
+ * frame does NOT close the whole menu on its own -- only an explicit
+ * click outside every frame (still caught by this file's own pointer
+ * grab, see handle_click()'s frame<0 branch), Escape, or selecting a leaf
+ * item closes it. This is deliberate: a menu is meant to stay put while
+ * the pointer wanders elsewhere (e.g. over a tooltip-bearing widget on
+ * the panel) rather than evaporating from a hover-away timeout the way a
+ * tooltip does -- see tooltip.c's panel_menu_is_open() check, which
+ * relies on this to keep tooltips suppressed for the whole time the menu
+ * is actually still open.
  *
  * A click whose root coordinates fall outside every open frame is
  * "clicked outside" and just dismisses the whole menu, without
@@ -127,10 +133,6 @@ typedef struct {
     uint64_t pending_since_ms;
     int pending_frame, pending_pos;
 
-    /* Pointer isn't over any open frame right now; closes the whole menu
-     * once owner_panel->tooltip_close_delay_ms elapses. 0 = pointer is
-     * over some frame (or we haven't left one yet). */
-    uint64_t close_deadline_ms;
 } PanelMenu;
 
 static PanelMenu *g_menu = NULL;
@@ -147,6 +149,11 @@ static void destroy_frame_resources(MenuFrame *f)
         XDestroyWindow(g_dpy, f->win);
     }
     memset(f, 0, sizeof(*f));
+}
+
+int panel_menu_is_open(void)
+{
+    return g_menu != NULL;
 }
 
 void panel_menu_close(void)
@@ -555,11 +562,6 @@ static void hit_test(PanelMenu *m, int root_x, int root_y, int *out_frame, int *
     *out_row = -1;
 }
 
-static uint64_t close_delay_ms(PanelMenu *m)
-{
-    return (uint64_t)(m->owner_panel->tooltip_close_delay_ms);
-}
-
 static uint64_t open_delay_ms(PanelMenu *m)
 {
     return (uint64_t)(m->owner_panel->tooltip_delay_ms);
@@ -575,13 +577,13 @@ static void handle_motion(int root_x, int root_y)
     int frame, row;
     hit_test(m, root_x, root_y, &frame, &row);
     if (frame < 0) {
-        if (!m->close_deadline_ms) {
-            m->close_deadline_ms = now_ms() + close_delay_ms(m);
-        }
+        /* Outside every open frame -- see this file's doc comment for why
+         * that alone doesn't close the menu (only an explicit click does,
+         * via handle_click()'s own frame<0 branch). Just stop any pending
+         * submenu-open timer, since nothing is hovered right now. */
         m->pending_since_ms = 0;
         return;
     }
-    m->close_deadline_ms = 0;
 
     MenuFrame *f = &m->frames[frame];
     if (f->hover_row != row) {
@@ -882,10 +884,6 @@ void panel_menu_tick(uint64_t now)
         return;
     }
     PanelMenu *m = g_menu;
-    if (m->close_deadline_ms && now >= m->close_deadline_ms) {
-        panel_menu_close();
-        return;
-    }
     if (m->pending_since_ms && now - m->pending_since_ms >= open_delay_ms(m)) {
         int pf = m->pending_frame, pp = m->pending_pos;
         m->pending_since_ms = 0;
@@ -900,9 +898,6 @@ uint64_t panel_menu_next_wake_ms(void)
     }
     PanelMenu *m = g_menu;
     uint64_t wake = 0;
-    if (m->close_deadline_ms) {
-        wake = m->close_deadline_ms;
-    }
     if (m->pending_since_ms) {
         uint64_t w2 = m->pending_since_ms + open_delay_ms(m);
         if (wake == 0 || w2 < wake) {
