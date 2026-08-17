@@ -1893,6 +1893,34 @@ static void dispatch_button(Panel *p, int button, int x, int y, int root_x, int 
     }
 }
 
+/* How long to coalesce a stream of ConfigureNotify (window move/resize)
+ * events before re-polling the widgets -- a drag emits one per pointer
+ * motion, and only the window's *resting* output actually matters, so
+ * rebuilding the task list on every motion would be pure waste. See the
+ * ConfigureNotify handling in the main loop. */
+#define WATCH_GEOMETRY_DEBOUNCE_MS 200
+
+/* Lowers every ticking widget's next tick to at_ms (never raises it), so
+ * the existing tick loop re-polls them at that time and each reports
+ * whether anything it draws actually changed. Turns a WM property or
+ * geometry change into an immediate (at_ms = now) or debounced (at_ms =
+ * now + WATCH_GEOMETRY_DEBOUNCE_MS) re-poll without any extra timer, since
+ * next_tick_ms already feeds the main loop's soonest-wake computation. */
+static void schedule_widget_repoll(uint64_t at_ms)
+{
+    for (int i = 0; i < MAX_PANELS; i++) {
+        if (!g_panels[i].in_use) {
+            continue;
+        }
+        for (int j = 0; j < g_panels[i].n_widgets; j++) {
+            PanelWidget *w = &g_panels[i].widgets[j];
+            if (w->ops->on_tick && w->next_tick_ms != 0 && w->next_tick_ms > at_ms) {
+                w->next_tick_ms = at_ms;
+            }
+        }
+    }
+}
+
 static int run_as_daemon(const char *sockpath)
 {
     g_dpy = XOpenDisplay(NULL);
@@ -2137,12 +2165,12 @@ static int run_as_daemon(const char *sockpath)
                     if (p && !is_sensor) {
                         p->dirty = 1;
                     }
-                } else if (ev.type == PropertyNotify) { 
+                } else if (ev.type == PropertyNotify) {
                     /* A WM property the polling widgets depend on changed
                      * (active window, client list, current desktop, or a
-                     * window's title/max/min state) -- make every widget
-                     * with a tick re-poll this iteration instead of waiting
-                     * out its fallback interval. Each on_tick still returns
+                     * window's title/max/min state/desktop) -- re-poll every
+                     * ticking widget this iteration instead of waiting out
+                     * its fallback interval. Each on_tick still returns
                      * "changed?" so a spurious event that doesn't actually
                      * alter anything drawn costs a cheap re-read, not a
                      * repaint. See ewmh_watch_init(). */
@@ -2151,19 +2179,16 @@ static int run_as_daemon(const char *sockpath)
                         if (client_list_changed) {
                             ewmh_watch_windows(); /* start watching any newly-mapped windows */
                         }
-                        uint64_t pn = now_ms();
-                        for (int i = 0; i < MAX_PANELS; i++) {
-                            if (!g_panels[i].in_use) {
-                                continue;
-                            }
-                            for (int j = 0; j < g_panels[i].n_widgets; j++) {
-                                PanelWidget *w = &g_panels[i].widgets[j];
-                                if (w->ops->on_tick && w->next_tick_ms != 0) {
-                                    w->next_tick_ms = pn;
-                                }
-                            }
-                        }
+                        schedule_widget_repoll(now_ms());
                     }
+                } else if (ev.type == ConfigureNotify) {
+                    /* A top-level window moved/resized (SubstructureNotify on
+                     * root) -- the only signal for a window changing output,
+                     * which has no property to watch. Debounced: a drag emits
+                     * a continuous stream, and only the resting position's
+                     * output matters, so coalesce into at most one re-poll
+                     * per WATCH_GEOMETRY_DEBOUNCE_MS. */
+                    schedule_widget_repoll(now_ms() + WATCH_GEOMETRY_DEBOUNCE_MS);
                 }
             }
         }

@@ -457,19 +457,37 @@ void ewmh_watch_windows(void)
         return;
     }
     for (int i = 0; i < n; i++) {
-        /* Additive per-client: doesn't disturb the window's owner or the
-         * WM (each X client has its own independent event mask on a
-         * window), and re-selecting an already-watched window is a
-         * harmless no-op. A window destroyed between the list read and
-         * here just yields a BadWindow the global error handler ignores. */
-        XSelectInput(g_dpy, list[i], PropertyChangeMask);
+        /* XSelectInput *replaces* this client's whole event mask on the
+         * window, it doesn't OR -- so blindly selecting PropertyChangeMask
+         * would wipe any mask we already have there. That matters for our
+         * own dock-mode panel windows, which are WM-managed and so appear
+         * in _NET_CLIENT_LIST: clobbering their ButtonPress/Motion/Enter/
+         * Leave mask down to just PropertyChangeMask killed every panel
+         * click (regression fixed here). Preserve the existing mask and
+         * add PropertyChangeMask to it. XGetWindowAttributes().your_event_
+         * mask is exactly *this* client's current mask on the window (0
+         * for another app's window we've never touched). A window
+         * destroyed in between just yields a BadWindow the global error
+         * handler ignores; skip it if the fetch failed. */
+        XWindowAttributes wa;
+        if (XGetWindowAttributes(g_dpy, list[i], &wa)) {
+            XSelectInput(g_dpy, list[i], wa.your_event_mask | PropertyChangeMask);
+        }
     }
     XFree(list);
 }
 
 void ewmh_watch_init(void)
 {
-    XSelectInput(g_dpy, g_root, PropertyChangeMask);
+    /* PropertyChangeMask: the root properties above. SubstructureNotifyMask:
+     * ConfigureNotify for top-level windows, the only signal for a window
+     * changing *output* (which has no property of its own -- it's derived
+     * from geometry vs the RandR layout). SubstructureNotifyMask is freely
+     * shared (unlike SubstructureRedirectMask, which only the WM holds), so
+     * selecting it here doesn't disturb the window manager. See the
+     * ConfigureNotify handling in xispanel.c (debounced, since a drag emits
+     * a continuous stream of them). */
+    XSelectInput(g_dpy, g_root, PropertyChangeMask | SubstructureNotifyMask);
     ewmh_watch_windows();
 }
 
@@ -489,8 +507,15 @@ int ewmh_property_event_is_relevant(const XPropertyEvent *ev, int *out_client_li
         return a == g_atom_net_active_window || a == g_atom_net_current_desktop ||
                a == g_atom_net_number_of_desktops;
     }
-    /* A watched client window: title or max/min-state change. */
-    return a == g_atom_net_wm_state || a == g_atom_wm_state || a == g_atom_net_wm_name || a == XA_WM_NAME;
+    /* A watched client window: title, max/min-state, or which virtual
+     * desktop it's on (_NET_WM_DESKTOP -- tasklist's same_desktop filter
+     * and desktop badge, winctl/globalmenu's same_desktop filter). Which
+     * *output* a window is on has no property to watch -- it's derived
+     * from the window's geometry against the RandR layout, so an output
+     * change arrives as a ConfigureNotify, not a PropertyNotify; see the
+     * SubstructureNotify handling in xispanel.c. */
+    return a == g_atom_net_wm_state || a == g_atom_wm_state || a == g_atom_net_wm_name || a == XA_WM_NAME ||
+           a == g_atom_net_wm_desktop;
 }
 
 static void ewmh_send_client_message(Window w, Atom message_type, long l0, long l1, long l2, long l3, long l4)
