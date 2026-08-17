@@ -312,6 +312,20 @@ void draw_icon_scaled(cairo_t *cr, cairo_surface_t *icon, double x, double y, do
 void draw_fallback_icon(cairo_t *cr, double x, double y, double size, const char *title, double fg_r, double fg_g,
                          double fg_b);
 void trim_to_width(cairo_t *cr, char *text, size_t bufsz, double max_width);
+/* Trims `s` in place back to its last complete UTF-8 codepoint boundary
+ * -- call after assembling a string by hand (repeated snprintf() calls
+ * into a running offset) in case a write that ran out of room cut the
+ * final multi-byte character in half. */
+void trim_to_utf8_boundary(char *s);
+/* snprintf(dst, dst_sz, "%s", src), but truncates at a UTF-8 codepoint
+ * boundary instead of a raw byte offset if src doesn't fit -- use this
+ * instead of a plain snprintf("%s", ...) whenever copying already-
+ * sanitized UTF-8 text (e.g. a window title) into a *smaller* fixed-size
+ * buffer, so cairo_show_text()/cairo_text_extents() never gets handed a
+ * string cut mid-codepoint (which permanently poisons the cairo_t --
+ * see trim_to_width()'s doc comment in ewmh.c for the real bug this
+ * fixes). */
+void copy_utf8_truncated(char *dst, size_t dst_sz, const char *src);
 /* Resolves a themed icon name (e.g. "folder", or a tray item's IconName)
  * against a fixed grid of common icon-theme paths -- see ewmh.c's doc
  * comment for the tradeoffs. NULL if nothing matched. */

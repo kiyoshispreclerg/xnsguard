@@ -380,10 +380,13 @@ static int tasklist_get_tooltip(PanelWidget *w, int local_x, char *buf, size_t b
                     }
                     used += (size_t)wrote;
                 }
+                /* A snprintf() above that ran out of room could have cut
+                 * the last title mid-codepoint. */
+                trim_to_utf8_boundary(buf);
                 *out_closable = 0;
                 *out_ctx = NULL;
             } else {
-                snprintf(buf, bufsz, "%s", tp->tasks[repr].title);
+                copy_utf8_truncated(buf, bufsz, tp->tasks[repr].title);
                 *out_closable = 1;
                 *out_ctx = (void *)(uintptr_t)tp->tasks[repr].win;
             }
@@ -549,7 +552,7 @@ static void tasklist_paint(PanelWidget *w, cairo_t *cr)
         }
         if (!tp->compact) {
             char label[96];
-            snprintf(label, sizeof(label), "%s", e->title);
+            copy_utf8_truncated(label, sizeof(label), e->title);
             cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.95);
             trim_to_width(cr, label, sizeof(label), bw - icon_px - 16);
             cairo_text_extents_t ext;

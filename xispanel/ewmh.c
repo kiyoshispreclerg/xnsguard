@@ -681,6 +681,83 @@ void draw_fallback_icon(cairo_t *cr, double x, double y, double size, const char
     cairo_restore(cr);
 }
 
+/* Backs `len` up to the start of the UTF-8 codepoint it's currently
+ * inside of (or already at the start of), by skipping past continuation
+ * bytes (10xxxxxx) -- shared by trim_to_width() below and by
+ * trim_to_utf8_boundary()/copy_utf8_truncated(). */
+static size_t back_up_to_codepoint(const char *text, size_t len)
+{
+    while (len > 0 && ((unsigned char)text[len] & 0xC0) == 0x80) {
+        len--;
+    }
+    return len;
+}
+
+/* Trims `s` in place back to its last complete UTF-8 codepoint boundary
+ * -- for a buffer assembled by hand (e.g. repeated snprintf() calls into
+ * a running offset, or a plain "%s" snprintf into a smaller buffer) where
+ * a write that ran out of room could have cut the final multi-byte
+ * character in half, silently leaving invalid UTF-8 that would poison a
+ * cairo_t the next time it's drawn.
+ *
+ * Deliberately not built on back_up_to_codepoint() above: that helper
+ * always drops the *entire* codepoint straddling a given cut position
+ * (the right behavior for trim_to_width(), which is intentionally
+ * shortening the string one whole character at a time). Here we only
+ * want to drop a *trailing* codepoint if it's actually incomplete --
+ * dropping a perfectly valid last character just because the buffer
+ * happened to end exactly there would be wrong. So this walks back to
+ * the last codepoint's own lead byte, works out how many bytes that
+ * lead byte says the codepoint should be, and only truncates if fewer
+ * than that many bytes actually made it into the buffer. */
+void trim_to_utf8_boundary(char *s)
+{
+    size_t len = strlen(s);
+    if (len == 0) {
+        return;
+    }
+    size_t lead = len - 1;
+    while (lead > 0 && ((unsigned char)s[lead] & 0xC0) == 0x80) {
+        lead--;
+    }
+    unsigned char c = (unsigned char)s[lead];
+    size_t expected;
+    if (c < 0x80) {
+        expected = 1;
+    } else if ((c & 0xE0) == 0xC0) {
+        expected = 2;
+    } else if ((c & 0xF0) == 0xE0) {
+        expected = 3;
+    } else if ((c & 0xF8) == 0xF0) {
+        expected = 4;
+    } else {
+        expected = 1; /* not a valid lead byte at all -- drop it too */
+    }
+    if (len - lead < expected) {
+        s[lead] = 0;
+    }
+}
+
+/* Same as snprintf(dst, dst_sz, "%s", src), but if src has to be cut to
+ * fit, cuts at a UTF-8 codepoint boundary instead of a raw byte offset --
+ * a plain "%s" snprintf can slice a multi-byte character in half. This is
+ * the fix for a real bug: window titles are already sanitized to valid
+ * UTF-8 by the time they reach a widget (see sanitize_utf8() above), but
+ * copying one into a *smaller* fixed-size stack buffer with a plain
+ * snprintf (e.g. tasklist's per-button label, copied from a 128-byte
+ * title into a smaller on-stack scratch buffer) can still truncate mid-
+ * codepoint -- easy to hit with dense multi-byte text (a long CJK window
+ * title was the real-world trigger) even though pure-ASCII titles never
+ * come close to it. */
+void copy_utf8_truncated(char *dst, size_t dst_sz, const char *src)
+{
+    if (dst_sz == 0) {
+        return;
+    }
+    snprintf(dst, dst_sz, "%s", src);
+    trim_to_utf8_boundary(dst);
+}
+
 /* Trims `text` in place (respecting `bufsz`) and appends an ellipsis
  * until it fits within max_width at cr's current font. */
 void trim_to_width(cairo_t *cr, char *text, size_t bufsz, double max_width)
@@ -690,22 +767,37 @@ void trim_to_width(cairo_t *cr, char *text, size_t bufsz, double max_width)
     if (max_width <= 0 || ext.x_advance <= max_width) {
         return;
     }
+    /* Reserve room for the 3-byte ellipsis (U+2026 is \xe2\x80\xa6) plus
+     * its NUL inside `bufsz` up front, so neither snprintf below can ever
+     * need to truncate -- previously the ellipsis was appended into a
+     * fixed-size local scratch buffer and then copied back with a plain
+     * "%s" snprintf, both byte-oriented cuts with no UTF-8 awareness: a
+     * `text` long enough to land within 3 bytes of the buffer's end (easy
+     * with dense multi-byte text -- a long Japanese window title was the
+     * real-world trigger) could have the ellipsis itself sliced in half,
+     * handing cairo_text_extents()/cairo_show_text() invalid UTF-8 and
+     * poisoning the whole cairo_t for every draw call after it. */
     size_t len = strlen(text);
+    size_t max_len = bufsz > 4 ? bufsz - 4 : 0;
+    if (len > max_len) {
+        len = back_up_to_codepoint(text, max_len);
+        text[len] = 0;
+    }
     while (len > 0) {
         len--;
         /* Don't stop mid-codepoint: back up past any UTF-8 continuation
-         * bytes (10xxxxxx) too, so we never truncate to an incomplete
-         * multi-byte sequence -- cairo_text_extents() below would reject
-         * that as invalid UTF-8 and poison `cr` for every draw after it,
-         * not just this one. */
-        while (len > 0 && ((unsigned char)text[len] & 0xC0) == 0x80) {
-            len--;
-        }
+         * bytes too, so we never truncate to an incomplete multi-byte
+         * sequence -- cairo_text_extents() below would reject that as
+         * invalid UTF-8 and poison `cr` for every draw after it, not
+         * just this one. */
+        len = back_up_to_codepoint(text, len);
         text[len] = 0;
-        char trimmed[128];
+        char trimmed[256];
         snprintf(trimmed, sizeof(trimmed), "%s\xe2\x80\xa6", text); /* U+2026 HORIZONTAL ELLIPSIS */
         cairo_text_extents(cr, trimmed, &ext);
         if (ext.x_advance <= max_width) {
+            /* Always fits: len <= bufsz-4, plus the 3-byte ellipsis and a
+             * NUL is at most bufsz bytes. */
             snprintf(text, bufsz, "%s", trimmed);
             return;
         }
