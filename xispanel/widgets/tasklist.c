@@ -276,9 +276,9 @@ static void tasklist_measure(PanelWidget *w, int cross_axis, int *out_len, int *
         if (tp->compact) {
             bw = icon_px + 8;
         } else {
-            cairo_text_extents_t ext;
-            cairo_text_extents(p->cr, e->title, &ext);
-            bw = icon_px + 8 + (int)ext.x_advance + 8;
+            double tw;
+            pango_text_extents_ellipsized(p->cr, e->title, panel_text_size(p), 0, &tw, NULL);
+            bw = icon_px + 8 + (int)tw + 8;
             if (bw > TASKLIST_WIDE_MAXW) {
                 bw = TASKLIST_WIDE_MAXW;
             }
@@ -548,7 +548,7 @@ static void tasklist_paint(PanelWidget *w, cairo_t *cr)
         if (e->icon) {
             draw_icon_scaled(cr, e->icon, bx + 4, icon_y, icon_px);
         } else {
-            draw_fallback_icon(cr, bx + 4, icon_y, icon_px, e->title, p->fg_r, p->fg_g, p->fg_b);
+            draw_fallback_icon(cr, bx + 4, icon_y, icon_px, e->title, p->fg_r, p->fg_g, p->fg_b, panel_text_size(p));
         }
         if (!tp->compact) {
             /* Pango draws e->title directly -- no manual truncation

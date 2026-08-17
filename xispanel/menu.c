@@ -224,10 +224,6 @@ static void paint_frame(PanelMenu *m, MenuFrame *f)
     cairo_set_source_rgba(cr, p->bg_r, p->bg_g, p->bg_b, p->bg_a);
     cairo_paint(cr);
     cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
-    if (g_font_face) {
-        cairo_set_font_face(cr, g_font_face);
-    }
-    cairo_set_font_size(cr, m->font_size);
 
     for (int row = 0; row < f->visible_rows; row++) {
         int y = row * m->item_h;
@@ -276,10 +272,7 @@ static void paint_frame(PanelMenu *m, MenuFrame *f)
             cairo_fill(cr);
         }
         cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, it->enabled ? 0.95 : 0.4);
-        cairo_text_extents_t ext;
-        cairo_text_extents(cr, it->label, &ext);
-        cairo_move_to(cr, 10, y + (m->item_h - ext.height) / 2.0 - ext.y_bearing);
-        cairo_show_text(cr, it->label);
+        pango_show_text_boxed(cr, 10, y, m->item_h, 0, m->font_size, it->label, NULL);
 
         if (m->has_children[idx]) {
             double ax = f->width - MENU_ARROW_RESERVE + 4;
@@ -373,10 +366,6 @@ static int measure_frame_width(PanelMenu *m, const int *idx, int n)
 {
     cairo_surface_t *probe_surf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
     cairo_t *probe_cr = cairo_create(probe_surf);
-    if (g_font_face) {
-        cairo_set_font_face(probe_cr, g_font_face);
-    }
-    cairo_set_font_size(probe_cr, m->font_size);
     int max_w = 80;
     int any_children = 0;
     for (int i = 0; i < n; i++) {
@@ -387,9 +376,9 @@ static int measure_frame_width(PanelMenu *m, const int *idx, int n)
         if (m->has_children[fi]) {
             any_children = 1;
         }
-        cairo_text_extents_t ext;
-        cairo_text_extents(probe_cr, m->items[fi].label, &ext);
-        int w = (int)ext.x_advance + 20;
+        double tw;
+        pango_text_extents_ellipsized(probe_cr, m->items[fi].label, m->font_size, 0, &tw, NULL);
+        int w = (int)tw + 20;
         if (w > max_w) {
             max_w = w;
         }

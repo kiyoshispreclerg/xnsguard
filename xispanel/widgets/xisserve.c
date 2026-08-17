@@ -104,7 +104,7 @@ static void xisserve_paint(PanelWidget *w, cairo_t *cr)
     if (xp->icon) {
         draw_icon_scaled(cr, xp->icon, icon_x, icon_y, icon_px);
     } else {
-        draw_fallback_icon(cr, icon_x, icon_y, icon_px, xp->name, p->fg_r, p->fg_g, p->fg_b);
+        draw_fallback_icon(cr, icon_x, icon_y, icon_px, xp->name, p->fg_r, p->fg_g, p->fg_b, panel_text_size(p));
     }
 }
 

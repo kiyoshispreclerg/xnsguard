@@ -90,8 +90,8 @@ static void tray_paint(PanelWidget *w, cairo_t *cr)
         if (icon) {
             draw_icon_scaled(cr, icon, bx, icon_y, icon_px);
         } else {
-            draw_fallback_icon(cr, bx, icon_y, icon_px, sni_title(i), w->panel->fg_r, w->panel->fg_g,
-                                w->panel->fg_b);
+            draw_fallback_icon(cr, bx, icon_y, icon_px, sni_title(i), w->panel->fg_r, w->panel->fg_g, w->panel->fg_b,
+                                panel_text_size(w->panel));
         }
     }
 }

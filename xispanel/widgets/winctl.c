@@ -323,13 +323,12 @@ static void winctl_measure(PanelWidget *w, int cross_axis, int *out_len, int *ou
     int icon_px = cross_axis > 8 ? cross_axis - 8 : 16;
     int len = 8 + icon_px + 8;
     if (wp->title[0]) {
-        cairo_text_extents_t ext;
-        cairo_text_extents(p->cr, wp->title, &ext);
-        int tw = (int)ext.x_advance;
+        double tw;
+        pango_text_extents_ellipsized(p->cr, wp->title, panel_text_size(p), 0, &tw, NULL);
         if (tw > 220) {
             tw = 220;
         }
-        len += tw + 8;
+        len += (int)tw + 8;
     }
     int show_buttons = wp->show_always || wp->maximized;
     if (show_buttons) {
@@ -373,12 +372,10 @@ static void winctl_paint(PanelWidget *w, cairo_t *cr)
         widget_get_rect(w, &ox, &oy, &owidth, &oheight);
         (void)oheight;
         cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.95);
-        trim_to_width(cr, text, sizeof(text), owidth - 16);
-        cairo_text_extents_t ext;
-        cairo_text_extents(cr, text, &ext);
-        cairo_move_to(cr, ox + (owidth - ext.width) / 2.0 - ext.x_bearing,
-                      oy + (w->thickness - ext.height) / 2.0 - ext.y_bearing);
-        cairo_show_text(cr, text);
+        double tw;
+        pango_text_extents_ellipsized(cr, text, panel_text_size(p), owidth - 16, &tw, NULL);
+        pango_show_text_boxed(cr, ox + (owidth - tw) / 2.0, oy, w->thickness, owidth - 16, panel_text_size(p), text,
+                               NULL);
         return;
     }
 
@@ -400,24 +397,18 @@ static void winctl_paint(PanelWidget *w, cairo_t *cr)
     if (wp->icon) {
         draw_icon_scaled(cr, wp->icon, tx, icon_y, icon_px);
     } else {
-        draw_fallback_icon(cr, tx, icon_y, icon_px, wp->title, p->fg_r, p->fg_g, p->fg_b);
+        draw_fallback_icon(cr, tx, icon_y, icon_px, wp->title, p->fg_r, p->fg_g, p->fg_b, panel_text_size(p));
     }
     tx += icon_px + 8;
 
     /* When width= is tight enough that icon+buttons alone eat the whole
      * fixed width, there's no room left for any title text at all --
-     * trim_to_width() leaves a string untouched when max_width <= 0
-     * (nothing to shrink *to*), so skip drawing entirely rather than
-     * overflow into the buttons. */
+     * pango_show_text_boxed() with max_width_px <= 0 just skips
+     * ellipsizing rather than shrinking to nothing, so still skip
+     * drawing entirely rather than overflow into the buttons. */
     if (wp->title[0] && content_end - tx - 8 > 0) {
-        char label[160];
-        snprintf(label, sizeof(label), "%s", wp->title);
         cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.95);
-        trim_to_width(cr, label, sizeof(label), content_end - tx - 8);
-        cairo_text_extents_t ext;
-        cairo_text_extents(cr, label, &ext);
-        cairo_move_to(cr, tx, oy + (w->thickness - ext.height) / 2.0 - ext.y_bearing);
-        cairo_show_text(cr, label);
+        pango_show_text_boxed(cr, tx, oy, w->thickness, content_end - tx - 8, panel_text_size(p), wp->title, NULL);
     }
 
     cairo_set_line_width(cr, 1.4);

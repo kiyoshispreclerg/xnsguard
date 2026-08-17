@@ -329,10 +329,10 @@ static int measure_lines(cairo_t *cr, double font_size, char lines[TOOLTIP_MAX_L
     double line_h = font_size * 1.4;
     int max_w = 0;
     for (int i = 0; i < n; i++) {
-        cairo_text_extents_t ext;
-        cairo_text_extents(cr, lines[i], &ext);
-        if ((int)ext.x_advance > max_w) {
-            max_w = (int)ext.x_advance;
+        double lw;
+        pango_text_extents_ellipsized(cr, lines[i], font_size, 0, &lw, NULL);
+        if ((int)lw > max_w) {
+            max_w = (int)lw;
         }
     }
     *out_text_w = max_w;
@@ -347,17 +347,12 @@ static void paint_popup_group(void)
 {
     Panel *p = g_panel;
     cairo_t *cr = g_popup->back_cr;
-    if (g_font_face) {
-        cairo_set_font_face(cr, g_font_face);
-    }
-    cairo_set_font_size(cr, tooltip_font_size());
 
     for (int i = 0; i < g_popup->group_shown_n; i++) {
         int ix = g_popup->group_item_x[i];
         int iy = g_popup->group_item_y[i];
         int ih = g_popup->group_item_h[i];
-        char title[128];
-        snprintf(title, sizeof(title), "%s", g_group_items[i].title);
+        const char *title = g_group_items[i].title;
 
         if (g_popup->group_thumbs) {
             if (!thumb_paint(cr, g_group_items[i].win, ix, iy, GROUP_THUMB_W, GROUP_THUMB_H)) {
@@ -369,22 +364,12 @@ static void paint_popup_group(void)
             /* Leave room for the close icon at the row's right edge -- title
              * is left-aligned in what's left, not centered under the whole
              * thumbnail, so it never runs under the icon. */
-            trim_to_width(cr, title, sizeof(title), GROUP_THUMB_W - TOOLTIP_CLOSE_ICON - 8);
-            cairo_text_extents_t ext;
-            cairo_text_extents(cr, title, &ext);
             double row_y = iy + GROUP_THUMB_H;
-            double tx = ix - ext.x_bearing;
-            double ty = row_y + (GROUP_TITLE_ROW_H - ext.height) / 2.0 - ext.y_bearing;
-            cairo_move_to(cr, tx, ty);
-            cairo_show_text(cr, title);
+            pango_show_text_boxed(cr, ix, row_y, GROUP_TITLE_ROW_H, GROUP_THUMB_W - TOOLTIP_CLOSE_ICON - 8,
+                                   tooltip_font_size(), title, NULL);
         } else {
             cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.95);
-            trim_to_width(cr, title, sizeof(title), GROUP_TITLE_MAXW);
-            cairo_text_extents_t ext;
-            cairo_text_extents(cr, title, &ext);
-            double ty = iy + (ih - ext.height) / 2.0 - ext.y_bearing;
-            cairo_move_to(cr, ix, ty);
-            cairo_show_text(cr, title);
+            pango_show_text_boxed(cr, ix, iy, ih, GROUP_TITLE_MAXW, tooltip_font_size(), title, NULL);
         }
 
         double cx = g_popup->group_close_x[i], cy = g_popup->group_close_y[i];
@@ -404,14 +389,12 @@ static void paint_popup_group(void)
         char more[32];
         snprintf(more, sizeof(more), "+%d mais", g_popup->group_more);
         cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.6);
-        cairo_text_extents_t ext;
-        cairo_text_extents(cr, more, &ext);
         int ix = g_popup->group_item_x[i], iy = g_popup->group_item_y[i];
         int iw = g_popup->group_item_w[i], ih = g_popup->group_item_h[i];
-        double tx = ix + (iw - ext.width) / 2.0 - ext.x_bearing;
-        double ty = iy + (ih - ext.height) / 2.0 - ext.y_bearing;
-        cairo_move_to(cr, tx, ty);
-        cairo_show_text(cr, more);
+        double tw;
+        pango_text_extents_ellipsized(cr, more, tooltip_font_size(), 0, &tw, NULL);
+        double tx = ix + (iw - tw) / 2.0;
+        pango_show_text_boxed(cr, tx, iy, ih, 0, tooltip_font_size(), more, NULL);
     }
 }
 
@@ -465,10 +448,6 @@ static void paint_popup(void)
     }
 
     double fsz = tooltip_font_size();
-    if (g_font_face) {
-        cairo_set_font_face(cr, g_font_face);
-    }
-    cairo_set_font_size(cr, fsz);
 
     char lines[TOOLTIP_MAX_LINES][128];
     int text_w, h;
@@ -478,11 +457,8 @@ static void paint_popup(void)
 
     cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, p->fg_a);
     for (int i = 0; i < n; i++) {
-        cairo_text_extents_t ext;
-        cairo_text_extents(cr, lines[i], &ext);
-        double ty = content_y0 + TOOLTIP_PAD_Y + i * line_h + (line_h - ext.height) / 2.0 - ext.y_bearing;
-        cairo_move_to(cr, TOOLTIP_PAD_X, ty);
-        cairo_show_text(cr, lines[i]);
+        double ty = content_y0 + TOOLTIP_PAD_Y + i * line_h;
+        pango_show_text_boxed(cr, TOOLTIP_PAD_X, ty, line_h, 0, fsz, lines[i], NULL);
     }
 
     if (g_closable) {
@@ -677,27 +653,23 @@ static void show_popup_group_layout(TooltipPopup *pop)
 
     cairo_surface_t *probe_surf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
     cairo_t *probe_cr = cairo_create(probe_surf);
-    if (g_font_face) {
-        cairo_set_font_face(probe_cr, g_font_face);
-    }
-    cairo_set_font_size(probe_cr, tooltip_font_size());
 
     int cell_w, cell_h;
     if (pop->group_thumbs) {
         cell_w = GROUP_THUMB_W;
         cell_h = GROUP_THUMB_H + GROUP_TITLE_ROW_H;
     } else {
-        /* Widest title across every member (capped), so every row's close
-         * icon lines up in the same column. */
+        /* Widest title across every member (capped to GROUP_TITLE_MAXW,
+         * same width pango_show_text_boxed() below will ellipsize each
+         * row's own title into), so every row's close icon lines up in
+         * the same column. */
         int max_tw = 0;
         for (int i = 0; i < g_group_n; i++) {
-            char t[128];
-            snprintf(t, sizeof(t), "%s", g_group_items[i].title);
-            trim_to_width(probe_cr, t, sizeof(t), GROUP_TITLE_MAXW);
-            cairo_text_extents_t ext;
-            cairo_text_extents(probe_cr, t, &ext);
-            if ((int)ext.x_advance > max_tw) {
-                max_tw = (int)ext.x_advance;
+            double tw;
+            pango_text_extents_ellipsized(probe_cr, g_group_items[i].title, tooltip_font_size(), GROUP_TITLE_MAXW,
+                                           &tw, NULL);
+            if ((int)tw > max_tw) {
+                max_tw = (int)tw;
             }
         }
         cell_w = max_tw + 10 + TOOLTIP_CLOSE_ICON + 6;

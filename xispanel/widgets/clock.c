@@ -93,9 +93,9 @@ static void clock_measure(PanelWidget *w, int cross_axis, int *out_len, int *out
     ClockPriv *cp = w->priv;
     Panel *p = w->panel;
     const char *sample = cp->text[0] ? cp->text : "00:00";
-    cairo_text_extents_t ext;
-    cairo_text_extents(p->cr, sample, &ext);
-    *out_len = (int)ext.x_advance + 16;
+    double tw;
+    pango_text_extents_ellipsized(p->cr, sample, panel_text_size(p), 0, &tw, NULL);
+    *out_len = (int)tw + 16;
     *out_min_len = *out_len; /* a clipped clock is worse than useless -- don't shrink it */
 }
 
@@ -148,12 +148,10 @@ static void clock_paint(PanelWidget *w, cairo_t *cr)
     widget_get_rect(w, &x, &y, &width, &height);
 
     cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, p->fg_a);
-    cairo_text_extents_t ext;
-    cairo_text_extents(cr, cp->text, &ext);
-    double tx = x + (width - ext.width) / 2.0 - ext.x_bearing;
-    double ty = y + (height - ext.height) / 2.0 - ext.y_bearing;
-    cairo_move_to(cr, tx, ty);
-    cairo_show_text(cr, cp->text);
+    double tw;
+    pango_text_extents_ellipsized(cr, cp->text, panel_text_size(p), 0, &tw, NULL);
+    double tx = x + (width - tw) / 2.0;
+    pango_show_text_boxed(cr, tx, y, height, 0, panel_text_size(p), cp->text, NULL);
 }
 
 const PanelWidgetOps clock_ops = {

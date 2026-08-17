@@ -665,7 +665,7 @@ static void first_utf8_char(const char *s, char *out, size_t outsz)
 }
 
 void draw_fallback_icon(cairo_t *cr, double x, double y, double size, const char *title, double fg_r, double fg_g,
-                         double fg_b)
+                         double fg_b, double font_size_px)
 {
     cairo_save(cr);
     cairo_set_source_rgba(cr, fg_r, fg_g, fg_b, 0.22);
@@ -674,10 +674,9 @@ void draw_fallback_icon(cairo_t *cr, double x, double y, double size, const char
     char letter[8];
     first_utf8_char(title, letter, sizeof(letter));
     cairo_set_source_rgba(cr, fg_r, fg_g, fg_b, 0.9);
-    cairo_text_extents_t ext;
-    cairo_text_extents(cr, letter, &ext);
-    cairo_move_to(cr, x + (size - ext.width) / 2.0 - ext.x_bearing, y + (size - ext.height) / 2.0 - ext.y_bearing);
-    cairo_show_text(cr, letter);
+    double tw;
+    pango_text_extents_ellipsized(cr, letter, font_size_px, 0, &tw, NULL);
+    pango_show_text_boxed(cr, x + (size - tw) / 2.0, y, size, 0, font_size_px, letter, NULL);
     cairo_restore(cr);
 }
 

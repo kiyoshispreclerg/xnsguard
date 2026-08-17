@@ -268,9 +268,9 @@ static void globalmenu_layout(PanelWidget *w)
     Panel *p = w->panel;
     int x = 0;
     for (int i = 0; i < gp->n_top; i++) {
-        cairo_text_extents_t ext;
-        cairo_text_extents(p->cr, gp->top_items[i].label, &ext);
-        int bw = (int)ext.x_advance + GLOBALMENU_ITEM_PAD * 2;
+        double tw;
+        pango_text_extents_ellipsized(p->cr, gp->top_items[i].label, panel_text_size(p), 0, &tw, NULL);
+        int bw = (int)tw + GLOBALMENU_ITEM_PAD * 2;
         gp->btn_x[i] = x;
         gp->btn_w[i] = bw;
         x += bw;
@@ -336,12 +336,10 @@ static void globalmenu_paint(PanelWidget *w, cairo_t *cr)
             cairo_fill(cr);
             cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.95);
         }
-        cairo_text_extents_t ext;
-        cairo_text_extents(cr, gp->top_items[i].label, &ext);
-        double tx = ox + gp->btn_x[i] + (gp->btn_w[i] - ext.width) / 2.0 - ext.x_bearing;
-        double ty = oy + (oheight - ext.height) / 2.0 - ext.y_bearing;
-        cairo_move_to(cr, tx, ty);
-        cairo_show_text(cr, gp->top_items[i].label);
+        double tw;
+        pango_text_extents_ellipsized(cr, gp->top_items[i].label, panel_text_size(p), 0, &tw, NULL);
+        double tx = ox + gp->btn_x[i] + (gp->btn_w[i] - tw) / 2.0;
+        pango_show_text_boxed(cr, tx, oy, oheight, 0, panel_text_size(p), gp->top_items[i].label, NULL);
     }
 }
 

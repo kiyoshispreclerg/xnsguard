@@ -242,10 +242,13 @@ extern char g_font_family[128];
 
 /* ---- Pango-backed text drawing (pango_text.c, exploratory) ----
  *
- * See pango_text.c's file comment. Not yet used everywhere -- only
- * tasklist.c's per-button label so far, as a proof of concept for the
- * xispanel-plus-pango branch. */
+ * See pango_text.c's file comment -- xispanel-plus-pango branch only. */
 void pango_text_init(const char *family); /* call once at startup, after g_font_family is resolved */
+/* Measures `text` (ellipsized to max_width_px first if positive) without
+ * drawing -- use ahead of a pango_show_text_boxed() call when the final
+ * pixel size is needed to position the text itself (e.g. centering). */
+void pango_text_extents_ellipsized(cairo_t *cr, const char *text, double size_px, double max_width_px, double *out_w,
+                                    double *out_h);
 void pango_show_text_boxed(cairo_t *cr, double x, double top_y, double box_h, double max_width_px, double size_px,
                             const char *text, double *out_w);
 
@@ -319,7 +322,7 @@ cairo_surface_t *ewmh_get_icon_surface(Window w, int target_size); /* NULL if no
 int icon_size_for(int thickness, int padding); /* shared by tasklist/tray's icon_padding= */
 void draw_icon_scaled(cairo_t *cr, cairo_surface_t *icon, double x, double y, double size);
 void draw_fallback_icon(cairo_t *cr, double x, double y, double size, const char *title, double fg_r, double fg_g,
-                         double fg_b);
+                         double fg_b, double font_size_px);
 void trim_to_width(cairo_t *cr, char *text, size_t bufsz, double max_width);
 /* Trims `s` in place back to its last complete UTF-8 codepoint boundary
  * -- call after assembling a string by hand (repeated snprintf() calls
