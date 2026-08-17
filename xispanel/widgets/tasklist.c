@@ -83,7 +83,48 @@ typedef struct {
     int n_visible;
     int scrollable; /* 1 if not everything fits and the arrow pair is shown */
     int arrow_x; /* local x of the up/down arrow pair, valid iff scrollable */
+
+    /* Signature of everything tasklist_paint() draws that can change on
+     * its own between ticks (the task set, the active-window highlight,
+     * the desktop count) -- compared each tick so on_tick only asks for a
+     * repaint when it actually differs, instead of repainting every
+     * ~800ms unconditionally. Scroll offset / pinned toggles change only
+     * on user interaction, which repaints through the button path, so
+     * they don't need to drive this. */
+    unsigned long last_sig;
 } TasklistPriv;
+
+/* FNV-1a over the drawn task state -- see TasklistPriv::last_sig. */
+static unsigned long tasklist_display_sig(TasklistPriv *tp, Window active)
+{
+    unsigned long h = 1469598103934665603UL;
+#define SIG_MIX(byte) (h = (h ^ (unsigned char)(byte)) * 1099511628211UL)
+#define SIG_MIX_INT(v)                                                                                                \
+    do {                                                                                                             \
+        unsigned long _v = (unsigned long)(v);                                                                       \
+        for (unsigned _k = 0; _k < sizeof(_v); _k++)                                                                 \
+            SIG_MIX(_v >> (_k * 8));                                                                                 \
+    } while (0)
+    SIG_MIX_INT(tp->n_tasks);
+    SIG_MIX_INT(tp->n_desktops);
+    SIG_MIX_INT(active);
+    for (int i = 0; i < tp->n_tasks; i++) {
+        TaskEntry *e = &tp->tasks[i];
+        SIG_MIX_INT(e->win);
+        for (const char *s = e->title; *s; s++) {
+            SIG_MIX(*s);
+        }
+        SIG_MIX(0xff); /* title terminator */
+        SIG_MIX_INT(e->desktop);
+        SIG_MIX(e->minimized);
+        SIG_MIX(e->maximized);
+        SIG_MIX(e->pinned);
+        SIG_MIX_INT((uintptr_t)e->icon);
+    }
+#undef SIG_MIX
+#undef SIG_MIX_INT
+    return h;
+}
 
 static int tasklist_find(TasklistPriv *tp, Window win)
 {
@@ -194,12 +235,14 @@ static int tasklist_on_tick(PanelWidget *w, uint64_t now)
     tp->n_tasks = n_fresh;
     tp->n_desktops = ewmh_get_number_of_desktops();
 
-    /* TODO(idle-cpu slice 2): return 1 unconditionally for now, so
-     * tasklist still repaints every 800ms even when nothing changed --
-     * the one remaining periodic repaint after slice 1. Change detection
-     * here needs to cover the task set (win/title/desktop/min/max/icon),
-     * the active-window highlight, and n_desktops; deferred to keep this
-     * slice small and testable. */
+    /* Repaint only when the drawn task state actually changed -- the
+     * active window (highlight) is fetched here purely for the signature,
+     * matching what tasklist_paint() reads. */
+    unsigned long sig = tasklist_display_sig(tp, ewmh_get_active_window());
+    if (sig == tp->last_sig) {
+        return 0;
+    }
+    tp->last_sig = sig;
     return 1;
 }
 
