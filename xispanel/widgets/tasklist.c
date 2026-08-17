@@ -551,14 +551,15 @@ static void tasklist_paint(PanelWidget *w, cairo_t *cr)
             draw_fallback_icon(cr, bx + 4, icon_y, icon_px, e->title, p->fg_r, p->fg_g, p->fg_b);
         }
         if (!tp->compact) {
-            char label[96];
-            copy_utf8_truncated(label, sizeof(label), e->title);
+            /* Pango draws e->title directly -- no manual truncation
+             * buffer needed, it ellipsizes to fit on its own, and (unlike
+             * the plain cairo_show_text() this replaced) does per-glyph
+             * font fallback, so a title in a script the configured UI
+             * font doesn't cover still renders instead of showing tofu
+             * boxes. See pango_text.c. */
             cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.95);
-            trim_to_width(cr, label, sizeof(label), bw - icon_px - 16);
-            cairo_text_extents_t ext;
-            cairo_text_extents(cr, label, &ext);
-            cairo_move_to(cr, bx + icon_px + 10, oy + (w->thickness - ext.height) / 2.0 - ext.y_bearing);
-            cairo_show_text(cr, label);
+            pango_show_text_boxed(cr, bx + icon_px + 10, oy, w->thickness, bw - icon_px - 16, panel_text_size(p),
+                                   e->title, NULL);
         }
         if (e->pinned) {
             cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.9);

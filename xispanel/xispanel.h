@@ -240,6 +240,15 @@ extern cairo_font_face_t *g_font_face;
  * passing it through so the launcher popup can match. */
 extern char g_font_family[128];
 
+/* ---- Pango-backed text drawing (pango_text.c, exploratory) ----
+ *
+ * See pango_text.c's file comment. Not yet used everywhere -- only
+ * tasklist.c's per-button label so far, as a proof of concept for the
+ * xispanel-plus-pango branch. */
+void pango_text_init(const char *family); /* call once at startup, after g_font_family is resolved */
+void pango_show_text_boxed(cairo_t *cr, double x, double top_y, double box_h, double max_width_px, double size_px,
+                            const char *text, double *out_w);
+
 /* ---- small helpers widgets rely on (xispanel.c) ---- */
 uint64_t now_ms(void);
 int kv_get(const char *kvline, const char *key, char *out, size_t outsz);

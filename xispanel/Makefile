@@ -1,5 +1,11 @@
 CFLAGS ?= -Wall -Wextra -O2
-PKGS := x11 xrandr cairo cairo-xlib imlib2 freetype2 fontconfig
+# pango/pangocairo: exploratory, branch xispanel-plus-pango only -- see
+# pango_text.c's file comment. Pulls GLib into xispanel's own process for
+# the first time, a real departure from this project's "no toolkit"
+# design elsewhere -- not made build-optional (unlike xcomposite/xtst
+# above) because this branch's whole point is deciding whether that
+# tradeoff is worth it, not shipping a graceful-degradation path yet.
+PKGS := x11 xrandr cairo cairo-xlib imlib2 freetype2 fontconfig pango pangocairo
 
 # dbus-1 (mpris.c/sni.c's MPRIS media controls + system tray, dbusmenu.c's
 # shared com.canonical.dbusmenu client used by both sni.c and the
@@ -70,7 +76,7 @@ LDLIBS := $(shell pkg-config --libs $(PKGS)) $(THUMB_LDLIBS) $(MODTAP_LDLIBS) -l
 PREFIX ?= /usr/local
 BINDIR := $(PREFIX)/bin
 
-SRCS := xispanel.c ewmh.c menu.c tooltip.c hotkey.c $(MODTAP_SRCS) pulse.c $(DBUS_SRCS) $(THUMB_SRCS) widgets/spacer.c widgets/clock.c widgets/tasklist.c widgets/winctl.c widgets/tray.c widgets/launcher.c widgets/volume.c widgets/globalmenu.c widgets/folder.c widgets/xisserve.c
+SRCS := xispanel.c ewmh.c menu.c tooltip.c hotkey.c $(MODTAP_SRCS) pulse.c pango_text.c $(DBUS_SRCS) $(THUMB_SRCS) widgets/spacer.c widgets/clock.c widgets/tasklist.c widgets/winctl.c widgets/tray.c widgets/launcher.c widgets/volume.c widgets/globalmenu.c widgets/folder.c widgets/xisserve.c
 OBJS := $(SRCS:.c=.o)
 
 xispanel: $(OBJS)

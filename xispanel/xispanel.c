@@ -1915,6 +1915,7 @@ static int run_as_daemon(const char *sockpath)
     } else if (g_font_family[0]) {
         fprintf(stderr, "xispanel: using system font '%s'\n", g_font_family);
     }
+    pango_text_init(g_font_family);
 
     ewmh_init_atoms();
     modtap_init(); /* bare-modifier ("tap Meta alone") hotkeys, see hotkey.c/modtap.c */
