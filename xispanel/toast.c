@@ -24,7 +24,11 @@
 #include <stdio.h>
 #include <string.h>
 
-#define TOAST_MAX 5
+/* Hard upper bound on the array itself -- the *actual* number shown at
+ * once is computed dynamically from the usable screen height (see
+ * toast_capacity() below), never a fixed count. This is just generous
+ * headroom no real screen height could plausibly exceed. */
+#define TOAST_ARRAY_CAP 32
 #define TOAST_W 320
 #define TOAST_H 72
 #define TOAST_PAD 12
@@ -60,7 +64,7 @@ typedef struct {
     cairo_surface_t *icon;
 } Toast;
 
-static Toast g_toasts[TOAST_MAX];
+static Toast g_toasts[TOAST_ARRAY_CAP];
 static int g_n = 0;
 static ToastCorner g_corner = TOAST_CORNER_BOTTOM_RIGHT;
 
@@ -87,19 +91,60 @@ static void ensure_visual(void)
     }
 }
 
+/* The rectangle toasts are allowed to occupy: _NET_WORKAREA for the
+ * current desktop (the WM's own "full screen minus every dock/panel's
+ * strut" rect) when a WM maintains it, falling back to the raw display
+ * size otherwise (the previous, panel-unaware behavior) -- see
+ * ewmh_get_workarea()'s doc comment. Re-read on every call rather than
+ * cached: it's cheap (one XGetWindowProperty), and a panel being added/
+ * removed/resized should be reflected the next time it matters (a new
+ * toast arriving) without any extra plumbing to invalidate a cache. */
+static void toast_area(int *out_x, int *out_y, int *out_w, int *out_h)
+{
+    if (!ewmh_get_workarea(out_x, out_y, out_w, out_h)) {
+        *out_x = 0;
+        *out_y = 0;
+        *out_w = DisplayWidth(g_dpy, g_screen);
+        *out_h = DisplayHeight(g_dpy, g_screen);
+    }
+}
+
+/* How many toasts fit stacked in the current toast_area() without any of
+ * them spilling past its far edge -- see the file comment on why this
+ * replaces a fixed count. Always >= 1: a single toast is let through even
+ * if it technically overflows a tiny/unusual workarea, same "never just
+ * silently show nothing" spirit as the rest of xispanel's degrade-
+ * gracefully helpers. */
+static int toast_capacity(void)
+{
+    int ax, ay, aw, ah;
+    toast_area(&ax, &ay, &aw, &ah);
+    (void)ax;
+    (void)ay;
+    (void)aw;
+    int usable = ah - 2 * TOAST_MARGIN;
+    if (usable < TOAST_H) {
+        return 1;
+    }
+    int cap = 1 + (usable - TOAST_H) / (TOAST_H + TOAST_GAP);
+    return cap < 1 ? 1 : cap;
+}
+
 /* Screen position for the toast currently at array index `idx` (0 =
  * oldest) -- the newest toast (index g_n-1) sits closest to g_corner,
  * older ones stacked away from it along the screen's vertical edge (up
- * from a bottom corner, down from a top corner). */
+ * from a bottom corner, down from a top corner). Positioned within
+ * toast_area() (the WM's workarea when available), not the raw screen,
+ * so toasts never sit under another panel/dock either. */
 static void toast_screen_pos(int idx, int *out_x, int *out_y)
 {
     int from_corner = g_n - 1 - idx;
-    int sw = DisplayWidth(g_dpy, g_screen);
-    int sh = DisplayHeight(g_dpy, g_screen);
+    int ax, ay, aw, ah;
+    toast_area(&ax, &ay, &aw, &ah);
     int at_left = (g_corner == TOAST_CORNER_TOP_LEFT || g_corner == TOAST_CORNER_BOTTOM_LEFT);
     int at_top = (g_corner == TOAST_CORNER_TOP_LEFT || g_corner == TOAST_CORNER_TOP_RIGHT);
-    *out_x = at_left ? TOAST_MARGIN : sw - TOAST_MARGIN - TOAST_W;
-    int base_y = at_top ? TOAST_MARGIN : sh - TOAST_MARGIN - TOAST_H;
+    *out_x = at_left ? ax + TOAST_MARGIN : ax + aw - TOAST_MARGIN - TOAST_W;
+    int base_y = at_top ? ay + TOAST_MARGIN : ay + ah - TOAST_MARGIN - TOAST_H;
     int step = from_corner * (TOAST_H + TOAST_GAP);
     *out_y = at_top ? base_y + step : base_y - step;
 }
@@ -180,7 +225,17 @@ static void remove_toast(int idx)
 static void toast_on_arrived(const NotifEntry *e, int expire_timeout_ms)
 {
     ensure_visual();
-    if (g_n >= TOAST_MAX) {
+    /* Room for one more, freeing up as many oldest-first as it takes --
+     * normally at most one eviction, but a loop (not a single if) since
+     * the workarea can also have shrunk since the last arrival (e.g.
+     * another panel/dock appeared), which could put the cap below g_n by
+     * more than one. Cap it at TOAST_ARRAY_CAP too so a pathological
+     * capacity (huge screen) never overflows the fixed-size array. */
+    int cap = toast_capacity();
+    if (cap > TOAST_ARRAY_CAP) {
+        cap = TOAST_ARRAY_CAP;
+    }
+    while (g_n >= cap && g_n > 0) {
         remove_toast(0); /* drop the oldest visible toast to make room */
     }
 

@@ -303,6 +303,11 @@ void ewmh_get_state_flags(Window w, int *minimized, int *maximized);
 Window ewmh_get_active_window(void);
 int ewmh_get_number_of_desktops(void);
 int ewmh_get_current_desktop(void); /* -1 if unavailable */
+/* _NET_WORKAREA for the current desktop -- 1 on success (fills all four
+ * out params), 0 if unavailable (WM doesn't maintain it), in which case
+ * the out params are left untouched and the caller should fall back to
+ * the full screen size. */
+int ewmh_get_workarea(int *out_x, int *out_y, int *out_w, int *out_h);
 int ewmh_skip_taskbar(Window w); /* 1 if a taskbar should never list this window */
 int ewmh_window_in_rect(Window w, int rx, int ry, int rw, int rh); /* 1 if w's center is inside the rect */
 int ewmh_window_has_input_focus(Window w); /* 1 if w (or a descendant) holds real X input focus */
