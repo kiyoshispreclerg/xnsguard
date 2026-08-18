@@ -28,9 +28,11 @@
 #include <sys/stat.h>
 
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -58,6 +60,7 @@ static GtkWidget *g_entry;
 static GtkWidget *g_treeview;
 static GtkListStore *g_store;
 static GtkTreeModel *g_filter;
+static pid_t g_watch_pid;
 
 /* ---- argv / JSON plumbing -------------------------------------------- */
 
@@ -596,6 +599,118 @@ static void toggle_visibility(void)
     }
 }
 
+/* Reads /proc/<pid>/comm (trimmed). Returns 0 if the process is gone or
+ * /proc isn't available, leaving comm untouched. */
+static int read_proc_comm(pid_t pid, char *comm, size_t comm_sz)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/comm", (int)pid);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    int ok = fgets(comm, comm_sz, f) != NULL;
+    fclose(f);
+    if (!ok) return 0;
+    size_t l = strlen(comm);
+    while (l > 0 && (comm[l - 1] == '\n' || comm[l - 1] == '\r')) comm[--l] = 0;
+    return 1;
+}
+
+static pid_t read_proc_ppid(pid_t pid)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/status", (int)pid);
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    char line[256];
+    pid_t ppid = -1;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "PPid:", 5) == 0) {
+            sscanf(line + 5, "%d", &ppid);
+            break;
+        }
+    }
+    fclose(f);
+    return ppid;
+}
+
+/* xispanel's run_detached() forks a single "sh -c '<cmd>'" child and
+ * never waits on it. Some shells tail-call-exec the last command of a
+ * -c string, which would make that child become xisserve itself
+ * (getppid() then reads as xispanel's own PID directly) -- but that
+ * optimization isn't guaranteed, and in practice the shell here stays
+ * alive as an intermediary, blocked waiting on us, so our direct parent
+ * is that shell and never changes even after xispanel dies. Climb past
+ * a shell-named direct parent to the grandparent, which is xispanel. */
+static pid_t resolve_watch_pid(void)
+{
+    pid_t p = getppid();
+    char comm[64];
+    if (read_proc_comm(p, comm, sizeof(comm)) &&
+        (strcmp(comm, "sh") == 0 || strcmp(comm, "bash") == 0 || strcmp(comm, "dash") == 0 ||
+         strcmp(comm, "ash") == 0)) {
+        pid_t gp = read_proc_ppid(p);
+        if (gp > 0) p = gp;
+    }
+    return p;
+}
+
+/* Polled rather than event-driven: there's no portable "notify me when
+ * this other process exits" primitive (Linux's PR_SET_PDEATHSIG only
+ * covers one's own direct parent, which per resolve_watch_pid() above
+ * isn't reliably xispanel here anyway, and still just delivers a signal
+ * we'd have to poll for regardless). */
+static gboolean check_parent_alive(gpointer data)
+{
+    (void)data;
+    if (kill(g_watch_pid, 0) != 0 && errno == ESRCH) {
+        gtk_main_quit();
+    }
+    return TRUE;
+}
+
+/* ---- power actions -------------------------------------------------------- */
+
+typedef struct {
+    const char *label;
+    const char *probe_bin; /* must resolve via $PATH for this button to be shown; NULL = always shown */
+    const char *cmd;       /* shell command run (after confirmation) on click; NULL = stub, no action yet */
+    const char *confirm_msg;
+} PowerAction;
+
+/* systemd-logind's `loginctl`/`systemctl` cover shutdown/reboot/suspend/
+ * lock on any systemd system without needing a desktop-specific tool;
+ * "Trocar usuario" only has a real answer under LightDM's `dm-tool`, and
+ * "Sair" (logout) has no generic single command at all for a
+ * WM-agnostic session like this one -- both ship as visible buttons per
+ * the ask, the latter always shown (cmd left NULL, a stub), the former
+ * hidden unless dm-tool is actually installed. */
+static const PowerAction kPowerActions[] = {
+    {"Desligar", "systemctl", "systemctl poweroff", "Desligar o computador agora?"},
+    {"Reiniciar", "systemctl", "systemctl reboot", "Reiniciar o computador agora?"},
+    {"Suspender", "systemctl", "systemctl suspend", "Suspender o computador agora?"},
+    {"Sair", NULL, NULL, "Encerrar a sessao atual?"},
+    {"Trocar usuario", "dm-tool", "dm-tool switch-to-greeter", "Trocar de usuario agora?"},
+    {"Bloquear tela", "loginctl", "loginctl lock-session", "Bloquear a tela agora?"},
+};
+#define N_POWER_ACTIONS ((int)(sizeof(kPowerActions) / sizeof(kPowerActions[0])))
+
+static void on_power_button_clicked(GtkWidget *btn, gpointer user_data)
+{
+    (void)btn;
+    const PowerAction *action = (const PowerAction *)user_data;
+    hide_launcher();
+
+    GtkWidget *dialog = gtk_message_dialog_new(NULL, GTK_DIALOG_MODAL, GTK_MESSAGE_QUESTION, GTK_BUTTONS_YES_NO, "%s",
+                                                action->confirm_msg);
+    gtk_window_set_title(GTK_WINDOW(dialog), action->label);
+    gint resp = gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+
+    if (resp == GTK_RESPONSE_YES && action->cmd) {
+        run_detached(action->cmd);
+    }
+}
+
 /* ---- control socket I/O -------------------------------------------------- */
 
 static gboolean on_ctl_accept(GIOChannel *source, GIOCondition cond, gpointer data)
@@ -803,6 +918,23 @@ static void build_ui(void)
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
     gtk_container_add(GTK_CONTAINER(scroll), g_treeview);
     gtk_box_pack_start(GTK_BOX(vbox), scroll, TRUE, TRUE, 0);
+
+    GtkWidget *sep = gtk_hseparator_new();
+    gtk_box_pack_start(GTK_BOX(vbox), sep, FALSE, FALSE, 0);
+
+    GtkWidget *footer = gtk_hbox_new(TRUE, 2);
+    for (int i = 0; i < N_POWER_ACTIONS; i++) {
+        const PowerAction *action = &kPowerActions[i];
+        if (action->probe_bin) {
+            gchar *found = g_find_program_in_path(action->probe_bin);
+            if (!found) continue;
+            g_free(found);
+        }
+        GtkWidget *btn = gtk_button_new_with_label(action->label);
+        g_signal_connect(btn, "clicked", G_CALLBACK(on_power_button_clicked), (gpointer)action);
+        gtk_box_pack_start(GTK_BOX(footer), btn, TRUE, TRUE, 0);
+    }
+    gtk_box_pack_start(GTK_BOX(vbox), footer, FALSE, FALSE, 0);
 }
 
 int main(int argc, char **argv)
@@ -838,6 +970,9 @@ int main(int argc, char **argv)
     }
 
     /* We hold the lock: this invocation becomes the singleton daemon. */
+    g_watch_pid = resolve_watch_pid();
+    g_timeout_add_seconds(2, check_parent_alive, NULL);
+
     g_args = args;
     build_ui();
     apply_theme();
