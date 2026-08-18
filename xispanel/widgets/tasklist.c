@@ -666,7 +666,15 @@ static void tasklist_layout_visible(PanelWidget *w)
         content_avail = 0;
     }
 
-    if (tp->scroll_offset >= tp->n_display) {
+    if (!tp->scrollable) {
+        /* Everything fits again (tasks closed since the user last
+         * scrolled) -- snap back to the start instead of leaving
+         * scroll_offset wherever it was, which would otherwise silently
+         * skip however many leading buttons (pinned ones included) that
+         * offset used to be scrolled past, with no arrows left to scroll
+         * back and reveal them. */
+        tp->scroll_offset = 0;
+    } else if (tp->scroll_offset >= tp->n_display) {
         tp->scroll_offset = tp->n_display > 0 ? tp->n_display - 1 : 0;
     }
     if (tp->scroll_offset < 0) {
