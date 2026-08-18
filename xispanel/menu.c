@@ -611,6 +611,42 @@ static void handle_motion(int root_x, int root_y)
     }
 }
 
+/* Mouse wheel over a paging frame (folder's directory listings are the
+ * common case, but any long enough menu pages) jumps a page in the
+ * wheel's direction, from anywhere over that frame -- not just the two
+ * arrow rows a click needs to land on, and deliberately NOT treated as a
+ * click (X11 reports wheel motion as ButtonPress with button 4/5, so
+ * without this it fell through to handle_click() and activated/opened
+ * whatever item happened to be under the pointer, which only the actual
+ * primary-button click should ever do). No-op if the frame under the
+ * pointer isn't paging, or there's no next/previous page to move to. */
+static void handle_scroll(int root_x, int root_y, int button)
+{
+    PanelMenu *m = g_menu;
+    int frame, row;
+    hit_test(m, root_x, root_y, &frame, &row);
+    if (frame < 0) {
+        return;
+    }
+    MenuFrame *f = &m->frames[frame];
+    if (!f->paging) {
+        return;
+    }
+    if (button == Button4) {
+        if (f->page > 0) {
+            f->page--;
+            f->hover_row = -1;
+            paint_frame(m, f);
+        }
+    } else if (button == Button5) {
+        if (f->page < f->page_count - 1) {
+            f->page++;
+            f->hover_row = -1;
+            paint_frame(m, f);
+        }
+    }
+}
+
 static void handle_click(int root_x, int root_y)
 {
     PanelMenu *m = g_menu;
@@ -934,7 +970,11 @@ int panel_menu_handle_event(const XEvent *ev)
         return 1;
     }
     if (ev->type == ButtonPress && ev->xbutton.window == m->frames[0].win) {
-        handle_click(ev->xbutton.x_root, ev->xbutton.y_root);
+        if (ev->xbutton.button == Button4 || ev->xbutton.button == Button5) {
+            handle_scroll(ev->xbutton.x_root, ev->xbutton.y_root, (int)ev->xbutton.button);
+        } else {
+            handle_click(ev->xbutton.x_root, ev->xbutton.y_root);
+        }
         return 1;
     }
     if (ev->type == KeyPress && ev->xkey.window == m->frames[0].win) {
