@@ -40,8 +40,43 @@ typedef struct {
     int minimized;
     int maximized;
     int pinned;
+    /* 1 = this slot isn't a real window at all -- a pinned app with no
+     * currently-running match (see PinnedApp/tasklist_pin_class() below).
+     * win is None, minimized/maximized/desktop are meaningless, and icon
+     * is *borrowed* from the owning PinnedApp (not freed by the normal
+     * per-tick icon cleanup in tasklist_on_tick() -- see that loop's
+     * is_placeholder check). */
+    int is_placeholder;
     cairo_surface_t *icon;
+    /* 1 once a .desktop-entry icon fallback lookup has been attempted for
+     * this window (see tasklist_on_tick()'s icon fallback) -- carried
+     * forward by win alongside `icon` itself, so a window whose icon
+     * never resolves (no matching .desktop file) doesn't get its
+     * directory scan repeated every tick/property-event forever. */
+    int icon_lookup_tried;
 } TaskEntry;
+
+/* One app pinned via the tasklist's own "Fixar" context-menu item (or the
+ * `pinned=` config key, for pins that should survive a restart without
+ * needing the running app to have been open at boot) -- stays in this
+ * list independent of whether a matching window is currently open.
+ * tasklist_on_tick() shows either the real running window's own button
+ * (if wm_class matches one) or, if none is running right now, a
+ * launcher-style placeholder button built from this entry -- see
+ * TaskEntry::is_placeholder. name/exec/icon are resolved once, at pin
+ * time (tasklist_pin_class()), via desktop_entry_find_by_wm_class() --
+ * not re-resolved every tick, since a directory scan of every .desktop
+ * file on the system is too expensive to repeat on a timer. */
+typedef struct {
+    char wm_class[64];
+    char name[128];
+    char exec[512]; /* empty if no .desktop entry was found -- the placeholder button then shows
+                      * but does nothing on click (nothing to launch), same as a plain icon-less
+                      * fallback rather than silently pretending it can relaunch the app. */
+    cairo_surface_t *icon; /* owned by this struct; NULL if nothing resolved (draw_fallback_icon() covers it) */
+} PinnedApp;
+
+#define MAX_PINNED 24
 
 typedef struct {
     int compact; /* 0 = wide (icon+label), 1 = compact (icon only) */
@@ -54,6 +89,8 @@ typedef struct {
                        * no-op if xispanel was built without libXcomposite or no compositor is running. */
     int show_desktop_badge; /* 1 = draw the task's virtual-desktop number on its icon; 0 (default) = don't. */
     int group_apps; /* 1 = collapse same-app windows (matched by WM_CLASS) into one button; 0 (default) = don't. */
+    PinnedApp pinned[MAX_PINNED];
+    int n_pinned;
     TaskEntry tasks[MAX_TASKS];
     int n_tasks;
     int n_desktops;
@@ -136,6 +173,55 @@ static int tasklist_find(TasklistPriv *tp, Window win)
     return -1;
 }
 
+/* Resolves and stores a newly-pinned app's name/exec/icon via
+ * desktop_entry_find_by_wm_class() + resolve_icon_theme_name() -- called
+ * once per pin (from tasklist_init()'s `pinned=` parsing, or from the
+ * "Fixar" context-menu item), never re-resolved per-tick. No-op if `cls`
+ * is already pinned or the list is full. If no .desktop entry (or no
+ * Icon=) is found, the placeholder button just falls back to
+ * draw_fallback_icon() like any other icon-less entry -- same as a real
+ * running window whose _NET_WM_ICON is also missing. */
+static void tasklist_pin_class(TasklistPriv *tp, const char *cls)
+{
+    if (!cls[0] || tp->n_pinned >= MAX_PINNED) {
+        return;
+    }
+    for (int i = 0; i < tp->n_pinned; i++) {
+        if (strcmp(tp->pinned[i].wm_class, cls) == 0) {
+            return; /* already pinned */
+        }
+    }
+    PinnedApp *pa = &tp->pinned[tp->n_pinned++];
+    memset(pa, 0, sizeof(*pa));
+    snprintf(pa->wm_class, sizeof(pa->wm_class), "%s", cls);
+
+    char icon_name[256] = "";
+    desktop_entry_find_by_wm_class(cls, pa->name, sizeof(pa->name), pa->exec, sizeof(pa->exec), icon_name,
+                                    sizeof(icon_name));
+    if (!pa->name[0]) {
+        snprintf(pa->name, sizeof(pa->name), "%s", cls);
+    }
+    if (icon_name[0]) {
+        pa->icon = resolve_icon_theme_name(icon_name);
+    }
+}
+
+static void tasklist_unpin_class(TasklistPriv *tp, const char *cls)
+{
+    for (int i = 0; i < tp->n_pinned; i++) {
+        if (strcmp(tp->pinned[i].wm_class, cls) == 0) {
+            if (tp->pinned[i].icon) {
+                cairo_surface_destroy(tp->pinned[i].icon);
+            }
+            for (int j = i; j < tp->n_pinned - 1; j++) {
+                tp->pinned[j] = tp->pinned[j + 1];
+            }
+            tp->n_pinned--;
+            return;
+        }
+    }
+}
+
 static int tasklist_init(PanelWidget *w)
 {
     TasklistPriv *tp = w->priv;
@@ -152,6 +238,20 @@ static int tasklist_init(PanelWidget *w)
     tp->show_desktop_badge = kv_get(w->config_kv, "show_desktop_badge", buf, sizeof(buf)) && strcmp(buf, "yes") == 0;
     tp->group_apps = kv_get(w->config_kv, "group", buf, sizeof(buf)) && strcmp(buf, "yes") == 0;
     tp->n_desktops = 1;
+
+    /* Optional `pinned=<wm_class1>,<wm_class2>,...` -- pins that should
+     * already be there on startup, hand-edited into the config (xispanel
+     * doesn't write its own config file -- see the file-level doc
+     * comment in xispanel.c). Pins added later via the right-click
+     * "Fixar" menu are session-only unless the user adds them here too. */
+    char list[512];
+    if (kv_get(w->config_kv, "pinned", list, sizeof(list))) {
+        char *save = NULL;
+        for (char *tok = strtok_r(list, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+            tasklist_pin_class(tp, tok);
+        }
+    }
+
     w->next_tick_ms = now_ms();
     return 0;
 }
@@ -160,8 +260,13 @@ static void tasklist_destroy(PanelWidget *w)
 {
     TasklistPriv *tp = w->priv;
     for (int i = 0; i < tp->n_tasks; i++) {
-        if (tp->tasks[i].icon) {
+        if (tp->tasks[i].icon && !tp->tasks[i].is_placeholder) {
             cairo_surface_destroy(tp->tasks[i].icon);
+        }
+    }
+    for (int i = 0; i < tp->n_pinned; i++) {
+        if (tp->pinned[i].icon) {
+            cairo_surface_destroy(tp->pinned[i].icon);
         }
     }
 }
@@ -220,19 +325,69 @@ static int tasklist_on_tick(PanelWidget *w, uint64_t now)
         e->minimized = minimized;
         e->maximized = maximized;
         if (old_idx >= 0) {
-            e->pinned = tp->tasks[old_idx].pinned;
             e->icon = tp->tasks[old_idx].icon; /* ownership moves to `fresh` */
             tp->tasks[old_idx].icon = NULL;
+            e->icon_lookup_tried = tp->tasks[old_idx].icon_lookup_tried;
         } else {
             e->icon = ewmh_get_icon_surface(win, icon_px);
+        }
+        if (!e->icon && !e->icon_lookup_tried && e->wm_class[0]) {
+            /* _NET_WM_ICON didn't supply one (some GTK/Electron apps
+             * only set an icon via the icon theme, keyed by WM_CLASS) --
+             * fall back to the same .desktop-entry lookup pinned
+             * placeholders use. Only ever attempted once per window (see
+             * icon_lookup_tried's doc comment) -- a directory scan of
+             * every .desktop file on the system every ~2s for a window
+             * that will never resolve one is exactly the kind of idle
+             * busywork this widget's on_tick was recently reworked to
+             * avoid. */
+            e->icon_lookup_tried = 1;
+            char icon_name[256] = "";
+            if (desktop_entry_find_by_wm_class(e->wm_class, NULL, 0, NULL, 0, icon_name, sizeof(icon_name)) &&
+                icon_name[0]) {
+                e->icon = resolve_icon_theme_name(icon_name);
+            }
         }
     }
     XFree(list);
 
+    /* Pinned apps (tasklist_pin_class()) with no window among `fresh`
+     * matching their wm_class get a launcher-style placeholder button
+     * appended, and every match gets flagged pinned (the "pin" dot and
+     * the context menu's Desafixar item both read TaskEntry::pinned, not
+     * PinnedApp directly, so a running window's pinned-ness is always
+     * derived fresh here rather than carried forward from the previous
+     * tick -- tp->pinned[] is the single source of truth for what's
+     * pinned, never TaskEntry::pinned on its own). */
+    for (int pi = 0; pi < tp->n_pinned && n_fresh < MAX_TASKS; pi++) {
+        PinnedApp *pa = &tp->pinned[pi];
+        int matched = 0;
+        for (int i = 0; i < n_fresh; i++) {
+            if (fresh[i].wm_class[0] && strcmp(fresh[i].wm_class, pa->wm_class) == 0) {
+                fresh[i].pinned = 1;
+                matched = 1;
+            }
+        }
+        if (matched) {
+            continue;
+        }
+        TaskEntry *e = &fresh[n_fresh++];
+        memset(e, 0, sizeof(*e));
+        e->win = None;
+        e->is_placeholder = 1;
+        e->pinned = 1;
+        snprintf(e->wm_class, sizeof(e->wm_class), "%s", pa->wm_class);
+        snprintf(e->title, sizeof(e->title), "%s", pa->name);
+        e->icon = pa->icon; /* borrowed -- see TaskEntry::is_placeholder's doc comment */
+    }
+
     /* Anything still owning an icon surface here belonged to a window
-     * that's gone from _NET_CLIENT_LIST now -- free it. */
+     * that's gone from _NET_CLIENT_LIST now -- free it. A placeholder's
+     * icon is borrowed from its PinnedApp (owned/freed by
+     * tasklist_unpin_class()/tasklist_destroy() instead), so skip those
+     * or this would double-free/dangle the very next tick. */
     for (int i = 0; i < tp->n_tasks; i++) {
-        if (tp->tasks[i].icon) {
+        if (tp->tasks[i].icon && !tp->tasks[i].is_placeholder) {
             cairo_surface_destroy(tp->tasks[i].icon);
         }
     }
@@ -329,7 +484,12 @@ static void tasklist_measure(PanelWidget *w, int cross_axis, int *out_len, int *
     for (int d = 0; d < tp->n_display; d++) {
         TaskEntry *e = &tp->tasks[tp->display_repr[d]];
         int bw;
-        if (tp->compact) {
+        /* Pinned-not-running placeholders are always icon-only, even in
+         * wide mode -- no title to show a title for would either draw
+         * nothing in a title-sized gap or (worse) show the app name where
+         * every other button shows the actual window title, so icon-only
+         * keeps them visually distinct from real task buttons at a glance. */
+        if (tp->compact || e->is_placeholder) {
             bw = icon_px + 8;
         } else {
             double tw;
@@ -443,7 +603,11 @@ static int tasklist_get_tooltip(PanelWidget *w, int local_x, char *buf, size_t b
                 *out_ctx = NULL;
             } else {
                 copy_utf8_truncated(buf, bufsz, tp->tasks[repr].title);
-                *out_closable = 1;
+                /* A placeholder (pinned, not running) has no window to
+                 * close -- see tasklist_on_button()'s own placeholder
+                 * branch for its actual click behavior (launch), which
+                 * goes through the button itself, not this tooltip. */
+                *out_closable = !tp->tasks[repr].is_placeholder;
                 *out_ctx = (void *)(uintptr_t)tp->tasks[repr].win;
             }
             *anchor_x = tp->vis_x[vi];
@@ -518,6 +682,9 @@ static int tasklist_get_tooltip_thumb(PanelWidget *w, int local_x, Window *out_w
             if (tp->display_count[d] > 1) {
                 return 0; /* which member's window to preview? -- ambiguous while grouped */
             }
+            if (tp->tasks[tp->display_repr[d]].is_placeholder) {
+                return 0; /* pinned, not running -- no window to thumbnail */
+            }
             *out_win = tp->tasks[tp->display_repr[d]].win;
             return 1;
         }
@@ -588,10 +755,12 @@ static void tasklist_paint(PanelWidget *w, cairo_t *cr)
         int bx = ox + tp->vis_x[vi];
         int bw = tp->vis_w[vi];
 
-        if (horiz) {
-            ewmh_set_icon_geometry(e->win, p->x + w->x + tp->vis_x[vi], p->y, bw, w->thickness);
-        } else {
-            ewmh_set_icon_geometry(e->win, p->x, p->y + w->x + tp->vis_x[vi], w->thickness, bw);
+        if (!e->is_placeholder) {
+            if (horiz) {
+                ewmh_set_icon_geometry(e->win, p->x + w->x + tp->vis_x[vi], p->y, bw, w->thickness);
+            } else {
+                ewmh_set_icon_geometry(e->win, p->x, p->y + w->x + tp->vis_x[vi], w->thickness, bw);
+            }
         }
 
         if (e->win == active) {
@@ -606,7 +775,7 @@ static void tasklist_paint(PanelWidget *w, cairo_t *cr)
         } else {
             draw_fallback_icon(cr, bx + 4, icon_y, icon_px, e->title, p->fg_r, p->fg_g, p->fg_b, panel_text_size(p));
         }
-        if (!tp->compact) {
+        if (!tp->compact && !e->is_placeholder) {
             /* Pango draws e->title directly -- no manual truncation
              * buffer needed, it ellipsizes to fit on its own, and (unlike
              * the plain cairo_show_text() this replaced) does per-glyph
@@ -660,7 +829,11 @@ static void tasklist_paint(PanelWidget *w, cairo_t *cr)
             cairo_set_font_size(cr, panel_text_size(p));
         }
         cairo_pop_group_to_source(cr);
-        cairo_paint_with_alpha(cr, e->minimized ? 0.55 : 1.0);
+        /* Placeholder (pinned, not running) buttons are dimmed so they
+         * read as "not currently open" at a glance, same idea as the
+         * existing minimized dimming -- the two never overlap (a
+         * placeholder is never minimized, it isn't a real window). */
+        cairo_paint_with_alpha(cr, e->is_placeholder ? 0.5 : (e->minimized ? 0.55 : 1.0));
     }
 
     if (tp->scrollable) {
@@ -686,16 +859,54 @@ static void tasklist_paint(PanelWidget *w, cairo_t *cr)
     }
 }
 
-/* Context menu item order: 0=minimize/restore, 1=maximize/restore,
- * 2=move, 3=close, [separator], 5=pin/unpin. ctx is the clicked window's
- * XID, packed directly into the void* (Window fits in a pointer-sized
- * integer on every platform this targets -- no heap allocation needed for
- * something this small and short-lived). */
+/* Tags a placeholder's context-menu ctx (see tasklist_on_button()'s
+ * Button3 handling) so tasklist_menu_select() can tell it apart from a
+ * real window's XID -- a real Window is always a server-assigned CARD32
+ * resource ID (< 2^32 by the X11 protocol itself), so any ctx at or
+ * above 2^32 unambiguously means "not a real window". The low bits carry
+ * the pinned app's index into tp->pinned[] directly (not its wm_class or
+ * anything heap-allocated) -- safe because pinned[] can only ever be
+ * mutated by this same menu's own "Desafixar" selection, and menu.c only
+ * ever has one menu open at a time, so nothing else can reorder it while
+ * this ctx is outstanding. */
+#define TASKLIST_PLACEHOLDER_CTX_TAG (1ULL << 32)
+
+/* Context menu item order for a real window: 0=minimize/restore,
+ * 1=maximize/restore, 2=move, 3=close, [separator], 5=pin/unpin. ctx is
+ * the clicked window's XID, packed directly into the void* (Window fits
+ * in a pointer-sized integer on every platform this targets -- no heap
+ * allocation needed for something this small and short-lived). For a
+ * placeholder (pinned, not running), it's a much shorter menu: 0=Abrir,
+ * 1=Desafixar -- see tasklist_on_button()'s Button3 handling. */
 static void tasklist_menu_select(Panel *panel, PanelWidget *w, void *ctx, int index)
 {
     (void)panel;
-    Window win = (Window)(uintptr_t)ctx;
     TasklistPriv *tp = w->priv;
+    uint64_t raw = (uint64_t)(uintptr_t)ctx;
+
+    if (raw & TASKLIST_PLACEHOLDER_CTX_TAG) {
+        int pi = (int)(raw & (TASKLIST_PLACEHOLDER_CTX_TAG - 1));
+        if (pi < 0 || pi >= tp->n_pinned) {
+            return;
+        }
+        switch (index) {
+        case 0: /* Abrir */
+            if (tp->pinned[pi].exec[0]) {
+                run_detached(tp->pinned[pi].exec);
+            }
+            break;
+        case 1: /* Desafixar */
+            tasklist_unpin_class(tp, tp->pinned[pi].wm_class);
+            break;
+        default:
+            break;
+        }
+        tasklist_on_tick(w, now_ms()); /* rebuild tasks[]/pinned[] state immediately, don't wait ~2s */
+        w->panel->dirty = 1;
+        return;
+    }
+
+    Window win = (Window)(uintptr_t)ctx;
     int idx = tasklist_find(tp, win);
 
     switch (index) {
@@ -720,13 +931,18 @@ static void tasklist_menu_select(Panel *panel, PanelWidget *w, void *ctx, int in
         break;
     case 5:
         if (idx >= 0) {
-            tp->tasks[idx].pinned = !tp->tasks[idx].pinned;
+            if (tp->tasks[idx].pinned) {
+                tasklist_unpin_class(tp, tp->tasks[idx].wm_class);
+            } else if (tp->tasks[idx].wm_class[0]) {
+                tasklist_pin_class(tp, tp->tasks[idx].wm_class);
+            }
         }
         break;
     default:
         break;
     }
     XFlush(g_dpy);
+    tasklist_on_tick(w, now_ms()); /* re-derive TaskEntry::pinned from tp->pinned[] immediately -- see its doc comment */
     w->panel->dirty = 1;
 }
 
@@ -787,6 +1003,46 @@ static int tasklist_on_button(PanelWidget *w, int button, int local_x, int local
      * tooltip's per-window list instead (see tasklist_get_tooltip_group()),
      * not by a separate click target here. */
     TaskEntry *e = &tp->tasks[idx];
+
+    if (e->is_placeholder) {
+        /* A pinned app with no window currently open -- click launches it
+         * instead of any of the real-window actions below (nothing to
+         * minimize/maximize/move/close). */
+        if (button == Button1) {
+            for (int pi = 0; pi < tp->n_pinned; pi++) {
+                if (strcmp(tp->pinned[pi].wm_class, e->wm_class) == 0) {
+                    if (tp->pinned[pi].exec[0]) {
+                        run_detached(tp->pinned[pi].exec);
+                    }
+                    break;
+                }
+            }
+            return 1;
+        }
+        if (button == Button3) {
+            MenuItem items[2];
+            snprintf(items[0].label, sizeof(items[0].label), "Abrir");
+            items[0].enabled = 1;
+            items[0].is_separator = 0;
+            snprintf(items[1].label, sizeof(items[1].label), "Desafixar");
+            items[1].enabled = 1;
+            items[1].is_separator = 0;
+            int pi = -1;
+            for (int i = 0; i < tp->n_pinned; i++) {
+                if (strcmp(tp->pinned[i].wm_class, e->wm_class) == 0) {
+                    pi = i;
+                    break;
+                }
+            }
+            if (pi < 0) {
+                return 1;
+            }
+            void *ctx = (void *)(uintptr_t)(TASKLIST_PLACEHOLDER_CTX_TAG | (unsigned)pi);
+            panel_menu_open(w->panel, w, anchor_x, anchor_w, items, 2, ctx, tasklist_menu_select);
+            return 1;
+        }
+        return 0;
+    }
 
     if (button == Button1) {
         Window active = ewmh_get_active_window();

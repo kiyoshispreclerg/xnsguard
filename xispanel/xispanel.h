@@ -382,6 +382,14 @@ void copy_utf8_truncated(char *dst, size_t dst_sz, const char *src);
  * against a fixed grid of common icon-theme paths -- see ewmh.c's doc
  * comment for the tradeoffs. NULL if nothing matched. */
 cairo_surface_t *resolve_icon_theme_name(const char *name);
+/* Finds the .desktop entry that best matches a window's WM_CLASS
+ * res_class -- see ewmh.c's doc comment for the match rules and scope.
+ * Used by tasklist.c both to name/launch/icon a pinned-but-not-running
+ * app and to fill in a real running window's icon when _NET_WM_ICON
+ * didn't supply one. Each out_* pointer is optional (pass NULL/0 to
+ * skip it). Returns 1 on a match, 0 if nothing matched. */
+int desktop_entry_find_by_wm_class(const char *wm_class, char *out_name, size_t name_sz, char *out_exec,
+                                    size_t exec_sz, char *out_icon_name, size_t icon_sz);
 
 /* ---- context menu (menu.c) ----
  *

@@ -11,8 +11,10 @@
 #include <X11/Xatom.h>
 #include <X11/Xutil.h>
 
+#include <dirent.h>
 #include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -954,4 +956,248 @@ cairo_surface_t *resolve_icon_theme_name(const char *name)
         }
     }
     return NULL;
+}
+
+/* Removes freedesktop Exec= field codes (%f/%F/%u/%U/%d/%D/%n/%N/%i/%c/%k/
+ * %v/%m) in place -- xispanel never hands a launched app a file/URL/icon-
+ * name argument, so every one of these is just deleted rather than
+ * substituted. "%%" (a literal percent) collapses to "%". Any other
+ * %<char> (not part of the spec) is left alone rather than guessed at. */
+static void strip_desktop_field_codes(char *s)
+{
+    char out[512];
+    size_t oi = 0;
+    for (size_t i = 0; s[i] && oi + 1 < sizeof(out); i++) {
+        if (s[i] == '%' && s[i + 1]) {
+            char c = s[i + 1];
+            if (c == '%') {
+                out[oi++] = '%';
+                i++;
+                continue;
+            }
+            if (strchr("fFuUdDnNickvm", c)) {
+                i++; /* drop both the '%' and the code letter */
+                continue;
+            }
+        }
+        out[oi++] = s[i];
+    }
+    out[oi] = 0;
+    snprintf(s, 512, "%s", out);
+}
+
+/* Parses one .desktop file at `path`, filling out_name/out_exec/out_icon
+ * (Exec= with field codes already stripped) if it looks usable (has an
+ * Exec=, isn't Hidden=true) and matches `wm_class` -- see
+ * desktop_entry_find_by_wm_class()'s doc comment for the match rules.
+ * Returns 0 (no match/unusable), 1 (fallback match: basename or Exec
+ * basename), or 2 (best match: exact StartupWMClass=). Only reads the
+ * [Desktop Entry] section, stopping at the first following [...] header
+ * so a file's [Desktop Action ...] subsections never leak into the
+ * result. */
+static int parse_desktop_file(const char *path, const char *wm_class, char *out_name, size_t name_sz,
+                               char *out_exec, size_t exec_sz, char *out_icon, size_t icon_sz)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        return 0;
+    }
+    char line[1024];
+    int in_entry = 0, seen_entry = 0, hidden = 0;
+    char name[256] = "", exec[512] = "", icon[256] = "", startup_class[128] = "";
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[--len] = 0;
+        }
+        if (line[0] == '[') {
+            in_entry = strcmp(line, "[Desktop Entry]") == 0;
+            if (in_entry) {
+                seen_entry = 1;
+            } else if (seen_entry) {
+                break; /* left the main section after having read it */
+            }
+            continue;
+        }
+        if (!in_entry) {
+            continue;
+        }
+        if (!strncmp(line, "Name=", 5) && !name[0]) {
+            snprintf(name, sizeof(name), "%s", line + 5);
+        } else if (!strncmp(line, "Exec=", 5)) {
+            snprintf(exec, sizeof(exec), "%s", line + 5);
+        } else if (!strncmp(line, "Icon=", 5)) {
+            snprintf(icon, sizeof(icon), "%s", line + 5);
+        } else if (!strncmp(line, "StartupWMClass=", 15)) {
+            snprintf(startup_class, sizeof(startup_class), "%s", line + 15);
+        } else if (!strcmp(line, "Hidden=true")) {
+            hidden = 1;
+        }
+    }
+    fclose(f);
+    if (hidden || !exec[0]) {
+        return 0;
+    }
+
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    char basenoext[256];
+    snprintf(basenoext, sizeof(basenoext), "%s", base);
+    char *dot = strrchr(basenoext, '.');
+    if (dot) {
+        *dot = 0;
+    }
+
+    int match = 0;
+    if (startup_class[0] && strcmp(startup_class, wm_class) == 0) {
+        match = 2;
+    } else {
+        char exec_base[256];
+        snprintf(exec_base, sizeof(exec_base), "%s", exec);
+        char *sp = strchr(exec_base, ' ');
+        if (sp) {
+            *sp = 0;
+        }
+        const char *exec_bin = strrchr(exec_base, '/');
+        exec_bin = exec_bin ? exec_bin + 1 : exec_base;
+        if (strcasecmp(basenoext, wm_class) == 0 || strcasecmp(exec_bin, wm_class) == 0) {
+            match = 1;
+        }
+    }
+    if (!match) {
+        return 0;
+    }
+
+    strip_desktop_field_codes(exec);
+    if (out_name && name_sz) {
+        snprintf(out_name, name_sz, "%s", name[0] ? name : basenoext);
+    }
+    if (out_exec && exec_sz) {
+        snprintf(out_exec, exec_sz, "%s", exec);
+    }
+    if (out_icon && icon_sz) {
+        snprintf(out_icon, icon_sz, "%s", icon);
+    }
+    return match;
+}
+
+/* Appends "<base>/applications" to dirs[*n] (silently capped at `max` --
+ * a caller passing more search roots than that just loses the excess,
+ * fine for what's already a generous fixed list). */
+static void add_desktop_search_dir(char dirs[][PATH_MAX], int *n, int max, const char *base)
+{
+    if (*n >= max || !base || !base[0]) {
+        return;
+    }
+    snprintf(dirs[*n], PATH_MAX, "%s/applications", base);
+    (*n)++;
+}
+
+/* Searches .desktop files under XDG_DATA_HOME (or ~/.local/share) and
+ * every XDG_DATA_DIRS entry (falling back to /usr/local/share:/usr/share
+ * if unset, per the freedesktop base-dir spec defaults) for the entry
+ * that best matches `wm_class` (a window's WM_CLASS res_class, as
+ * returned by ewmh_get_class()). An exact StartupWMClass= match wins
+ * outright and stops the search; otherwise the first file whose own
+ * basename (sans .desktop) or Exec='s first-token basename matches
+ * case-insensitively is kept as a fallback candidate, same heuristic
+ * KDE's own Task Manager applet falls back to when no StartupWMClass is
+ * known (see tasklist.c's tasklist_build_display() doc comment) -- used
+ * only if no exact match turns up anywhere.
+ *
+ * Deliberately not a full .desktop/icon-theme implementation (no
+ * NoDisplay/OnlyShowIn filtering, no localized Name[xx]= keys, non-
+ * recursive directory scan) -- just enough to name/launch/icon a pinned
+ * app (tasklist.c's "Fixar") or fill in a real running window's icon
+ * when _NET_WM_ICON didn't supply one (some GTK/Electron apps only set
+ * an icon via WM_CLASS + the icon theme, never _NET_WM_ICON pixel data).
+ * out_name/out_exec/out_icon_name are each optional (pass NULL/0 to skip);
+ * out_exec has field codes already stripped (see
+ * strip_desktop_field_codes()). Returns 1 on any match, 0 if nothing
+ * matched anywhere. */
+int desktop_entry_find_by_wm_class(const char *wm_class, char *out_name, size_t name_sz, char *out_exec,
+                                    size_t exec_sz, char *out_icon_name, size_t icon_sz)
+{
+    if (!wm_class || !wm_class[0]) {
+        return 0;
+    }
+
+    char dirs[16][PATH_MAX];
+    int n_dirs = 0;
+    const char *xdg_data_home = getenv("XDG_DATA_HOME");
+    if (xdg_data_home && xdg_data_home[0]) {
+        add_desktop_search_dir(dirs, &n_dirs, 16, xdg_data_home);
+    } else {
+        const char *home = getenv("HOME");
+        if (home && home[0]) {
+            char buf[PATH_MAX];
+            snprintf(buf, sizeof(buf), "%s/.local/share", home);
+            add_desktop_search_dir(dirs, &n_dirs, 16, buf);
+        }
+    }
+    const char *xdg_data_dirs = getenv("XDG_DATA_DIRS");
+    if (!xdg_data_dirs || !xdg_data_dirs[0]) {
+        xdg_data_dirs = "/usr/local/share:/usr/share";
+    }
+    char ddbuf[1024];
+    snprintf(ddbuf, sizeof(ddbuf), "%s", xdg_data_dirs);
+    char *save = NULL;
+    for (char *tok = strtok_r(ddbuf, ":", &save); tok; tok = strtok_r(NULL, ":", &save)) {
+        add_desktop_search_dir(dirs, &n_dirs, 16, tok);
+    }
+
+    char fb_name[256] = "", fb_exec[512] = "", fb_icon[256] = "";
+    int have_fallback = 0;
+
+    for (int d = 0; d < n_dirs; d++) {
+        DIR *dh = opendir(dirs[d]);
+        if (!dh) {
+            continue;
+        }
+        struct dirent *de;
+        while ((de = readdir(dh)) != NULL) {
+            size_t nlen = strlen(de->d_name);
+            if (nlen < 9 || strcmp(de->d_name + nlen - 8, ".desktop") != 0) {
+                continue;
+            }
+            char path[PATH_MAX];
+            snprintf(path, sizeof(path), "%s/%s", dirs[d], de->d_name);
+            char name[256], exec[512], icon[256];
+            int m = parse_desktop_file(path, wm_class, name, sizeof(name), exec, sizeof(exec), icon, sizeof(icon));
+            if (m == 2) {
+                closedir(dh);
+                if (out_name && name_sz) {
+                    snprintf(out_name, name_sz, "%s", name);
+                }
+                if (out_exec && exec_sz) {
+                    snprintf(out_exec, exec_sz, "%s", exec);
+                }
+                if (out_icon_name && icon_sz) {
+                    snprintf(out_icon_name, icon_sz, "%s", icon);
+                }
+                return 1;
+            }
+            if (m == 1 && !have_fallback) {
+                have_fallback = 1;
+                snprintf(fb_name, sizeof(fb_name), "%s", name);
+                snprintf(fb_exec, sizeof(fb_exec), "%s", exec);
+                snprintf(fb_icon, sizeof(fb_icon), "%s", icon);
+            }
+        }
+        closedir(dh);
+    }
+
+    if (!have_fallback) {
+        return 0;
+    }
+    if (out_name && name_sz) {
+        snprintf(out_name, name_sz, "%s", fb_name);
+    }
+    if (out_exec && exec_sz) {
+        snprintf(out_exec, exec_sz, "%s", fb_exec);
+    }
+    if (out_icon_name && icon_sz) {
+        snprintf(out_icon_name, icon_sz, "%s", fb_icon);
+    }
+    return 1;
 }
