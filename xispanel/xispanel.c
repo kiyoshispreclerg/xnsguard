@@ -43,11 +43,19 @@
  * -- no Pango, no GLib.
  *
  * Config lives at $XDG_CONFIG_HOME/xispanel.conf and is *not* written by
- * this program yet: PANEL/WIDGET/THEME lines are hand-edited (or written
- * by a future xisconf tab) and picked up on startup or via the IPC RELOAD
- * command. Persisting live-mutated state (SET_WIDGET etc. over the IPC
- * socket) is a later phase once there is any IPC command that actually
- * mutates a panel. See PROTOCOL.md.
+ * this program in general: PANEL/WIDGET/THEME lines are hand-edited (or
+ * written by a future xisconf tab) and picked up on startup or via the
+ * IPC RELOAD command. Persisting live-mutated state (SET_WIDGET etc. over
+ * the IPC socket) is a later phase once there is any IPC command that
+ * actually mutates a panel. See PROTOCOL.md.
+ *
+ * One narrow, deliberate exception: tasklist.c's pinned-apps list writes
+ * its own fixed_list= key onto its own WIDGET line the first time the
+ * user pins something (see config_widget_set_key() and
+ * tasklist_persist_pinned() in widgets/tasklist.c) -- not a general
+ * config-mutation mechanism, just enough for one widget's own sidecar
+ * file path to survive a restart without requiring the user to hand-edit
+ * it in first.
  */
 
 #include "xispanel.h"
@@ -1502,7 +1510,13 @@ static Panel *alloc_panel(const char *name, const char *output)
 
 static void panel_add_widget(Panel *p, int order, const char *type, const char *kvline)
 {
-    (void)order; /* config lines are already emitted in the desired order */
+    /* Layout order itself comes from file order (config lines are already
+     * emitted in the desired order), not this number -- but it's still
+     * stored on the widget as an identifier: it's the third field of this
+     * widget's own WIDGET line, so config_widget_set_key() (tasklist.c's
+     * pinned-apps persistence) can find that exact line again later by
+     * (panel name, order, type), the same triple that uniquely identifies
+     * it in the file. */
     if (p->n_widgets >= MAX_WIDGETS) {
         fprintf(stderr, "xispanel: panel '%s': too many widgets, ignoring '%s'\n", p->name, type);
         return;
@@ -1516,6 +1530,7 @@ static void panel_add_widget(Panel *p, int order, const char *type, const char *
     memset(w, 0, sizeof(*w));
     w->ops = ops;
     w->panel = p;
+    w->order = order;
     snprintf(w->config_kv, sizeof(w->config_kv), "%s", kvline ? kvline : "");
     if (ops->priv_size > 0) {
         w->priv = calloc(1, ops->priv_size);
@@ -1616,6 +1631,110 @@ static void apply_theme_kv(Panel *p, const char *kvline)
      * it just means a plain full-image stretch, not an error. */
     kv_get(kvline, "bg_image", p->bg_image_path, sizeof(p->bg_image_path));
     kv_get(kvline, "bg_slice", p->bg_slice_path, sizeof(p->bg_slice_path));
+}
+
+/* Directory containing the config file (same place write_default_config_
+ * if_missing() creates xispanel.conf in) -- tasklist.c places its
+ * pinned-apps sidecar file (fixed_list=, see tasklist_persist_pinned())
+ * alongside it when the user hasn't given an absolute path. Returns 0 if
+ * g_configpath somehow has no '/' in it (shouldn't happen -- it's always
+ * built from an absolute XDG dir in main()), leaving `out` untouched. */
+int config_dir(char *out, size_t outsz)
+{
+    const char *slash = strrchr(g_configpath, '/');
+    if (!slash) {
+        return 0;
+    }
+    size_t len = (size_t)(slash - g_configpath);
+    if (len >= outsz) {
+        len = outsz - 1;
+    }
+    memcpy(out, g_configpath, len);
+    out[len] = 0;
+    return 1;
+}
+
+/* True if `raw` (one line of the config file, not yet trimmed) is a
+ * WIDGET line for exactly (panel_name, order, type_name) -- tokenizes a
+ * scratch copy the same whitespace-run-insensitive way load_config()'s
+ * own field splitter does, so this matches regardless of whether the
+ * line uses tabs, spaces, or a mix. */
+static int widget_line_matches(const char *raw, const char *panel_name, int order, const char *type_name)
+{
+    char buf[LINE_MAX_LEN];
+    snprintf(buf, sizeof(buf), "%s", raw);
+    char *save = NULL;
+    char *tok = strtok_r(buf, " \t\r\n", &save);
+    if (!tok || strcmp(tok, "WIDGET") != 0) {
+        return 0;
+    }
+    tok = strtok_r(NULL, " \t\r\n", &save);
+    if (!tok || strcmp(tok, panel_name) != 0) {
+        return 0;
+    }
+    tok = strtok_r(NULL, " \t\r\n", &save);
+    if (!tok || atoi(tok) != order) {
+        return 0;
+    }
+    tok = strtok_r(NULL, " \t\r\n", &save);
+    return tok && strcmp(tok, type_name) == 0;
+}
+
+/* Appends " key=value" to one WIDGET line's own kv tail, identified by
+ * (panel_name, order, type_name) exactly as widget_line_matches() above
+ * matches -- this is the ONLY kind of write-back xispanel ever does to
+ * its own config (see this file's top-of-file doc comment on config
+ * persistence), deliberately narrow: one widget's own fixed_list= key,
+ * written once, so a pinned-apps sidecar file survives a restart without
+ * needing general "persist any runtime change" config-mutation
+ * infrastructure. Rewrites the whole file to a sibling .tmp path (no
+ * in-place text insert into a line-oriented file) and renames it over
+ * the original, so a crash/power-loss mid-write can't leave a half-
+ * written config behind; every line is copied through unchanged except
+ * the one WIDGET line that matches. Returns 0 (leaving the original file
+ * untouched) if the config can't be read/rewritten, or no matching line
+ * was found -- the caller treats that as "this pin just won't survive a
+ * restart", not a fatal error. */
+int config_widget_set_key(const char *panel_name, int order, const char *type_name, const char *key,
+                           const char *value)
+{
+    FILE *in = fopen(g_configpath, "r");
+    if (!in) {
+        return 0;
+    }
+    char tmppath[PATH_MAX];
+    snprintf(tmppath, sizeof(tmppath), "%s.tmp", g_configpath);
+    FILE *out = fopen(tmppath, "w");
+    if (!out) {
+        fclose(in);
+        return 0;
+    }
+
+    char line[LINE_MAX_LEN];
+    int found = 0;
+    while (fgets(line, sizeof(line), in)) {
+        if (!found && widget_line_matches(line, panel_name, order, type_name)) {
+            found = 1;
+            size_t len = strlen(line);
+            while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+                line[--len] = 0;
+            }
+            fprintf(out, "%s %s=%s\n", line, key, value);
+        } else {
+            fputs(line, out);
+        }
+    }
+    fclose(in);
+    fclose(out);
+
+    if (!found || rename(tmppath, g_configpath) != 0) {
+        if (found) {
+            fprintf(stderr, "xispanel: could not update config %s: %s\n", g_configpath, strerror(errno));
+        }
+        remove(tmppath);
+        return 0;
+    }
+    return 1;
 }
 
 static void load_config(void)
@@ -2340,7 +2459,15 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    int lockfd = open(lockpath, O_CREAT | O_RDWR, 0600);
+    /* O_CLOEXEC matters here specifically: without it, this fd leaks into
+     * every child run_detached() forks (launcher/tasklist/xisserve clicks)
+     * and, via exec(), into whatever program they launch -- and since an
+     * flock() is held by the open file description, not by a process, a
+     * launched GUI app that never closes an inherited fd (most don't
+     * bother) keeps this lock held even after xispanel itself has been
+     * killed, making a relaunch report "already running" until every
+     * program it ever launched also exits. */
+    int lockfd = open(lockpath, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
     if (lockfd < 0) {
         perror("xispanel: open lock");
         return 1;

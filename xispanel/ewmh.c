@@ -906,6 +906,66 @@ void trim_to_width(cairo_t *cr, char *text, size_t bufsz, double max_width)
  * to the fallback icon exactly like an absent pixmap already does. Also
  * handles the (seen in the wild) case of a caller passing an absolute
  * path as `name` directly. */
+/* Reads the desktop's configured icon theme name the same live-off-config
+ * way xispanel.c's detect_system_font_family()/detect_system_colors()
+ * read font/color -- KDE's ~/.config/kdeglobals ([Icons] Theme=) checked
+ * first, then GTK3's ~/.config/gtk-3.0/settings.ini
+ * (gtk-icon-theme-name=). Without this, resolve_icon_theme_name() below
+ * only ever finds icons on the handful of hardcoded theme names it
+ * happens to list -- a user on Papirus/Yaru/Numix/elementary/... would
+ * never get a resolved icon at all. Leaves `out` empty (caller just
+ * skips the extra search root) if neither config file has the key. */
+static void detect_icon_theme(char *out, size_t outsz)
+{
+    out[0] = 0;
+    const char *home = getenv("HOME");
+    if (!home) {
+        return;
+    }
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/.config/kdeglobals", home);
+    FILE *f = fopen(path, "r");
+    if (f) {
+        char line[256];
+        int in_icons = 0;
+        while (fgets(line, sizeof(line), f)) {
+            size_t len = strlen(line);
+            while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+                line[--len] = 0;
+            }
+            if (line[0] == '[') {
+                in_icons = strcmp(line, "[Icons]") == 0;
+                continue;
+            }
+            if (in_icons && !strncmp(line, "Theme=", 6)) {
+                snprintf(out, outsz, "%s", line + 6);
+                break;
+            }
+        }
+        fclose(f);
+        if (out[0]) {
+            return;
+        }
+    }
+    snprintf(path, sizeof(path), "%s/.config/gtk-3.0/settings.ini", home);
+    f = fopen(path, "r");
+    if (!f) {
+        return;
+    }
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[--len] = 0;
+        }
+        if (!strncmp(line, "gtk-icon-theme-name=", 20)) {
+            snprintf(out, outsz, "%s", line + 20);
+            break;
+        }
+    }
+    fclose(f);
+}
+
 cairo_surface_t *resolve_icon_theme_name(const char *name)
 {
     if (!name || !name[0]) {
@@ -914,17 +974,85 @@ cairo_surface_t *resolve_icon_theme_name(const char *name)
     if (name[0] == '/') {
         return load_png_argb(name);
     }
-    static const char *bases[] = {
+
+    /* The user's actual icon theme (if detected) is searched first, ahead
+     * of the hardcoded breeze/Adwaita/hicolor fallback list -- built at
+     * runtime instead of a compile-time array since the theme name/home
+     * dir aren't known until now. Deliberately capped/deduped rather than
+     * walking a theme's full index.theme Inherits= chain -- see this
+     * function's original doc comment on why full spec compliance is out
+     * of scope. */
+    char theme[128];
+    detect_icon_theme(theme, sizeof(theme));
+    const char *home = getenv("HOME");
+
+    char base_buf[7][PATH_MAX];
+    const char *bases[7];
+    int n_bases = 0;
+    if (theme[0]) {
+        snprintf(base_buf[n_bases], PATH_MAX, "/usr/share/icons/%s", theme);
+        bases[n_bases] = base_buf[n_bases];
+        n_bases++;
+        if (home) {
+            snprintf(base_buf[n_bases], PATH_MAX, "%s/.local/share/icons/%s", home, theme);
+            bases[n_bases] = base_buf[n_bases];
+            n_bases++;
+            snprintf(base_buf[n_bases], PATH_MAX, "%s/.icons/%s", home, theme);
+            bases[n_bases] = base_buf[n_bases];
+            n_bases++;
+        }
+    }
+    static const char *hardcoded[] = {
         "/usr/share/icons/breeze",
         "/usr/share/icons/breeze-dark",
         "/usr/share/icons/Adwaita",
         "/usr/share/icons/hicolor",
     };
-    static const char *categories[] = {"status", "apps", "devices", "actions", "categories", "mimetypes", "places"};
-    static const char *sizedirs[] = {"symbolic", "scalable", "48x48", "32x32", "24x24", "22x22", "16x16"};
-    static const char *exts[] = {".svg", ".png"};
+    for (size_t i = 0; i < sizeof(hardcoded) / sizeof(hardcoded[0]) && n_bases < 7; i++) {
+        int dup = 0;
+        for (int j = 0; j < n_bases; j++) {
+            if (strcmp(bases[j], hardcoded[i]) == 0) {
+                dup = 1;
+                break;
+            }
+        }
+        if (!dup) {
+            bases[n_bases++] = hardcoded[i];
+        }
+    }
+
+    /* "legacy" matters: some icon names from the freedesktop spec's
+     * legacy list (e.g. konsole's Icon=utilities-terminal) only exist
+     * there in Adwaita/hicolor, not under "apps" -- confirmed against a
+     * live install (Adwaita/48x48/legacy/utilities-terminal.png exists,
+     * .../apps/utilities-terminal.png doesn't; only a *-symbolic variant
+     * does, a different filename that wouldn't match `name` anyway). */
+    static const char *categories[] = {"status",     "apps",  "devices", "actions",
+                                        "categories", "mimetypes", "places",  "legacy"};
+    /* Both naming conventions are real: Adwaita/hicolor use "48x48" per
+     * the icon-theme spec, but breeze/KDE themes use a bare "48" (plus
+     * "@2x"/"@3x" HiDPI variants this doesn't bother with) -- confirmed
+     * against a live breeze install (.../apps/48/kcolorchooser.svg, not
+     * .../apps/48x48/...). Trying both forms for every theme is cheap
+     * (just extra access() misses) and avoids needing to know which
+     * convention a given theme uses ahead of time. 128/256/512 cover
+     * hicolor-only apps that never ship a "scalable" SVG (confirmed:
+     * OBS Studio's hicolor entry is 128x128/256x256/512x512 PNGs plus a
+     * scalable SVG, no smaller sizes at all). */
+    static const char *sizedirs[] = {"symbolic", "scalable", "48x48",   "48",  "32x32",   "32",     "24x24",
+                                      "24",       "22x22",    "22",      "16x16", "16",   "64x64",  "64",
+                                      "128x128",  "128",      "256x256", "256", "512x512", "512"};
+    /* .png before .svg: Imlib2's SVG support depends on an optional
+     * loader plugin (librsvg-backed) that isn't guaranteed to be
+     * installed -- confirmed on a live system where imlib_load_image()
+     * silently fails on every .svg (breeze ships nothing else, so this
+     * alone made konsole/kate unresolvable before the "legacy" fix
+     * above gave Adwaita's PNG a chance to be tried at all). Trying .png
+     * first costs nothing when only one extension exists in a given
+     * directory, and wins outright when both do. */
+    static const char *exts[] = {".png", ".svg"};
     char path[PATH_MAX];
-    for (size_t b = 0; b < sizeof(bases) / sizeof(bases[0]); b++) {
+    for (int b = 0; b < n_bases; b++) {
         for (size_t c = 0; c < sizeof(categories) / sizeof(categories[0]); c++) {
             for (size_t s = 0; s < sizeof(sizedirs) / sizeof(sizedirs[0]); s++) {
                 for (size_t e = 0; e < sizeof(exts) / sizeof(exts[0]); e++) {
@@ -946,13 +1074,20 @@ cairo_surface_t *resolve_icon_theme_name(const char *name)
             }
         }
     }
-    /* Flat fallback, no theme structure at all. */
+    /* Flat fallback, no theme structure at all -- /usr/local/share/pixmaps
+     * matters for anything installed outside the distro package manager
+     * (confirmed: a manually-installed Anki only ships
+     * /usr/local/share/pixmaps/anki.png, nothing under /usr/share at
+     * all). */
+    static const char *pixmap_dirs[] = {"/usr/share/pixmaps", "/usr/local/share/pixmaps"};
     static const char *exts2[] = {".png", ".svg", ".xpm"};
-    for (size_t e = 0; e < sizeof(exts2) / sizeof(exts2[0]); e++) {
-        snprintf(path, sizeof(path), "/usr/share/pixmaps/%s%s", name, exts2[e]);
-        cairo_surface_t *surf = access(path, R_OK) == 0 ? load_png_argb(path) : NULL;
-        if (surf) {
-            return surf;
+    for (size_t d = 0; d < sizeof(pixmap_dirs) / sizeof(pixmap_dirs[0]); d++) {
+        for (size_t e = 0; e < sizeof(exts2) / sizeof(exts2[0]); e++) {
+            snprintf(path, sizeof(path), "%s/%s%s", pixmap_dirs[d], name, exts2[e]);
+            cairo_surface_t *surf = access(path, R_OK) == 0 ? load_png_argb(path) : NULL;
+            if (surf) {
+                return surf;
+            }
         }
     }
     return NULL;

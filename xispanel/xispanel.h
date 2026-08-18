@@ -129,6 +129,13 @@ typedef struct {
 struct PanelWidget {
     const PanelWidgetOps *ops;
     Panel *panel;
+    /* The WIDGET line's own order field, as parsed -- NOT what determines
+     * on-panel layout order (that's just file order, see panel_add_
+     * widget()'s doc comment in xispanel.c). Kept as an identifier: with
+     * `panel->name` and `ops->type_name`, it's the same (panel, order,
+     * type) triple that uniquely names this widget's own line in the
+     * config file -- see config_widget_set_key(), used by tasklist.c's
+     * pinned-apps persistence to find that line again later. */
     int order;
     char config_kv[256]; /* raw "key=value key2=value2 ..." from config */
     void *priv;
@@ -303,6 +310,17 @@ void panel_draw_9slice(cairo_t *cr, cairo_surface_t *src, int sw, int sh, int l,
  * xisback's run_action() uses for its own click actions. No-op if `cmd`
  * is NULL/empty. */
 void run_detached(const char *cmd);
+/* Directory containing xispanel.conf -- see xispanel.c's doc comment on
+ * config_dir()/config_widget_set_key() for why these two exist (a single
+ * narrow exception to "xispanel doesn't write its own config", used by
+ * tasklist.c's pinned-apps persistence). Returns 0 on failure, leaving
+ * `out` untouched. */
+int config_dir(char *out, size_t outsz);
+/* Appends " key=value" to one WIDGET line's own kv tail, identified by
+ * (panel_name, order, type_name). Returns 1 on success, 0 if the config
+ * couldn't be read/rewritten or no matching line was found. */
+int config_widget_set_key(const char *panel_name, int order, const char *type_name, const char *key,
+                           const char *value);
 
 /* ---- WM-type / strut atoms widgets/menu may need (ewmh.c) ---- */
 extern Atom g_atom_wm_window_type;

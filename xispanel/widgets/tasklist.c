@@ -12,17 +12,19 @@
  * drawing can never disagree about where a button actually is.
  *
  * Right-click opens a per-window context menu (minimize/maximize/move/
- * close/pin) via the generic panel_menu_open(). "Pin" is currently a
- * visual-only toggle for the running session: a pinned entry does *not*
- * yet survive its window closing and relaunch on click, since that needs
- * .desktop-file lookup by WM_CLASS -- a later (launcher) phase. What it
- * does today is exist as working context-menu-item infrastructure that
- * the launcher phase can build real pinning on top of.
+ * close/pin) via the generic panel_menu_open(). "Pin" (Fixar) keeps an
+ * app in the tasklist independent of whether it's currently running --
+ * see PinnedApp/TaskEntry::is_placeholder below for how a pinned-but-not-
+ * running app is shown/launched, and tasklist_persist_pinned() for how
+ * the pinned list survives a restart (a `fixed_list=<file>` sidecar next
+ * to xispanel.conf, auto-created on first pin -- see that function's doc
+ * comment).
  */
 #include "../xispanel.h"
 
 #include <X11/Xlib.h>
 
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -91,6 +93,9 @@ typedef struct {
     int group_apps; /* 1 = collapse same-app windows (matched by WM_CLASS) into one button; 0 (default) = don't. */
     PinnedApp pinned[MAX_PINNED];
     int n_pinned;
+    /* Absolute path of the pinned-apps sidecar file (fixed_list=), empty
+     * if not configured yet -- see tasklist_persist_pinned(). */
+    char fixed_list_path[PATH_MAX];
     TaskEntry tasks[MAX_TASKS];
     int n_tasks;
     int n_desktops;
@@ -222,6 +227,72 @@ static void tasklist_unpin_class(TasklistPriv *tp, const char *cls)
     }
 }
 
+/* Loads wm_class entries (one per line, blank/'#'-comment lines skipped)
+ * from tp->fixed_list_path, pinning each -- called once at init() after
+ * that path is resolved. Silent no-op if the file doesn't exist yet
+ * (e.g. fixed_list= was hand-added to the config before ever pinning
+ * anything through the UI). */
+static void tasklist_load_fixed_list(TasklistPriv *tp)
+{
+    FILE *f = fopen(tp->fixed_list_path, "r");
+    if (!f) {
+        return;
+    }
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[--len] = 0;
+        }
+        if (line[0] && line[0] != '#') {
+            tasklist_pin_class(tp, line);
+        }
+    }
+    fclose(f);
+}
+
+/* Writes tp->pinned[]'s wm_classes (one per line) to tp->fixed_list_path,
+ * so the pinned list survives a restart -- called after every pin/unpin
+ * that actually changes tp->pinned[] (see tasklist_menu_select()). If no
+ * fixed_list= was configured yet, this is also where one gets set up for
+ * the first time: a sidecar filename is picked (deterministic from this
+ * widget's own panel name + order, so re-running this on a second widget
+ * never collides), the file is created in the same directory as
+ * xispanel.conf (config_dir()), and `fixed_list=<name>` is appended to
+ * this widget's own WIDGET line on disk (config_widget_set_key()) so the
+ * next startup knows to load it -- see that function's doc comment for
+ * why this one write-back is safe to do unconditionally. If that config
+ * write fails for any reason (unwritable config dir, config not found on
+ * disk yet, ...), the pin still works for the running session, it just
+ * won't survive a restart -- logged, not fatal. */
+static void tasklist_persist_pinned(PanelWidget *w)
+{
+    TasklistPriv *tp = w->priv;
+    if (!tp->fixed_list_path[0]) {
+        char dir[PATH_MAX];
+        if (!config_dir(dir, sizeof(dir))) {
+            return;
+        }
+        char fname[64];
+        snprintf(fname, sizeof(fname), "xispanel-pinned-%s-%d.list", w->panel->name, w->order);
+        if (!config_widget_set_key(w->panel->name, w->order, "tasklist", "fixed_list", fname)) {
+            fprintf(stderr,
+                    "xispanel: tasklist: could not add fixed_list= to config -- pins won't survive a restart\n");
+            return;
+        }
+        snprintf(tp->fixed_list_path, sizeof(tp->fixed_list_path), "%s/%s", dir, fname);
+    }
+    FILE *f = fopen(tp->fixed_list_path, "w");
+    if (!f) {
+        fprintf(stderr, "xispanel: tasklist: could not write %s: %s\n", tp->fixed_list_path, strerror(errno));
+        return;
+    }
+    for (int i = 0; i < tp->n_pinned; i++) {
+        fprintf(f, "%s\n", tp->pinned[i].wm_class);
+    }
+    fclose(f);
+}
+
 static int tasklist_init(PanelWidget *w)
 {
     TasklistPriv *tp = w->priv;
@@ -249,6 +320,27 @@ static int tasklist_init(PanelWidget *w)
         char *save = NULL;
         for (char *tok = strtok_r(list, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
             tasklist_pin_class(tp, tok);
+        }
+    }
+
+    /* `fixed_list=<file>` -- the persisted pinned-apps sidecar (see
+     * tasklist_persist_pinned()'s doc comment). An absolute path is used
+     * as-is; anything else is resolved relative to xispanel.conf's own
+     * directory (config_dir()), matching where tasklist_persist_pinned()
+     * creates it. Loaded after `pinned=` above so both can coexist
+     * (tasklist_pin_class() is a no-op for an already-pinned wm_class). */
+    char fixed_list_name[128];
+    if (kv_get(w->config_kv, "fixed_list", fixed_list_name, sizeof(fixed_list_name))) {
+        if (fixed_list_name[0] == '/') {
+            snprintf(tp->fixed_list_path, sizeof(tp->fixed_list_path), "%s", fixed_list_name);
+        } else {
+            char dir[PATH_MAX];
+            if (config_dir(dir, sizeof(dir))) {
+                snprintf(tp->fixed_list_path, sizeof(tp->fixed_list_path), "%s/%s", dir, fixed_list_name);
+            }
+        }
+        if (tp->fixed_list_path[0]) {
+            tasklist_load_fixed_list(tp);
         }
     }
 
@@ -786,11 +878,6 @@ static void tasklist_paint(PanelWidget *w, cairo_t *cr)
             pango_show_text_boxed(cr, bx + icon_px + 10, oy, w->thickness, bw - icon_px - 16, panel_text_size(p),
                                    e->title, NULL);
         }
-        if (e->pinned) {
-            cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.9);
-            cairo_arc(cr, bx + icon_px + 2, icon_y + 2, 2.5, 0, 2 * 3.14159265);
-            cairo_fill(cr);
-        }
         if (tp->show_desktop_badge && tp->n_desktops > 1 && e->desktop >= 0) {
             char badge[16];
             snprintf(badge, sizeof(badge), "%d", e->desktop + 1);
@@ -809,9 +896,9 @@ static void tasklist_paint(PanelWidget *w, cairo_t *cr)
             cairo_set_font_size(cr, panel_text_size(p));
         }
         if (group_count > 1) {
-            /* Bottom-left of the icon -- deliberately the one corner the
-             * pin dot (top-right) and desktop badge (bottom-right) never
-             * use, so all three can be shown at once without overlapping. */
+            /* Bottom-left of the icon -- deliberately the corner the
+             * desktop badge (bottom-right) never uses, so both can be
+             * shown at once without overlapping. */
             char badge[16];
             snprintf(badge, sizeof(badge), "%d", group_count);
             double badge_fs = w->thickness * 0.28;
@@ -897,6 +984,7 @@ static void tasklist_menu_select(Panel *panel, PanelWidget *w, void *ctx, int in
             break;
         case 1: /* Desafixar */
             tasklist_unpin_class(tp, tp->pinned[pi].wm_class);
+            tasklist_persist_pinned(w);
             break;
         default:
             break;
@@ -933,8 +1021,10 @@ static void tasklist_menu_select(Panel *panel, PanelWidget *w, void *ctx, int in
         if (idx >= 0) {
             if (tp->tasks[idx].pinned) {
                 tasklist_unpin_class(tp, tp->tasks[idx].wm_class);
+                tasklist_persist_pinned(w);
             } else if (tp->tasks[idx].wm_class[0]) {
                 tasklist_pin_class(tp, tp->tasks[idx].wm_class);
+                tasklist_persist_pinned(w);
             }
         }
         break;
