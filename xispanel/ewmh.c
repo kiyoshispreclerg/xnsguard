@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 Atom g_atom_wm_window_type;
@@ -986,8 +987,9 @@ cairo_surface_t *resolve_icon_theme_name(const char *name)
     detect_icon_theme(theme, sizeof(theme));
     const char *home = getenv("HOME");
 
-    char base_buf[7][PATH_MAX];
-    const char *bases[7];
+#define ICON_BASE_MAX 48
+    char base_buf[ICON_BASE_MAX][PATH_MAX];
+    const char *bases[ICON_BASE_MAX];
     int n_bases = 0;
     if (theme[0]) {
         snprintf(base_buf[n_bases], PATH_MAX, "/usr/share/icons/%s", theme);
@@ -1008,7 +1010,7 @@ cairo_surface_t *resolve_icon_theme_name(const char *name)
         "/usr/share/icons/Adwaita",
         "/usr/share/icons/hicolor",
     };
-    for (size_t i = 0; i < sizeof(hardcoded) / sizeof(hardcoded[0]) && n_bases < 7; i++) {
+    for (size_t i = 0; i < sizeof(hardcoded) / sizeof(hardcoded[0]) && n_bases < ICON_BASE_MAX; i++) {
         int dup = 0;
         for (int j = 0; j < n_bases; j++) {
             if (strcmp(bases[j], hardcoded[i]) == 0) {
@@ -1019,6 +1021,43 @@ cairo_surface_t *resolve_icon_theme_name(const char *name)
         if (!dup) {
             bases[n_bases++] = hardcoded[i];
         }
+    }
+    /* Last resort: every OTHER installed theme under /usr/share/icons,
+     * not just the curated shortlist above -- confirmed real gap (KDE's
+     * "System Monitor" ships Icon=utilities-system-monitor, which exists
+     * as a decodable PNG only in the "gnome"/"oxygen" themes on a live
+     * system; breeze only has an SVG copy, which fails to decode when
+     * Imlib2 has no SVG loader -- see the .png-before-.svg comment
+     * below). A distro can ship a dozen+ icon themes though, so this is
+     * a fallback of last resort, tried after every curated base above
+     * comes up empty, not folded into the curated list itself. */
+    DIR *icons_root = opendir("/usr/share/icons");
+    if (icons_root) {
+        struct dirent *de;
+        while ((de = readdir(icons_root)) != NULL && n_bases < ICON_BASE_MAX) {
+            if (de->d_name[0] == '.') {
+                continue;
+            }
+            char cand[PATH_MAX];
+            snprintf(cand, sizeof(cand), "/usr/share/icons/%s", de->d_name);
+            struct stat st;
+            if (stat(cand, &st) != 0 || !S_ISDIR(st.st_mode)) {
+                continue;
+            }
+            int dup = 0;
+            for (int j = 0; j < n_bases; j++) {
+                if (strcmp(bases[j], cand) == 0) {
+                    dup = 1;
+                    break;
+                }
+            }
+            if (!dup) {
+                snprintf(base_buf[n_bases], PATH_MAX, "%s", cand);
+                bases[n_bases] = base_buf[n_bases];
+                n_bases++;
+            }
+        }
+        closedir(icons_root);
     }
 
     /* "legacy" matters: some icon names from the freedesktop spec's

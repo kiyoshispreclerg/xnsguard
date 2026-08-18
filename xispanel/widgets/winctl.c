@@ -59,6 +59,13 @@ typedef struct {
     char title[128];
     int minimized, maximized;
     cairo_surface_t *icon;
+    /* 1 once a .desktop-entry icon fallback lookup has been attempted for
+     * active_win -- reset alongside `icon` whenever active_win changes
+     * (see winctl_on_tick()). Without this, a window whose icon never
+     * resolves (no matching .desktop file) would get its directory scan
+     * repeated every ~2s/property-event for as long as it stays active,
+     * same concern tasklist.c's own icon_lookup_tried avoids. */
+    int icon_lookup_tried;
 
     /* Recomputed by winctl_layout() from the widget's actual allotted
      * w->len every paint/on_button call, same pattern as tasklist's
@@ -261,6 +268,7 @@ static int winctl_on_tick(PanelWidget *w, uint64_t now)
             cairo_surface_destroy(wp->icon);
             wp->icon = NULL;
         }
+        wp->icon_lookup_tried = 0;
         wp->active_win = active;
     }
 
@@ -288,6 +296,19 @@ static int winctl_on_tick(PanelWidget *w, uint64_t now)
         if (!wp->icon) {
             int icon_px = w->thickness > 8 ? w->thickness - 8 : 16;
             wp->icon = ewmh_get_icon_surface(active, icon_px);
+        }
+        if (!wp->icon && !wp->icon_lookup_tried) {
+            /* _NET_WM_ICON didn't supply one -- fall back to the same
+             * .desktop-entry lookup tasklist.c uses (see its on_tick doc
+             * comment for the apps this covers). */
+            wp->icon_lookup_tried = 1;
+            char wm_class[64], icon_name[256] = "";
+            ewmh_get_class(active, wm_class, sizeof(wm_class));
+            if (wm_class[0] &&
+                desktop_entry_find_by_wm_class(wm_class, NULL, 0, NULL, 0, icon_name, sizeof(icon_name)) &&
+                icon_name[0]) {
+                wp->icon = resolve_icon_theme_name(icon_name);
+            }
         }
     } else {
         wp->title[0] = 0;

@@ -26,6 +26,7 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define MAX_TASKS 64
@@ -91,6 +92,8 @@ typedef struct {
                        * no-op if xispanel was built without libXcomposite or no compositor is running. */
     int show_desktop_badge; /* 1 = draw the task's virtual-desktop number on its icon; 0 (default) = don't. */
     int group_apps; /* 1 = collapse same-app windows (matched by WM_CLASS) into one button; 0 (default) = don't. */
+    int fixed_first; /* 1 (default) = pinned block always before the regular-windows block; 0 = regular block
+                       * first, pinned block after -- see tasklist_on_tick()'s block-merge doc comment. */
     PinnedApp pinned[MAX_PINNED];
     int n_pinned;
     /* Absolute path of the pinned-apps sidecar file (fixed_list=), empty
@@ -308,6 +311,7 @@ static int tasklist_init(PanelWidget *w)
     tp->show_thumbs = kv_get(w->config_kv, "show_thumbs", buf, sizeof(buf)) && strcmp(buf, "yes") == 0;
     tp->show_desktop_badge = kv_get(w->config_kv, "show_desktop_badge", buf, sizeof(buf)) && strcmp(buf, "yes") == 0;
     tp->group_apps = kv_get(w->config_kv, "group", buf, sizeof(buf)) && strcmp(buf, "yes") == 0;
+    tp->fixed_first = !(kv_get(w->config_kv, "fixed_first", buf, sizeof(buf)) && strcmp(buf, "no") == 0);
     tp->n_desktops = 1;
 
     /* Optional `pinned=<wm_class1>,<wm_class2>,...` -- pins that should
@@ -384,8 +388,8 @@ static int tasklist_on_tick(PanelWidget *w, uint64_t now)
 
     int current_desktop = tp->same_desktop_only ? ewmh_get_current_desktop() : -1;
 
-    TaskEntry fresh[MAX_TASKS];
-    int n_fresh = 0;
+    TaskEntry real_windows[MAX_TASKS];
+    int n_real = 0;
     int icon_px = icon_size_for(w->thickness, tp->icon_padding);
     for (int i = 0; i < n; i++) {
         Window win = list[i];
@@ -408,7 +412,7 @@ static int tasklist_on_tick(PanelWidget *w, uint64_t now)
             continue;
         }
         int old_idx = tasklist_find(tp, win);
-        TaskEntry *e = &fresh[n_fresh++];
+        TaskEntry *e = &real_windows[n_real++];
         memset(e, 0, sizeof(*e));
         e->win = win;
         ewmh_get_title(win, e->title, sizeof(e->title));
@@ -417,7 +421,7 @@ static int tasklist_on_tick(PanelWidget *w, uint64_t now)
         e->minimized = minimized;
         e->maximized = maximized;
         if (old_idx >= 0) {
-            e->icon = tp->tasks[old_idx].icon; /* ownership moves to `fresh` */
+            e->icon = tp->tasks[old_idx].icon; /* ownership moves to `real_windows` */
             tp->tasks[old_idx].icon = NULL;
             e->icon_lookup_tried = tp->tasks[old_idx].icon_lookup_tried;
         } else {
@@ -443,27 +447,39 @@ static int tasklist_on_tick(PanelWidget *w, uint64_t now)
     }
     XFree(list);
 
-    /* Pinned apps (tasklist_pin_class()) with no window among `fresh`
-     * matching their wm_class get a launcher-style placeholder button
-     * appended, and every match gets flagged pinned (the "pin" dot and
-     * the context menu's Desafixar item both read TaskEntry::pinned, not
-     * PinnedApp directly, so a running window's pinned-ness is always
-     * derived fresh here rather than carried forward from the previous
-     * tick -- tp->pinned[] is the single source of truth for what's
-     * pinned, never TaskEntry::pinned on its own). */
-    for (int pi = 0; pi < tp->n_pinned && n_fresh < MAX_TASKS; pi++) {
+    /* Splits real_windows[] into two ordered blocks -- pinned_block (every
+     * window whose wm_class is in tp->pinned[], in pin order, plus a
+     * launcher-style placeholder for any pinned class with no running
+     * match) and regular_block (every other window, in its original
+     * _NET_CLIENT_LIST order) -- then reassembles them according to
+     * tp->fixed_first: pinned_block first (the default), or last, so
+     * fixed_first=no visually mixes pinned and regular buttons by putting
+     * all the regular ones first instead of always leading with pins.
+     * Either way, a given pinned app's position *within* pinned_block
+     * never depends on whether it's currently running -- pin order alone
+     * decides that, so its button doesn't jump around the row as it opens
+     * and closes, only swaps between placeholder and real-window look in
+     * place (see TaskEntry::is_placeholder). */
+    int consumed[MAX_TASKS] = {0};
+    TaskEntry pinned_block[MAX_TASKS];
+    int n_pinned_block = 0;
+    for (int pi = 0; pi < tp->n_pinned && n_pinned_block < MAX_TASKS; pi++) {
         PinnedApp *pa = &tp->pinned[pi];
         int matched = 0;
-        for (int i = 0; i < n_fresh; i++) {
-            if (fresh[i].wm_class[0] && strcmp(fresh[i].wm_class, pa->wm_class) == 0) {
-                fresh[i].pinned = 1;
+        for (int i = 0; i < n_real; i++) {
+            if (!consumed[i] && real_windows[i].wm_class[0] && strcmp(real_windows[i].wm_class, pa->wm_class) == 0) {
+                consumed[i] = 1;
+                real_windows[i].pinned = 1;
+                if (n_pinned_block < MAX_TASKS) {
+                    pinned_block[n_pinned_block++] = real_windows[i];
+                }
                 matched = 1;
             }
         }
-        if (matched) {
+        if (matched || n_pinned_block >= MAX_TASKS) {
             continue;
         }
-        TaskEntry *e = &fresh[n_fresh++];
+        TaskEntry *e = &pinned_block[n_pinned_block++];
         memset(e, 0, sizeof(*e));
         e->win = None;
         e->is_placeholder = 1;
@@ -471,6 +487,34 @@ static int tasklist_on_tick(PanelWidget *w, uint64_t now)
         snprintf(e->wm_class, sizeof(e->wm_class), "%s", pa->wm_class);
         snprintf(e->title, sizeof(e->title), "%s", pa->name);
         e->icon = pa->icon; /* borrowed -- see TaskEntry::is_placeholder's doc comment */
+    }
+
+    TaskEntry fresh[MAX_TASKS];
+    int n_fresh = 0;
+    if (tp->fixed_first) {
+        for (int i = 0; i < n_pinned_block && n_fresh < MAX_TASKS; i++) {
+            fresh[n_fresh++] = pinned_block[i];
+        }
+    }
+    for (int i = 0; i < n_real && n_fresh < MAX_TASKS; i++) {
+        if (!consumed[i]) {
+            fresh[n_fresh++] = real_windows[i];
+        }
+    }
+    if (!tp->fixed_first) {
+        for (int i = 0; i < n_pinned_block && n_fresh < MAX_TASKS; i++) {
+            fresh[n_fresh++] = pinned_block[i];
+        }
+    }
+
+    if (getenv("XISPANEL_DEBUG_TASKLIST")) {
+        fprintf(stderr, "tasklist[%s] fixed_first=%d n_pinned=%d order:", w->panel->name, tp->fixed_first,
+                tp->n_pinned);
+        for (int i = 0; i < n_fresh; i++) {
+            fprintf(stderr, " [%s%s%s]", fresh[i].pinned ? "P:" : "", fresh[i].wm_class[0] ? fresh[i].wm_class : "?",
+                    fresh[i].is_placeholder ? "(ph)" : "");
+        }
+        fprintf(stderr, "\n");
     }
 
     /* Anything still owning an icon surface here belonged to a window
