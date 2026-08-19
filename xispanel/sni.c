@@ -94,6 +94,14 @@ static const char *g_watcher_name = NULL;
 /* Set by sni_handle_incoming() when any item's NewIcon/NewStatus/etc.
  * signal arrived since the last poll; sni_poll() checks + clears it. */
 static int g_saw_change_signal = 0;
+/* See xispanel.h's doc comment. 0 = unknown yet (no shrink applied) --
+ * tray.c syncs this in on_tick() before any icon this poll gets fetched. */
+static int g_icon_target_size = 0;
+
+void sni_set_icon_target_size(int px)
+{
+    g_icon_target_size = px;
+}
 
 static void *g_libdbus = NULL;
 static int g_load_attempted = 0;
@@ -704,7 +712,7 @@ int sni_poll(uint64_t now)
                                               SNI_ITEM_IFACE, "IconPixmap");
             cairo_surface_t *icon = NULL;
             if (ireply) {
-                icon = extract_get_icon_pixmap(ireply);
+                icon = shrink_icon_surface(extract_get_icon_pixmap(ireply), g_icon_target_size);
                 p_dbus_message_unref(ireply);
             }
             if (!icon) {
@@ -719,7 +727,7 @@ int sni_poll(uint64_t now)
                     char iconname[128] = "";
                     extract_get_string(nreply, iconname, sizeof(iconname));
                     p_dbus_message_unref(nreply);
-                    icon = resolve_icon_theme_name(iconname);
+                    icon = resolve_icon_theme_name(iconname, g_icon_target_size);
                 }
             }
             if (icon) {

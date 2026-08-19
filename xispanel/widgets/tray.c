@@ -44,6 +44,8 @@ static int tray_init(PanelWidget *w)
     return 0;
 }
 
+static void tray_layout(PanelWidget *w, int *out_icon_px, int *out_slot, int *out_pad);
+
 static int tray_on_tick(PanelWidget *w, uint64_t now)
 {
     /* The tray's data is owned by sni.c, refreshed by sni_poll() in the
@@ -53,6 +55,16 @@ static int tray_on_tick(PanelWidget *w, uint64_t now)
      * tick scheduled so the loop stays warm enough to call sni_poll() at
      * its own cadence even on an otherwise-idle panel. */
     w->next_tick_ms = now + 1000;
+
+    /* Re-synced every tick rather than once at init() so a later RELOAD
+     * (panel thickness change) or a second tray widget with a different
+     * icon_padding= keeps sni.c's next IconPixmap/theme fetch shrinking to
+     * the right size -- cheap, sni_set_icon_target_size() is a plain
+     * assignment. Only ever affects icons (re)fetched *after* this call,
+     * see its doc comment. */
+    int icon_px, slot, pad;
+    tray_layout(w, &icon_px, &slot, &pad);
+    sni_set_icon_target_size(icon_px);
     return 0;
 }
 

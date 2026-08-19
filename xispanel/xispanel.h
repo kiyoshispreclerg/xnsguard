@@ -412,6 +412,19 @@ cairo_surface_t *ewmh_get_icon_surface(Window w, int target_size); /* NULL if no
 
 /* ---- small drawing helpers built on top of the above (ewmh.c) ---- */
 int icon_size_for(int thickness, int padding); /* shared by tasklist/tray's icon_padding= */
+/* Downscales `src` to fit within target_size x target_size (aspect
+ * preserved), replacing it with a new smaller surface and destroying the
+ * original. Never upscales -- if `src` is already <= target_size on both
+ * axes, it's returned unchanged. Every icon source (icon-theme lookup,
+ * _NET_WM_ICON, SNI IconPixmap, a user's icon=<path>) can hand back
+ * something much larger than any panel actually needs (icon themes commonly
+ * ship 256/512px PNGs even for icons only ever drawn at 16-48px) -- calling
+ * this once right after resolving/decoding, instead of leaving the full-res
+ * surface around to be re-scaled by draw_icon_scaled() on every repaint,
+ * is what actually saves the memory and per-frame scaling CPU that matters
+ * (draw_icon_scaled() itself still does the final tiny fit, but scaling a
+ * 24x24 source is nearly free next to scaling a 512x512 one every paint). */
+cairo_surface_t *shrink_icon_surface(cairo_surface_t *src, int target_size);
 void draw_icon_scaled(cairo_t *cr, cairo_surface_t *icon, double x, double y, double size);
 void draw_fallback_icon(cairo_t *cr, double x, double y, double size, const char *title, double fg_r, double fg_g,
                          double fg_b, double font_size_px);
@@ -432,8 +445,20 @@ void trim_to_utf8_boundary(char *s);
 void copy_utf8_truncated(char *dst, size_t dst_sz, const char *src);
 /* Resolves a themed icon name (e.g. "folder", or a tray item's IconName)
  * against a fixed grid of common icon-theme paths -- see ewmh.c's doc
- * comment for the tradeoffs. NULL if nothing matched. */
-cairo_surface_t *resolve_icon_theme_name(const char *name);
+ * comment for the tradeoffs. `target_size` (the pixel size the icon will
+ * actually be drawn at) steers which per-size theme directory is tried
+ * first -- the smallest one that's still >= target_size, to avoid pulling
+ * in and decoding a much larger PNG than needed -- and the result is
+ * shrunk to fit target_size before returning (see shrink_icon_surface()).
+ * Pass 0 to skip both (old behavior: fixed size-directory order, no
+ * shrink) -- only meant for the rare caller that doesn't know its target
+ * size yet. NULL if nothing matched. */
+cairo_surface_t *resolve_icon_theme_name(const char *name, int target_size);
+/* Same as load_png_argb(), but also shrinks the result to fit
+ * target_size x target_size (see shrink_icon_surface()) -- use this
+ * instead of load_png_argb() for any user-supplied icon=<path> that's
+ * about to be drawn at a known fixed size. */
+cairo_surface_t *load_icon_argb(const char *path, int target_size);
 /* Finds the .desktop entry that best matches a window's WM_CLASS
  * res_class -- see ewmh.c's doc comment for the match rules and scope.
  * Used by tasklist.c both to name/launch/icon a pinned-but-not-running
@@ -660,6 +685,15 @@ void mpris_previous(const char *busname);
  * appearance changed (so a panel with a tray widget needs repainting),
  * 0 otherwise -- lets the loop avoid a repaint when nothing changed. */
 int sni_poll(uint64_t now);
+/* Pixel size tray icons are actually drawn at -- IconPixmap/icon-theme
+ * lookups are shrunk to this size right after resolving (see
+ * shrink_icon_surface()) instead of keeping whatever resolution the
+ * source happened to offer (some apps publish IconPixmap up to 512x512).
+ * Call whenever it might have changed (tray.c's on_tick re-syncs it every
+ * ~1s, same pattern notif.c uses for toast.c's theme sync) -- takes
+ * effect the next time an icon is (re)fetched, doesn't retroactively
+ * shrink icons already cached. */
+void sni_set_icon_target_size(int px);
 int sni_count(void);
 const char *sni_title(int idx); /* "" if idx out of range */
 cairo_surface_t *sni_icon(int idx); /* NULL if unknown/idx out of range */

@@ -984,6 +984,47 @@ cairo_surface_t *load_png_argb(const char *path)
     return surf;
 }
 
+/* See xispanel.h's doc comment. */
+cairo_surface_t *shrink_icon_surface(cairo_surface_t *src, int target_size)
+{
+    if (!src || cairo_surface_status(src) != CAIRO_STATUS_SUCCESS || target_size <= 0) {
+        return src;
+    }
+    int iw = cairo_image_surface_get_width(src);
+    int ih = cairo_image_surface_get_height(src);
+    if (iw <= 0 || ih <= 0 || (iw <= target_size && ih <= target_size)) {
+        return src; /* already small enough -- never upscale */
+    }
+    double scale = (double)target_size / (double)(iw > ih ? iw : ih);
+    int nw = (int)(iw * scale + 0.5);
+    int nh = (int)(ih * scale + 0.5);
+    if (nw < 1) {
+        nw = 1;
+    }
+    if (nh < 1) {
+        nh = 1;
+    }
+    cairo_surface_t *dst = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, nw, nh);
+    if (cairo_surface_status(dst) != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(dst);
+        return src;
+    }
+    cairo_t *cr = cairo_create(dst);
+    cairo_scale(cr, scale, scale);
+    cairo_set_source_surface(cr, src, 0, 0);
+    cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_GOOD);
+    cairo_paint(cr);
+    cairo_destroy(cr);
+    cairo_surface_destroy(src);
+    return dst;
+}
+
+/* See xispanel.h's doc comment. */
+cairo_surface_t *load_icon_argb(const char *path, int target_size)
+{
+    return shrink_icon_surface(load_png_argb(path), target_size);
+}
+
 /* Sidecar "measurements" file for a 9-slice bg_image: plain key=value
  * lines (left/top/right/bottom, pixels in the *source image*), same
  * spirit as the rest of this program's config format. Missing file or

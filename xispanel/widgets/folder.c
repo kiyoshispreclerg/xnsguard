@@ -126,15 +126,22 @@ static int folder_init(PanelWidget *w)
         const char *base = strrchr(fp->path, '/');
         snprintf(fp->name, sizeof(fp->name), "%s", (base && base[1]) ? base + 1 : fp->path);
     }
+    /* w->thickness isn't resolved yet this early (init() runs before
+     * panel_resolve_geometry() -- see notif_init()'s doc comment in
+     * notif.c) -- fall back to the panel's configured thickness_cfg
+     * (already set from this panel's own PANEL line) instead of shrinking
+     * every icon to a blurry fixed 16px. */
+    int thickness = w->thickness > 0 ? w->thickness : w->panel->thickness_cfg;
+    int icon_px = thickness > 6 ? thickness - 6 : 16;
     char icon_path[PATH_MAX];
     if (kv_get(w->config_kv, "icon", icon_path, sizeof(icon_path)) && icon_path[0]) {
-        fp->icon = load_png_argb(icon_path);
+        fp->icon = load_icon_argb(icon_path, icon_px);
         if (!fp->icon) {
             fprintf(stderr, "xispanel: folder: could not load icon '%s', falling back\n", icon_path);
         }
     }
     if (!fp->icon) {
-        fp->icon = resolve_icon_theme_name("folder");
+        fp->icon = resolve_icon_theme_name("folder", icon_px);
     }
     char hotkey[64];
     if (kv_get(w->config_kv, "hotkey", hotkey, sizeof(hotkey)) && hotkey[0]) {

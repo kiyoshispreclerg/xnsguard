@@ -49,7 +49,11 @@ static int launcher_init(PanelWidget *w)
 
     char icon_path[PATH_MAX];
     if (kv_get(w->config_kv, "icon", icon_path, sizeof(icon_path)) && icon_path[0]) {
-        lp->icon = load_png_argb(icon_path);
+        /* w->thickness isn't resolved yet this early -- see the same fix
+         * in folder_init(). */
+        int thickness = w->thickness > 0 ? w->thickness : w->panel->thickness_cfg;
+        int icon_px = thickness > 6 ? thickness - 6 : 16;
+        lp->icon = load_icon_argb(icon_path, icon_px);
         if (!lp->icon) {
             fprintf(stderr, "xispanel: launcher: could not load icon '%s', falling back to a placeholder\n",
                     icon_path);

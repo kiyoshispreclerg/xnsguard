@@ -189,8 +189,9 @@ static int tasklist_find(TasklistPriv *tp, Window win)
  * Icon=) is found, the placeholder button just falls back to
  * draw_fallback_icon() like any other icon-less entry -- same as a real
  * running window whose _NET_WM_ICON is also missing. */
-static void tasklist_pin_class(TasklistPriv *tp, const char *cls)
+static void tasklist_pin_class(PanelWidget *w, const char *cls)
 {
+    TasklistPriv *tp = w->priv;
     if (!cls[0] || tp->n_pinned >= MAX_PINNED) {
         return;
     }
@@ -210,7 +211,17 @@ static void tasklist_pin_class(TasklistPriv *tp, const char *cls)
         snprintf(pa->name, sizeof(pa->name), "%s", cls);
     }
     if (icon_name[0]) {
-        pa->icon = resolve_icon_theme_name(icon_name);
+        /* w->thickness isn't resolved yet the first time this runs (from
+         * tasklist_init()'s `pinned=`/`fixed_list=` parsing, which happens
+         * before panel_resolve_geometry() -- see notif_init()'s doc
+         * comment on the same ordering) -- fall back to the panel's
+         * *configured* thickness_cfg (already set from this panel's own
+         * PANEL line, always parsed before its WIDGET lines) rather than
+         * shrinking to icon_size_for(0, ...)'s floor of 4px. A later pin
+         * via the right-click "Fixar" menu runs on an already-laid-out
+         * panel, where w->thickness is the real thing. */
+        int thickness = w->thickness > 0 ? w->thickness : w->panel->thickness_cfg;
+        pa->icon = resolve_icon_theme_name(icon_name, icon_size_for(thickness, tp->icon_padding));
     }
 }
 
@@ -235,8 +246,9 @@ static void tasklist_unpin_class(TasklistPriv *tp, const char *cls)
  * that path is resolved. Silent no-op if the file doesn't exist yet
  * (e.g. fixed_list= was hand-added to the config before ever pinning
  * anything through the UI). */
-static void tasklist_load_fixed_list(TasklistPriv *tp)
+static void tasklist_load_fixed_list(PanelWidget *w)
 {
+    TasklistPriv *tp = w->priv;
     FILE *f = fopen(tp->fixed_list_path, "r");
     if (!f) {
         return;
@@ -248,7 +260,7 @@ static void tasklist_load_fixed_list(TasklistPriv *tp)
             line[--len] = 0;
         }
         if (line[0] && line[0] != '#') {
-            tasklist_pin_class(tp, line);
+            tasklist_pin_class(w, line);
         }
     }
     fclose(f);
@@ -323,7 +335,7 @@ static int tasklist_init(PanelWidget *w)
     if (kv_get(w->config_kv, "pinned", list, sizeof(list))) {
         char *save = NULL;
         for (char *tok = strtok_r(list, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
-            tasklist_pin_class(tp, tok);
+            tasklist_pin_class(w, tok);
         }
     }
 
@@ -344,7 +356,7 @@ static int tasklist_init(PanelWidget *w)
             }
         }
         if (tp->fixed_list_path[0]) {
-            tasklist_load_fixed_list(tp);
+            tasklist_load_fixed_list(w);
         }
     }
 
@@ -441,7 +453,7 @@ static int tasklist_on_tick(PanelWidget *w, uint64_t now)
             char icon_name[256] = "";
             if (desktop_entry_find_by_wm_class(e->wm_class, NULL, 0, NULL, 0, icon_name, sizeof(icon_name)) &&
                 icon_name[0]) {
-                e->icon = resolve_icon_theme_name(icon_name);
+                e->icon = resolve_icon_theme_name(icon_name, icon_px);
             }
         }
     }
@@ -1081,7 +1093,7 @@ static void tasklist_menu_select(Panel *panel, PanelWidget *w, void *ctx, int in
                 tasklist_unpin_class(tp, tp->tasks[idx].wm_class);
                 tasklist_persist_pinned(w);
             } else if (tp->tasks[idx].wm_class[0]) {
-                tasklist_pin_class(tp, tp->tasks[idx].wm_class);
+                tasklist_pin_class(w, tp->tasks[idx].wm_class);
                 tasklist_persist_pinned(w);
             }
         }

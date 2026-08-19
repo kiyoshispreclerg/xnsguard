@@ -672,7 +672,13 @@ cairo_surface_t *ewmh_get_icon_surface(Window w, int target_size)
     }
     cairo_surface_mark_dirty(surf);
     XFree(prop);
-    return surf;
+    /* The size-picking loop above already tries to land on the smallest
+     * available icon that's still >= target_size, but "smallest available"
+     * can still be much bigger than target_size (e.g. a window that only
+     * publishes a 128x128 _NET_WM_ICON for a 22px taskbar button) -- shrink
+     * to the exact size actually needed rather than caching (and re-scaling
+     * every repaint) whatever was closest. */
+    return shrink_icon_surface(surf, target_size);
 }
 
 /* icon_padding=0 (default, for whichever widget's config exposes this)
@@ -967,13 +973,13 @@ static void detect_icon_theme(char *out, size_t outsz)
     fclose(f);
 }
 
-cairo_surface_t *resolve_icon_theme_name(const char *name)
+cairo_surface_t *resolve_icon_theme_name(const char *name, int target_size)
 {
     if (!name || !name[0]) {
         return NULL;
     }
     if (name[0] == '/') {
-        return load_png_argb(name);
+        return shrink_icon_surface(load_png_argb(name), target_size);
     }
 
     /* The user's actual icon theme (if detected) is searched first, ahead
@@ -1078,9 +1084,45 @@ cairo_surface_t *resolve_icon_theme_name(const char *name)
      * hicolor-only apps that never ship a "scalable" SVG (confirmed:
      * OBS Studio's hicolor entry is 128x128/256x256/512x512 PNGs plus a
      * scalable SVG, no smaller sizes at all). */
-    static const char *sizedirs[] = {"symbolic", "scalable", "48x48",   "48",  "32x32",   "32",     "24x24",
-                                      "24",       "22x22",    "22",      "16x16", "16",   "64x64",  "64",
-                                      "128x128",  "128",      "256x256", "256", "512x512", "512"};
+    static const char *sizedirs_default[] = {"symbolic", "scalable", "48x48",   "48",  "32x32",   "32",     "24x24",
+                                              "24",       "22x22",    "22",      "16x16", "16",   "64x64",  "64",
+                                              "128x128",  "128",      "256x256", "256", "512x512", "512"};
+    /* Reordered by proximity to target_size when known: ascending through
+     * every size >= target_size first (the smallest that's still big
+     * enough, avoiding decoding a needlessly larger PNG than what
+     * shrink_icon_surface() will immediately downscale anyway), then
+     * descending through sizes < target_size as a last resort (biggest
+     * available rather than blurriest). Falls back to the fixed order
+     * above when target_size is unknown (0). */
+    static const int numeric_sizes[] = {16, 22, 24, 32, 48, 64, 128, 256, 512};
+    char size_str_buf[sizeof(numeric_sizes) / sizeof(numeric_sizes[0]) * 2][8];
+    const char *sizedirs_ordered[2 + sizeof(numeric_sizes) / sizeof(numeric_sizes[0]) * 2];
+    const char **sizedirs = sizedirs_default;
+    size_t n_sizedirs = sizeof(sizedirs_default) / sizeof(sizedirs_default[0]);
+    if (target_size > 0) {
+        int n_numeric = (int)(sizeof(numeric_sizes) / sizeof(numeric_sizes[0]));
+        int idx = 0, nb = 0;
+        sizedirs_ordered[idx++] = "symbolic";
+        sizedirs_ordered[idx++] = "scalable";
+        for (int i = 0; i < n_numeric; i++) {
+            if (numeric_sizes[i] >= target_size) {
+                snprintf(size_str_buf[nb], sizeof(size_str_buf[0]), "%dx%d", numeric_sizes[i], numeric_sizes[i]);
+                sizedirs_ordered[idx++] = size_str_buf[nb++];
+                snprintf(size_str_buf[nb], sizeof(size_str_buf[0]), "%d", numeric_sizes[i]);
+                sizedirs_ordered[idx++] = size_str_buf[nb++];
+            }
+        }
+        for (int i = n_numeric - 1; i >= 0; i--) {
+            if (numeric_sizes[i] < target_size) {
+                snprintf(size_str_buf[nb], sizeof(size_str_buf[0]), "%dx%d", numeric_sizes[i], numeric_sizes[i]);
+                sizedirs_ordered[idx++] = size_str_buf[nb++];
+                snprintf(size_str_buf[nb], sizeof(size_str_buf[0]), "%d", numeric_sizes[i]);
+                sizedirs_ordered[idx++] = size_str_buf[nb++];
+            }
+        }
+        sizedirs = sizedirs_ordered;
+        n_sizedirs = (size_t)idx;
+    }
     /* .png before .svg: Imlib2's SVG support depends on an optional
      * loader plugin (librsvg-backed) that isn't guaranteed to be
      * installed -- confirmed on a live system where imlib_load_image()
@@ -1093,21 +1135,21 @@ cairo_surface_t *resolve_icon_theme_name(const char *name)
     char path[PATH_MAX];
     for (int b = 0; b < n_bases; b++) {
         for (size_t c = 0; c < sizeof(categories) / sizeof(categories[0]); c++) {
-            for (size_t s = 0; s < sizeof(sizedirs) / sizeof(sizedirs[0]); s++) {
+            for (size_t s = 0; s < n_sizedirs; s++) {
                 for (size_t e = 0; e < sizeof(exts) / sizeof(exts[0]); e++) {
                     /* breeze order: <category>/<sizedir>/<name> */
                     snprintf(path, sizeof(path), "%s/%s/%s/%s%s", bases[b], categories[c], sizedirs[s], name,
                              exts[e]);
                     cairo_surface_t *surf = access(path, R_OK) == 0 ? load_png_argb(path) : NULL;
                     if (surf) {
-                        return surf;
+                        return shrink_icon_surface(surf, target_size);
                     }
                     /* Adwaita/hicolor order: <sizedir>/<category>/<name> */
                     snprintf(path, sizeof(path), "%s/%s/%s/%s%s", bases[b], sizedirs[s], categories[c], name,
                              exts[e]);
                     surf = access(path, R_OK) == 0 ? load_png_argb(path) : NULL;
                     if (surf) {
-                        return surf;
+                        return shrink_icon_surface(surf, target_size);
                     }
                 }
             }
@@ -1125,6 +1167,7 @@ cairo_surface_t *resolve_icon_theme_name(const char *name)
             snprintf(path, sizeof(path), "%s/%s%s", pixmap_dirs[d], name, exts2[e]);
             cairo_surface_t *surf = access(path, R_OK) == 0 ? load_png_argb(path) : NULL;
             if (surf) {
+                surf = shrink_icon_surface(surf, target_size);
                 return surf;
             }
         }

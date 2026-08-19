@@ -203,18 +203,25 @@ static int notifd_ensure_connected(void)
  * icon theme grid (see resolve_icon_theme_name() in ewmh.c) -- same
  * three forms sni.c already handles for a tray item's IconName/
  * IconPixmap fallback. NULL if empty or nothing resolved. */
+/* Matches toast.c's TOAST_ICON -- the only place a notification's icon is
+ * ever drawn, at a fixed size regardless of which panel/output shows the
+ * toast. Shrinking to it here (rather than caching whatever an icon
+ * theme/PNG happens to be) keeps the ring buffer's held icons cheap even
+ * when all NOTIFD_MAX ring entries are holding one. */
+#define NOTIFD_ICON_TARGET_PX 40
+
 static cairo_surface_t *resolve_notif_icon(const char *app_icon)
 {
     if (!app_icon || !app_icon[0]) {
         return NULL;
     }
     if (app_icon[0] == '/') {
-        return load_png_argb(app_icon);
+        return load_icon_argb(app_icon, NOTIFD_ICON_TARGET_PX);
     }
     if (!strncmp(app_icon, "file://", 7)) {
-        return load_png_argb(app_icon + 7);
+        return load_icon_argb(app_icon + 7, NOTIFD_ICON_TARGET_PX);
     }
-    return resolve_icon_theme_name(app_icon);
+    return resolve_icon_theme_name(app_icon, NOTIFD_ICON_TARGET_PX);
 }
 
 static void ring_append(const char *app_name, const char *app_icon, const char *summary, const char *body,
