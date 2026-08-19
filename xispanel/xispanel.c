@@ -219,6 +219,32 @@ void widget_get_rect(const PanelWidget *w, int *x, int *y, int *width, int *heig
     }
 }
 
+int panel_widget_hover_local_x(const PanelWidget *w, int *out_local_x)
+{
+    if (w->panel->hover_widget != w) {
+        return 0;
+    }
+    if (out_local_x) {
+        *out_local_x = w->panel->hover_local_x;
+    }
+    return 1;
+}
+
+void widget_paint_hover_rect(PanelWidget *w, cairo_t *cr, int x, int width)
+{
+    Panel *p = w->panel;
+    cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.12);
+    cairo_rectangle(cr, x, 0, width, w->thickness);
+    cairo_fill(cr);
+}
+
+void widget_paint_hover_bg(PanelWidget *w, cairo_t *cr)
+{
+    if (panel_widget_hover_local_x(w, NULL)) {
+        widget_paint_hover_rect(w, cr, 0, w->len);
+    }
+}
+
 double panel_text_size(const Panel *p)
 {
     return p->font_size_px > 0 ? p->font_size_px : p->thickness * 0.45;
@@ -887,13 +913,7 @@ static Window panel_create_sensor(Panel *p)
 /* 9-slice PNG background theme                                        */
 /* ------------------------------------------------------------------ */
 
-/* Decodes `path` via Imlib2 into a premultiplied-alpha cairo ARGB32
- * surface (Imlib2's DATA32 pixels are straight, not premultiplied --same
- * conversion ewmh_get_icon_surface() does for _NET_WM_ICON). NULL on any
- * failure (missing file, unreadable, decode error) -- callers treat that
- * as "no image", not a fatal error: THEME's bg_image is meant to
- * gracefully fall back to the plain bg_r/g/b/a color whenever it can't be
- * loaded. */
+/* Runs `cmd` via `sh -c`, detached (see xispanel.h's doc comment). */
 void run_detached(const char *cmd)
 {
     if (!cmd || !cmd[0]) {
@@ -911,6 +931,13 @@ void run_detached(const char *cmd)
     }
 }
 
+/* Decodes `path` via Imlib2 into a premultiplied-alpha cairo ARGB32
+ * surface (Imlib2's DATA32 pixels are straight, not premultiplied --same
+ * conversion ewmh_get_icon_surface() does for _NET_WM_ICON). NULL on any
+ * failure (missing file, unreadable, decode error) -- callers treat that
+ * as "no image", not a fatal error: a THEME's path=<folder>/bg.png is
+ * meant to gracefully fall back to the plain bg_r/g/b/a color whenever it
+ * can't be loaded. */
 cairo_surface_t *load_png_argb(const char *path)
 {
     Imlib_Image img = imlib_load_image(path);
@@ -971,7 +998,7 @@ static void load_slice_file(const char *path, int *l, int *t, int *r, int *b)
     }
     FILE *f = fopen(path, "r");
     if (!f) {
-        fprintf(stderr, "xispanel: could not open bg_slice file '%s', using 0-inset (full stretch)\n", path);
+        fprintf(stderr, "xispanel: could not open theme slice file '%s', using 0-inset (full stretch)\n", path);
         return;
     }
     char line[128];
@@ -991,25 +1018,30 @@ static void load_slice_file(const char *path, int *l, int *t, int *r, int *b)
 }
 
 /* Loads (or reloads) p's bg_image_surface + slice insets from its
- * currently configured bg_image_path/bg_slice_path. Called once from
- * panel_activate() -- config paths don't change without a full RELOAD,
- * which tears down and re-activates every panel anyway. */
+ * currently configured theme_path -- a folder containing fixed-named
+ * files (bg.png, slice) rather than separately-pointed-to files, so a
+ * theme can grow more files later without new config keys. Called once
+ * from panel_activate() -- config paths don't change without a full
+ * RELOAD, which tears down and re-activates every panel anyway. */
 static void panel_load_bg_image(Panel *p)
 {
     if (p->bg_image_surface) {
         cairo_surface_destroy(p->bg_image_surface);
         p->bg_image_surface = NULL;
     }
-    if (!p->bg_image_path[0]) {
+    if (!p->theme_path[0]) {
         return;
     }
-    p->bg_image_surface = load_png_argb(p->bg_image_path);
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/bg.png", p->theme_path);
+    p->bg_image_surface = load_png_argb(path);
     if (!p->bg_image_surface) {
-        fprintf(stderr, "xispanel: panel '%s': could not load bg_image '%s', falling back to bg color\n", p->name,
-                p->bg_image_path);
+        fprintf(stderr, "xispanel: panel '%s': could not load theme background '%s', falling back to bg color\n",
+                p->name, path);
         return;
     }
-    load_slice_file(p->bg_slice_path, &p->bg_slice_l, &p->bg_slice_t, &p->bg_slice_r, &p->bg_slice_b);
+    snprintf(path, sizeof(path), "%s/slice", p->theme_path);
+    load_slice_file(path, &p->bg_slice_l, &p->bg_slice_t, &p->bg_slice_r, &p->bg_slice_b);
 }
 
 /* Paints one source sub-rectangle [sx,sy,sw,sh] of `src` into one
@@ -1623,14 +1655,13 @@ static void apply_theme_kv(Panel *p, const char *kvline)
     if (kv_get(kvline, "font_size", buf, sizeof(buf))) {
         p->font_size_px = atof(buf);
     }
-    /* Optional 9-slice background image, replacing the bg_r/g/b/a color
-     * above entirely once it loads (panel_load_bg_image(), called from
+    /* Optional 9-slice background theme: path=<folder> containing bg.png
+     * (the image) and slice (the sidecar measurements file, itself
+     * optional -- missing it just means a plain full-image stretch, not
+     * an error). Actually loaded by panel_load_bg_image(), called from
      * panel_activate() -- not here, since that needs Imlib2/an open X
-     * display that may not exist yet while just parsing config text).
-     * bg_slice is the (also optional) sidecar measurements file; missing
-     * it just means a plain full-image stretch, not an error. */
-    kv_get(kvline, "bg_image", p->bg_image_path, sizeof(p->bg_image_path));
-    kv_get(kvline, "bg_slice", p->bg_slice_path, sizeof(p->bg_slice_path));
+     * display that may not exist yet while just parsing config text. */
+    kv_get(kvline, "path", p->theme_path, sizeof(p->theme_path));
 }
 
 /* Directory containing the config file (same place write_default_config_
@@ -2016,6 +2047,41 @@ static void dispatch_button(Panel *p, int button, int x, int y, int root_x, int 
     }
 }
 
+/* Updates p's generic hover-highlight state (see panel_widget_hover_local_x()
+ * in xispanel.h) from a MotionNotify's axis position -- same widget
+ * lookup dispatch_button() uses for clicks. Only marks the panel dirty
+ * when the hovered widget or its local_x actually changed, so a stream
+ * of MotionNotify events over the *same* spot (X can resend these) isn't
+ * a repaint each time. */
+static void panel_update_hover(Panel *p, int axis_pos)
+{
+    PanelWidget *hit = NULL;
+    int local_x = 0;
+    for (int i = 0; i < p->n_widgets; i++) {
+        PanelWidget *w = &p->widgets[i];
+        if (axis_pos >= w->x && axis_pos < w->x + w->len) {
+            hit = w;
+            local_x = axis_pos - w->x;
+            break;
+        }
+    }
+    if (hit != p->hover_widget || (hit && local_x != p->hover_local_x)) {
+        p->hover_widget = hit;
+        p->hover_local_x = local_x;
+        p->dirty = 1;
+    }
+}
+
+/* Clears p's hover-highlight state (pointer left the panel entirely) --
+ * called from LeaveNotify, alongside tooltip_notice_leave(). */
+static void panel_clear_hover(Panel *p)
+{
+    if (p->hover_widget) {
+        p->hover_widget = NULL;
+        p->dirty = 1;
+    }
+}
+
 /* How long to coalesce a stream of ConfigureNotify (window move/resize)
  * events before re-polling the widgets -- a drag emits one per pointer
  * motion, and only the window's *resting* output actually matters, so
@@ -2268,6 +2334,7 @@ static int run_as_daemon(const char *sockpath)
                     if (p && !is_sensor) {
                         int axis_pos = (p->edge == EDGE_TOP || p->edge == EDGE_BOTTOM) ? ev.xmotion.x : ev.xmotion.y;
                         tooltip_notice_motion(p, axis_pos);
+                        panel_update_hover(p, axis_pos);
                     }
                 } else if (ev.type == EnterNotify) {
                     int is_sensor = 0;
@@ -2281,6 +2348,7 @@ static int run_as_daemon(const char *sockpath)
                     if (p && !is_sensor) {
                         panel_autohide_leave(p);
                         tooltip_notice_leave(p);
+                        panel_clear_hover(p);
                     }
                 } else if (ev.type == Expose) {
                     int is_sensor = 0;

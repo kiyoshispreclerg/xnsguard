@@ -97,6 +97,7 @@ static void xisserve_paint(PanelWidget *w, cairo_t *cr)
     widget_get_rect(w, &ox, &oy, &owidth, &oheight);
     (void)owidth;
     (void)oheight;
+    widget_paint_hover_bg(w, cr);
 
     int icon_px = w->thickness > 6 ? w->thickness - 6 : 16;
     int icon_x = ox + (w->thickness - icon_px) / 2;

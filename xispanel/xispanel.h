@@ -198,14 +198,16 @@ struct Panel {
      * own font_size=<px>. */
     double font_size_px;
     int spacing;
-    /* Optional 9-slice background image, replacing the solid bg_* color
-     * entirely when it loads successfully -- see THEME's bg_image/
-     * bg_slice keys and panel_load_bg_image() in xispanel.c. Path fields
-     * are the raw config values (kept so reload can retry); *_surface is
-     * NULL whenever there's no image or it failed to load, in which case
+    /* Optional 9-slice background theme, replacing the solid bg_* color
+     * entirely when it loads successfully -- see THEME's path= key and
+     * panel_load_bg_image() in xispanel.c. A theme is a folder containing
+     * fixed-named files (bg.png, slice) rather than separately-pointed-to
+     * files, so more files can be added to a theme later (per-widget
+     * textures, etc.) without new config keys. theme_path is the raw
+     * config value (kept so reload can retry); bg_image_surface is NULL
+     * whenever there's no theme or it failed to load, in which case
      * panel_repaint() just falls back to bg_r/g/b/a as always. */
-    char bg_image_path[PATH_MAX];
-    char bg_slice_path[PATH_MAX];
+    char theme_path[PATH_MAX];
     int bg_slice_l, bg_slice_t, bg_slice_r, bg_slice_b;
     cairo_surface_t *bg_image_surface;
 
@@ -248,6 +250,15 @@ struct Panel {
 
     PanelWidget widgets[MAX_WIDGETS];
     int n_widgets;
+
+    /* Generic per-panel hover-highlight state, updated by the main
+     * event loop's MotionNotify/LeaveNotify handling -- see
+     * panel_widget_hover_local_x() in xispanel.c. Independent of
+     * tooltip.c's own hover tracking (that one drives popup delay
+     * timers; this one drives an instant, no-delay paint highlight).
+     * NULL = pointer isn't over any widget on this panel right now. */
+    PanelWidget *hover_widget;
+    int hover_local_x;
 };
 
 /* ---- shared X connection state (defined in xispanel.c) ---- */
@@ -283,6 +294,29 @@ int kv_get_int(const char *kvline, const char *key, int defval);
  * orientation (horizontal panels lay widgets out along x, vertical panels
  * along y). */
 void widget_get_rect(const PanelWidget *w, int *x, int *y, int *width, int *height);
+/* True (and fills *out_local_x, if not NULL) if the pointer is currently
+ * hovering `w` -- generic hover-highlight support any widget can opt
+ * into from its own paint(). *out_local_x is in the same local-axis
+ * coordinate space on_button()'s local_x already uses (0 at the
+ * widget's own leading edge), so a widget with several sub-items
+ * (tasklist's task buttons, tray's icons) can tell exactly which one is
+ * hovered the same way it already hit-tests clicks. See
+ * widget_paint_hover_bg()/widget_paint_hover_rect() for the actual
+ * paint step most widgets want. */
+int panel_widget_hover_local_x(const PanelWidget *w, int *out_local_x);
+/* Fills the sub-rect [x, x+width) x [0, w->thickness) of `w`'s own
+ * content (natural, un-rotated local coordinates -- same space every
+ * paint() already draws in) with a very transparent fg-colored
+ * highlight -- the shared hover-feedback look every opted-in widget
+ * uses. Draws unconditionally; callers that only want it while actually
+ * hovered should gate on panel_widget_hover_local_x() themselves (see
+ * widget_paint_hover_bg() for the common whole-widget case). */
+void widget_paint_hover_rect(PanelWidget *w, cairo_t *cr, int x, int width);
+/* widget_paint_hover_rect() over the whole widget (0..w->len), only
+ * while panel_widget_hover_local_x() is true -- what a widget with no
+ * sub-items of its own (launcher, clock, globalmenu, xisserve) wants:
+ * one call near the top of paint(), no state of its own to track. */
+void widget_paint_hover_bg(PanelWidget *w, cairo_t *cr);
 /* Resolved text size for `p`'s own in-panel widget text (task/window/clock
  * labels): p->font_size_px if set (system-detected or THEME's font_size=),
  * else the historical thickness-proportional size. Widgets that draw their

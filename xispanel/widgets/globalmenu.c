@@ -315,6 +315,7 @@ static void globalmenu_paint(PanelWidget *w, cairo_t *cr)
     }
     int ox, oy, owidth, oheight;
     widget_get_rect(w, &ox, &oy, &owidth, &oheight);
+    widget_paint_hover_bg(w, cr);
 
     Panel *p = w->panel;
     if (!gp->open_mode) {

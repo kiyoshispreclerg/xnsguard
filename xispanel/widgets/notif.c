@@ -234,6 +234,7 @@ static void notif_paint(PanelWidget *w, cairo_t *cr)
     widget_get_rect(w, &ox, &oy, &owidth, &oheight);
     (void)owidth;
     (void)oheight;
+    widget_paint_hover_bg(w, cr);
 
     int icon_px = icon_size_for(w->thickness, 0);
     double icon_y = oy + (w->thickness - icon_px) / 2.0;

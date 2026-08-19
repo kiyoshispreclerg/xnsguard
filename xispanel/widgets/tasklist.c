@@ -891,6 +891,8 @@ static void tasklist_paint(PanelWidget *w, cairo_t *cr)
      * approximation at 90/270 since the button's actual displayed spot is
      * transposed; acceptable for what's only an animation-endpoint hint. */
     int horiz = (p->edge == EDGE_TOP || p->edge == EDGE_BOTTOM);
+    int hover_local_x;
+    int has_hover = panel_widget_hover_local_x(w, &hover_local_x);
 
     for (int vi = 0; vi < tp->n_visible; vi++) {
         int d = tp->vis_idx[vi];
@@ -905,6 +907,14 @@ static void tasklist_paint(PanelWidget *w, cairo_t *cr)
             } else {
                 ewmh_set_icon_geometry(e->win, p->x, p->y + w->x + tp->vis_x[vi], w->thickness, bw);
             }
+        }
+
+        /* Hover feedback drawn first, active-window highlight on top of
+         * it -- both are the same fg-colored translucent rect, layering
+         * just makes an active *and* hovered button a bit more opaque
+         * rather than fighting for the same pixels. */
+        if (has_hover && hover_local_x >= tp->vis_x[vi] && hover_local_x < tp->vis_x[vi] + bw) {
+            widget_paint_hover_rect(w, cr, tp->vis_x[vi], bw);
         }
 
         if (e->win == active) {
@@ -968,11 +978,7 @@ static void tasklist_paint(PanelWidget *w, cairo_t *cr)
             cairo_set_font_size(cr, panel_text_size(p));
         }
         cairo_pop_group_to_source(cr);
-        /* Placeholder (pinned, not running) buttons are dimmed so they
-         * read as "not currently open" at a glance, same idea as the
-         * existing minimized dimming -- the two never overlap (a
-         * placeholder is never minimized, it isn't a real window). */
-        cairo_paint_with_alpha(cr, e->is_placeholder ? 0.5 : (e->minimized ? 0.55 : 1.0));
+        cairo_paint_with_alpha(cr, e->minimized ? 0.55 : 1.0);
     }
 
     if (tp->scrollable) {

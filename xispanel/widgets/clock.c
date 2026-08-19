@@ -152,6 +152,7 @@ static void clock_paint(PanelWidget *w, cairo_t *cr)
     Panel *p = w->panel;
     int x, y, width, height;
     widget_get_rect(w, &x, &y, &width, &height);
+    widget_paint_hover_bg(w, cr);
 
     cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, p->fg_a);
     double tw;

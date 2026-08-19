@@ -448,8 +448,14 @@ static void winctl_paint(PanelWidget *w, cairo_t *cr)
         pango_show_text_boxed(cr, tx, oy, w->thickness, content_end - tx - 8, panel_text_size(p), wp->title, NULL);
     }
 
+    int hover_local_x;
+    int has_hover = panel_widget_hover_local_x(w, &hover_local_x);
+
     cairo_set_line_width(cr, 1.4);
     for (int i = 0; i < wp->n_visible_buttons; i++) {
+        if (has_hover && hover_local_x >= wp->btn_x[i] && hover_local_x < wp->btn_x[i] + wp->btn_w[i]) {
+            widget_paint_hover_rect(w, cr, wp->btn_x[i], wp->btn_w[i]);
+        }
         double cx = ox + wp->btn_x[i] + wp->btn_w[i] / 2.0;
         double cy = oy + w->thickness / 2.0;
         cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.85);

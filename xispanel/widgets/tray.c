@@ -80,6 +80,8 @@ static void tray_measure(PanelWidget *w, int cross_axis, int *out_len, int *out_
     *out_min_len = *out_len;
 }
 
+static int tray_hit_test(int local_x, int icon_px, int slot, int pad, int n);
+
 static void tray_paint(PanelWidget *w, cairo_t *cr)
 {
     int ox, oy, owidth, oheight;
@@ -91,8 +93,14 @@ static void tray_paint(PanelWidget *w, cairo_t *cr)
     tray_layout(w, &icon_px, &slot, &pad);
     int n = sni_count();
     int icon_y = oy + (w->thickness - icon_px) / 2;
+    int hover_local_x;
+    int hovered = panel_widget_hover_local_x(w, &hover_local_x) ? tray_hit_test(hover_local_x, icon_px, slot, pad, n)
+                                                                  : -1;
     for (int i = 0; i < n; i++) {
         int bx = ox + pad + i * slot;
+        if (i == hovered) {
+            widget_paint_hover_rect(w, cr, bx, icon_px);
+        }
         cairo_surface_t *icon = sni_icon(i);
         if (icon) {
             draw_icon_scaled(cr, icon, bx, icon_y, icon_px);

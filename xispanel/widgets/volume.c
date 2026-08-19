@@ -120,6 +120,7 @@ static void volume_paint(PanelWidget *w, cairo_t *cr)
     widget_get_rect(w, &ox, &oy, &owidth, &oheight);
     (void)owidth;
     (void)oheight;
+    widget_paint_hover_bg(w, cr);
 
     double cx = ox + w->thickness / 2.0;
     double cy = oy + w->thickness / 2.0;
