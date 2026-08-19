@@ -56,9 +56,21 @@
 #define SNI_POLL_MS 1500
 /* Safety-net fallback only -- IconPixmap is normally re-fetched right
  * after a NewIcon/NewStatus/etc. signal is observed (see
- * g_saw_change_signal), not on a fixed schedule. This just catches items
- * whose client library doesn't emit those signals reliably. */
+ * sni_mark_pending_signal()), not on a fixed schedule. This just catches
+ * items whose client library doesn't emit those signals reliably. */
 #define SNI_ICON_REFRESH_MS 60000
+/* Floor between two IconPixmap re-fetches for the *same* item even when
+ * its own change signals keep firing back to back -- some real clients
+ * (confirmed live: syncthingtray during active sync, qps as a live
+ * process-stats tray icon) legitimately re-announce NewIcon/NewToolTip
+ * every ~1s, and re-issuing a synchronous, up-to-SNI_CALL_TIMEOUT_MS-
+ * blocking DBus call that often is real, measured CPU cost -- see
+ * sni_poll()'s doc comment. A signal that arrives before the floor has
+ * elapsed isn't dropped, just deferred to right when the floor opens (see
+ * sni_request_icon_refresh()), so a genuine one-off icon change still
+ * shows up within this window rather than waiting out the full
+ * SNI_ICON_REFRESH_MS safety net. */
+#define SNI_ICON_DEBOUNCE_MS 1000
 #define SNI_CALL_TIMEOUT_MS 200
 #define SNI_MAX_ITEMS 24
 #define SNI_WATCHER_PATH "/StatusNotifierWatcher"
@@ -75,10 +87,15 @@ typedef struct {
     char path[128];
     char title[128];
     cairo_surface_t *icon;
-    /* IconPixmap is only re-fetched every SNI_ICON_REFRESH_MS (0 forces
-     * an immediate fetch for a freshly-registered item), not on every
-     * SNI_POLL_MS tick -- see sni_poll()'s header comment. */
+    /* When the next IconPixmap fetch is due -- normally now+SNI_ICON_
+     * REFRESH_MS (the slow safety net), but sni_mark_pending_signal() can
+     * pull this *earlier* (down to last_icon_fetch_ms+SNI_ICON_DEBOUNCE_MS)
+     * when this specific item announces a change, so genuine changes still
+     * show up promptly without needing a separate "pending" flag -- a
+     * single field drives both schedules. 0 forces an immediate fetch for
+     * a freshly-registered item. */
     uint64_t next_icon_poll_ms;
+    uint64_t last_icon_fetch_ms; /* 0 = never fetched yet */
 } SniItem;
 
 static SniItem g_items[SNI_MAX_ITEMS];
@@ -91,9 +108,6 @@ static int g_host_registered = 0;
  * startup. Both interface *and* bus name are this same string (the
  * protocol reuses the bus name as its own interface name). */
 static const char *g_watcher_name = NULL;
-/* Set by sni_handle_incoming() when any item's NewIcon/NewStatus/etc.
- * signal arrived since the last poll; sni_poll() checks + clears it. */
-static int g_saw_change_signal = 0;
 /* See xispanel.h's doc comment. 0 = unknown yet (no shrink applied) --
  * tray.c syncs this in on_tick() before any icon this poll gets fetched. */
 static int g_icon_target_size = 0;
@@ -479,11 +493,62 @@ static void sni_register_item(const char *arg)
     fprintf(stderr, "xispanel: sni: tray item registered: %s%s\n", busname, path);
 }
 
+/* Pulls `it`'s next IconPixmap fetch earlier in response to a change
+ * signal -- down to right when SNI_ICON_DEBOUNCE_MS has elapsed since its
+ * last *actual* fetch, never sooner, so a burst of signals from one chatty
+ * item (confirmed live: syncthingtray during active sync, qps as a live
+ * process-stats tray icon, both re-signal roughly once a second) collapses
+ * into one fetch per debounce window instead of one per signal. A quiet
+ * item's first signal in a while still fetches essentially immediately
+ * (last_icon_fetch_ms is far enough in the past that the floor is already
+ * behind `now`). Only ever moves the deadline earlier, never later --
+ * doesn't touch it if a fetch was already due sooner than what this signal
+ * would request. */
+static void sni_request_icon_refresh(SniItem *it, uint64_t now)
+{
+    uint64_t earliest = it->last_icon_fetch_ms ? it->last_icon_fetch_ms + SNI_ICON_DEBOUNCE_MS : 0;
+    uint64_t want = now > earliest ? now : earliest;
+    if (want < it->next_icon_poll_ms) {
+        it->next_icon_poll_ms = want;
+    }
+}
+
+/* Attributes a change signal to the specific item it applies to -- matched
+ * by comparing the signal's actual sender (always a unique :1.N connection
+ * name) against each tracked item's `busname`, which *is* that same
+ * unique name for any item that registered with its own connection name
+ * instead of a well-known one (see sni_register_item()'s doc comment --
+ * increasingly the common case in practice; confirmed live against both
+ * syncthingtray and qps). Falls back to requesting a refresh for every
+ * item if nothing matched (a well-known-name-registered item's signal
+ * sender won't equal its registered busname) -- same as this code's old
+ * always-refresh-everyone behavior, just no longer the common case. */
+static void sni_mark_pending_signal(const char *sender)
+{
+    if (!sender || !sender[0]) {
+        return;
+    }
+    uint64_t now = now_ms();
+    int matched = 0;
+    for (int i = 0; i < g_n_items; i++) {
+        if (strcmp(g_items[i].busname, sender) == 0) {
+            sni_request_icon_refresh(&g_items[i], now);
+            matched = 1;
+        }
+    }
+    if (!matched) {
+        for (int i = 0; i < g_n_items; i++) {
+            sni_request_icon_refresh(&g_items[i], now);
+        }
+    }
+}
+
 /* Handles whatever incoming messages are waiting for us: our NewIcon/
  * NewStatus/etc. match rule (see sni_ensure_connected()) delivers signals
  * regardless of watcher role, so this always drains the queue -- not just
- * when g_is_watcher -- setting g_saw_change_signal for sni_poll() to pick
- * up. Method calls (RegisterStatusNotifierItem, the odd Properties.Get(All)
+ * when g_is_watcher -- attributing each one to the item(s) it applies to
+ * (see sni_mark_pending_signal()) for sni_poll() to pick up. Method calls
+ * (RegisterStatusNotifierItem, the odd Properties.Get(All)
  * / Introspect probe) are only ever sent to us when we *are* the watcher,
  * so that handling stays gated. Every method call that expects a reply
  * gets *some* reply, even if just an error -- an unanswered one is the one
@@ -497,7 +562,7 @@ static void sni_handle_incoming(void)
         if (mtype == DBUS_MESSAGE_TYPE_SIGNAL) {
             const char *siface = p_dbus_message_get_interface(msg);
             if (siface && strcmp(siface, SNI_ITEM_IFACE) == 0) {
-                g_saw_change_signal = 1;
+                sni_mark_pending_signal(p_dbus_message_get_sender(msg));
             }
             p_dbus_message_unref(msg);
             continue;
@@ -659,28 +724,30 @@ int sni_poll(uint64_t now)
     /* Refresh Title + icon for every currently-tracked item, dropping any
      * that stopped answering (process exited without us seeing it leave
      * the bus). Title uses a targeted Properties.Get every poll (cheap,
-     * small string); IconPixmap is fetched the same way but only when
-     * g_saw_change_signal is set (a NewIcon/NewAttentionIcon/NewOverlayIcon/
-     * NewStatus/NewTitle/NewToolTip signal arrived from *some* item since
-     * the last poll -- see the match rule in sni_ensure_connected()) or the
-     * SNI_ICON_REFRESH_MS safety net elapsed. A GetAll-every-1.5s of a
+     * small string); IconPixmap is fetched the same way but only once
+     * `next_icon_poll_ms` is due -- pulled earlier by a NewIcon/
+     * NewAttentionIcon/NewOverlayIcon/NewStatus/NewTitle/NewToolTip signal
+     * for this specific item (see sni_mark_pending_signal()), or else the
+     * SNI_ICON_REFRESH_MS safety net. A GetAll-every-1.5s of a
      * property that can carry tens of KB of raw pixel data per item,
-     * regardless of whether anything changed, was the actual cause of
+     * regardless of whether anything changed, was the original cause of
      * xispanel's tray-widget CPU cost -- this way the expensive fetch only
-     * happens when there's reason to think it changed. Liveness is judged
+     * happens when there's reason to think it changed. A second, real cost
+     * showed up once real chatty items were involved (confirmed live:
+     * syncthingtray during active sync, qps as a live process-stats tray
+     * icon both re-signal roughly once a second): SNI_ICON_DEBOUNCE_MS
+     * floors how often *any single item* actually re-fetches even under a
+     * signal burst from just that one item, without capping responsiveness
+     * to a genuine one-off change from a quiet item. Liveness is judged
      * from the Title call alone so an item that's merely between icon
-     * refreshes doesn't get dropped. Not attributing the signal to a
-     * specific item (its sender is a unique :1.N name we don't necessarily
-     * have on file) means one item's change causes all items to
-     * re-fetch -- fine since this only fires on genuine change bursts, not
-     * every tick. */
-    int refresh_icons_this_poll = g_saw_change_signal;
-    g_saw_change_signal = 0;
+     * refreshes doesn't get dropped. */
     int n_alive = 0;
     SniItem alive[SNI_MAX_ITEMS];
     for (int i = 0; i < g_n_items; i++) {
         SniItem *it = &g_items[i];
 
+        char title[128];
+        title[0] = 0;
         DBusMessage *treply =
             sni_call2s(it->busname, it->path, "org.freedesktop.DBus.Properties", "Get", SNI_ITEM_IFACE, "Title");
         if (!treply) {
@@ -689,8 +756,6 @@ int sni_poll(uint64_t now)
             }
             continue;
         }
-        char title[128];
-        title[0] = 0;
         extract_get_string(treply, title, sizeof(title));
         p_dbus_message_unref(treply);
         if (!title[0]) {
@@ -706,8 +771,9 @@ int sni_poll(uint64_t now)
         *dst = *it;
         snprintf(dst->title, sizeof(dst->title), "%s", title);
 
-        if (refresh_icons_this_poll || now >= dst->next_icon_poll_ms) {
+        if (now >= dst->next_icon_poll_ms) {
             dst->next_icon_poll_ms = now + SNI_ICON_REFRESH_MS;
+            dst->last_icon_fetch_ms = now;
             DBusMessage *ireply = sni_call2s(it->busname, it->path, "org.freedesktop.DBus.Properties", "Get",
                                               SNI_ITEM_IFACE, "IconPixmap");
             cairo_surface_t *icon = NULL;
