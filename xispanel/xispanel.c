@@ -2151,8 +2151,34 @@ static void schedule_widget_repoll(uint64_t at_ms)
     }
 }
 
+/* 1 if envvar `name` is set to anything other than "" or "0" -- used
+ * below by a handful of XISPANEL_DISABLE_* debug toggles, one per
+ * subsystem that keeps running/polling in the background regardless of
+ * which widgets are configured (some, notably ewmh_watch_init()'s
+ * property/geometry watching, run even with zero panels at all). Meant
+ * for bisecting a CPU-usage report by process of elimination (run with
+ * one disabled at a time, see which one it was), not for end-user
+ * configuration -- there's no config-file equivalent on purpose. */
+static int env_flag(const char *name)
+{
+    const char *v = getenv(name);
+    return v && v[0] && strcmp(v, "0") != 0;
+}
+
 static int run_as_daemon(const char *sockpath)
 {
+    int disable_ewmh_watch = env_flag("XISPANEL_DISABLE_EWMH_WATCH");
+    int disable_modtap = env_flag("XISPANEL_DISABLE_MODTAP");
+    int disable_sni = env_flag("XISPANEL_DISABLE_SNI");
+    int disable_mpris = env_flag("XISPANEL_DISABLE_MPRIS");
+    int disable_notifd = env_flag("XISPANEL_DISABLE_NOTIFD");
+    if (disable_ewmh_watch || disable_modtap || disable_sni || disable_mpris || disable_notifd) {
+        fprintf(stderr,
+                "xispanel: debug subsystem disable flags active:%s%s%s%s%s\n",
+                disable_ewmh_watch ? " EWMH_WATCH" : "", disable_modtap ? " MODTAP" : "",
+                disable_sni ? " SNI" : "", disable_mpris ? " MPRIS" : "", disable_notifd ? " NOTIFD" : "");
+    }
+
     g_dpy = XOpenDisplay(NULL);
     if (!g_dpy) {
         fprintf(stderr, "xispanel: could not open the X display\n");
@@ -2177,7 +2203,9 @@ static int run_as_daemon(const char *sockpath)
     pango_text_init(g_font_family);
 
     ewmh_init_atoms();
-    modtap_init(); /* bare-modifier ("tap Meta alone") hotkeys, see hotkey.c/modtap.c */
+    if (!disable_modtap) {
+        modtap_init(); /* bare-modifier ("tap Meta alone") hotkeys, see hotkey.c/modtap.c */
+    }
     toast_init(); /* wires notifd.c's arrived callback to the toast popups, see toast.c */
     g_atom_net_wm_state = XInternAtom(g_dpy, "_NET_WM_STATE", False);
     g_atom_net_wm_state_skip_taskbar = XInternAtom(g_dpy, "_NET_WM_STATE_SKIP_TASKBAR", False);
@@ -2220,7 +2248,9 @@ static int run_as_daemon(const char *sockpath)
      * widgets (tasklist/winctl/globalmenu) care about, so they re-poll the
      * instant one changes rather than only on their slow fallback tick --
      * see ewmh_watch_init() and the PropertyNotify handling below. */
-    ewmh_watch_init();
+    if (!disable_ewmh_watch) {
+        ewmh_watch_init();
+    }
     XFlush(g_dpy);
 
     int xfd = ConnectionNumber(g_dpy);
@@ -2433,7 +2463,9 @@ static int run_as_daemon(const char *sockpath)
         tooltip_tick(now);
         panel_menu_tick(now);
         toast_tick(now);
-        mpris_poll(now);
+        if (!disable_mpris) {
+            mpris_poll(now);
+        }
         /* mpris feeds tooltips only (no widget paints it), so it doesn't
          * mark panels dirty. sni feeds the tray widget's paint, so a
          * change there does -- and since any panel could host a tray
@@ -2441,8 +2473,10 @@ static int run_as_daemon(const char *sockpath)
          * repaint of a tray-less panel is cheaper than tracking which
          * panel owns the tray). notifd's badge latency is covered by the
          * notif widget's own on_tick polling unread count. */
-        int tray_changed = sni_poll(now);
-        notifd_poll(now);
+        int tray_changed = disable_sni ? 0 : sni_poll(now);
+        if (!disable_notifd) {
+            notifd_poll(now);
+        }
         for (int i = 0; i < MAX_PANELS; i++) {
             Panel *p = &g_panels[i];
             if (!p->in_use) {
