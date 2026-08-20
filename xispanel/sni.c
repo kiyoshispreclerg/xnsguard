@@ -53,12 +53,16 @@
 #include <string.h>
 #include <unistd.h>
 
-#define SNI_POLL_MS 1500
+#define SNI_POLL_MS 150
+/* The poll tick is now only a cheap dispatch opportunity.  All actual
+ * tray state changes are driven by D-Bus signals; 50 ms bounds wakeup
+ * latency without doing Properties.Get calls while the tray is idle. */
 /* Safety-net fallback only -- IconPixmap is normally re-fetched right
  * after a NewIcon/NewStatus/etc. signal is observed (see
  * sni_mark_pending_signal()), not on a fixed schedule. This just catches
  * items whose client library doesn't emit those signals reliably. */
 #define SNI_ICON_REFRESH_MS 60000
+#define SNI_LIVENESS_SWEEP_MS 60000
 /* Floor between two IconPixmap re-fetches for the *same* item even when
  * its own change signals keep firing back to back -- some real clients
  * (confirmed live: syncthingtray during active sync, qps as a live
@@ -96,11 +100,14 @@ typedef struct {
      * a freshly-registered item. */
     uint64_t next_icon_poll_ms;
     uint64_t last_icon_fetch_ms; /* 0 = never fetched yet */
+    int title_dirty;             /* fetch Title/IconName on the next dispatch */
 } SniItem;
 
 static SniItem g_items[SNI_MAX_ITEMS];
 static int g_n_items = 0;
 static uint64_t g_next_poll_ms = 0;
+static uint64_t g_next_liveness_ms = 0;
+static int g_initial_sync_done = 0;
 static int g_is_watcher = 0;
 static int g_host_registered = 0;
 /* Which of SNI_WATCHER_NAMES[] to actually talk to when we're not the
@@ -287,6 +294,18 @@ static int sni_ensure_connected(void)
     p_dbus_error_init(&merr);
     p_dbus_bus_add_match(g_conn, "type='signal',interface='" SNI_ITEM_IFACE "'", &merr);
     p_dbus_error_free(&merr);
+
+    /* Watcher membership is event-driven too.  The initial
+     * RegisteredStatusNotifierItems snapshot is fetched exactly once by
+     * sni_poll(); afterwards these signals keep g_items[] synchronized. */
+    for (int wi = 0; wi < SNI_N_WATCHER_NAMES; wi++) {
+        DBusError werr;
+        char rule[256];
+        p_dbus_error_init(&werr);
+        snprintf(rule, sizeof(rule), "type='signal',interface='%s'", SNI_WATCHER_NAMES[wi]);
+        p_dbus_bus_add_match(g_conn, rule, &werr);
+        p_dbus_error_free(&werr);
+    }
 
     char hostname[64];
     snprintf(hostname, sizeof(hostname), "org.freedesktop.StatusNotifierHost-%d", (int)getpid());
@@ -490,6 +509,8 @@ static void sni_register_item(const char *arg)
     memset(it, 0, sizeof(*it));
     snprintf(it->busname, sizeof(it->busname), "%s", busname);
     snprintf(it->path, sizeof(it->path), "%s", path);
+    it->title_dirty = 1;
+    it->next_icon_poll_ms = 0;
     fprintf(stderr, "xispanel: sni: tray item registered: %s%s\n", busname, path);
 }
 
@@ -553,6 +574,54 @@ static void sni_mark_pending_signal(const char *sender)
  * so that handling stays gated. Every method call that expects a reply
  * gets *some* reply, even if just an error -- an unanswered one is the one
  * thing that can visibly misbehave a well-written DBus client. */
+static void sni_unregister_item_arg(const char *arg)
+{
+    if (!arg || !arg[0]) {
+        return;
+    }
+
+    char busname[128], path[128];
+    const char *slash = strchr(arg, '/');
+    if (slash && slash != arg) {
+        size_t blen = (size_t)(slash - arg);
+        if (blen >= sizeof(busname)) {
+            blen = sizeof(busname) - 1;
+        }
+        memcpy(busname, arg, blen);
+        busname[blen] = 0;
+        snprintf(path, sizeof(path), "%s", slash);
+    } else {
+        snprintf(busname, sizeof(busname), "%s", arg);
+        snprintf(path, sizeof(path), "/StatusNotifierItem");
+    }
+
+    for (int i = 0; i < g_n_items; i++) {
+        if (strcmp(g_items[i].busname, busname) == 0 && strcmp(g_items[i].path, path) == 0) {
+            if (g_items[i].icon) {
+                cairo_surface_destroy(g_items[i].icon);
+            }
+            memmove(&g_items[i], &g_items[i + 1],
+                    (size_t)(g_n_items - i - 1) * sizeof(g_items[0]));
+            g_n_items--;
+            fprintf(stderr, "xispanel: sni: tray item unregistered: %s%s\n", busname, path);
+            return;
+        }
+    }
+}
+
+static int sni_signal_string_arg(DBusMessage *msg, char *buf, size_t bufsz)
+{
+    DBusMessageIter it;
+    if (!p_dbus_message_iter_init(msg, &it) ||
+        p_dbus_message_iter_get_arg_type(&it) != DBUS_TYPE_STRING) {
+        return 0;
+    }
+    const char *arg = NULL;
+    p_dbus_message_iter_get_basic(&it, &arg);
+    snprintf(buf, bufsz, "%s", arg ? arg : "");
+    return buf[0] != 0;
+}
+
 static void sni_handle_incoming(void)
 {
     p_dbus_connection_read_write(g_conn, 0);
@@ -561,8 +630,47 @@ static void sni_handle_incoming(void)
         int mtype = p_dbus_message_get_type(msg);
         if (mtype == DBUS_MESSAGE_TYPE_SIGNAL) {
             const char *siface = p_dbus_message_get_interface(msg);
+            const char *smember = p_dbus_message_get_member(msg);
+
             if (siface && strcmp(siface, SNI_ITEM_IFACE) == 0) {
+                /* Item signals are the normal fast path: no timer-driven
+                 * property refresh is necessary.  A quiet item gets an
+                 * immediate refresh; repeated signals are still collapsed
+                 * by SNI_ICON_DEBOUNCE_MS. */
                 sni_mark_pending_signal(p_dbus_message_get_sender(msg));
+                if (smember && strcmp(smember, "NewTitle") == 0) {
+                    const char *sender = p_dbus_message_get_sender(msg);
+                    int title_matched = 0;
+                    for (int i = 0; i < g_n_items; i++) {
+                        if (sender && strcmp(g_items[i].busname, sender) == 0) {
+                            g_items[i].title_dirty = 1;
+                            title_matched = 1;
+                        }
+                    }
+                    /* A client may have registered using a well-known name,
+                     * while the signal sender is its unique :1.N name.  In
+                     * that ambiguous case refresh all titles rather than
+                     * missing a genuine NewTitle event. */
+                    if (!title_matched) {
+                        for (int i = 0; i < g_n_items; i++) {
+                            g_items[i].title_dirty = 1;
+                        }
+                    }
+                }
+            } else if (siface &&
+                       (strcmp(siface, SNI_WATCHER_NAMES[0]) == 0 ||
+                        strcmp(siface, SNI_WATCHER_NAMES[1]) == 0) &&
+                       smember) {
+                char arg[256] = "";
+                if (strcmp(smember, "StatusNotifierItemRegistered") == 0) {
+                    if (sni_signal_string_arg(msg, arg, sizeof(arg))) {
+                        sni_register_item(arg);
+                    }
+                } else if (strcmp(smember, "StatusNotifierItemUnregistered") == 0) {
+                    if (sni_signal_string_arg(msg, arg, sizeof(arg))) {
+                        sni_unregister_item_arg(arg);
+                    }
+                }
             }
             p_dbus_message_unref(msg);
             continue;
@@ -673,6 +781,11 @@ static int sni_take_sig_change(void)
 
 int sni_poll(uint64_t now)
 {
+    /* This function remains API-compatible with the existing xispanel main
+     * loop.  The important change is that it is no longer a 1.5s polling
+     * loop: the 50ms tick only dispatches already-arrived D-Bus messages.
+     * Properties are fetched only after a registration/change signal (plus
+     * a very slow liveness safety net). */
     if (now < g_next_poll_ms) {
         return 0;
     }
@@ -685,31 +798,27 @@ int sni_poll(uint64_t now)
 
     sni_handle_incoming();
 
-    if (!g_is_watcher && g_watcher_name) {
-        /* We're not the watcher -- read its RegisteredStatusNotifierItems
-         * property instead of tracking registrations ourselves. */
-        DBusMessage *reply = sni_call2s(g_watcher_name, SNI_WATCHER_PATH, "org.freedesktop.DBus.Properties", "Get",
+    /* If we attached to an existing watcher, enumerate its current items
+     * exactly once at startup.  Subsequent membership changes arrive via
+     * StatusNotifierItemRegistered/Unregistered signals. */
+    if (!g_initial_sync_done && !g_is_watcher && g_watcher_name) {
+        g_initial_sync_done = 1;
+        DBusMessage *reply = sni_call2s(g_watcher_name, SNI_WATCHER_PATH,
+                                         "org.freedesktop.DBus.Properties", "Get",
                                          g_watcher_name, "RegisteredStatusNotifierItems");
         if (reply) {
             DBusMessageIter it, variant, arr;
-            if (p_dbus_message_iter_init(reply, &it) && p_dbus_message_iter_get_arg_type(&it) == DBUS_TYPE_VARIANT) {
+            if (p_dbus_message_iter_init(reply, &it) &&
+                p_dbus_message_iter_get_arg_type(&it) == DBUS_TYPE_VARIANT) {
                 p_dbus_message_iter_recurse(&it, &variant);
                 if (p_dbus_message_iter_get_arg_type(&variant) == DBUS_TYPE_ARRAY) {
                     p_dbus_message_iter_recurse(&variant, &arr);
-                    /* Deliberately *not* resetting g_n_items to 0 here:
-                     * sni_register_item() already dedups against the
-                     * current list via sni_find(), so re-parsing the same
-                     * mostly-unchanged array every poll only appends
-                     * genuinely new items instead of re-logging/
-                     * re-adding everything every ~1.5s. Items that drop
-                     * out of the watcher's list get pruned naturally by
-                     * the GetAll-failure loop below once their bus name
-                     * actually stops answering. */
-                    while (p_dbus_message_iter_get_arg_type(&arr) == DBUS_TYPE_STRING && g_n_items < SNI_MAX_ITEMS) {
-                        const char *s = NULL;
-                        p_dbus_message_iter_get_basic(&arr, &s);
-                        if (s) {
-                            sni_register_item(s);
+                    while (p_dbus_message_iter_get_arg_type(&arr) == DBUS_TYPE_STRING &&
+                           g_n_items < SNI_MAX_ITEMS) {
+                        const char *item = NULL;
+                        p_dbus_message_iter_get_basic(&arr, &item);
+                        if (item) {
+                            sni_register_item(item);
                         }
                         if (!p_dbus_message_iter_next(&arr)) {
                             break;
@@ -721,74 +830,61 @@ int sni_poll(uint64_t now)
         }
     }
 
-    /* Refresh Title + icon for every currently-tracked item, dropping any
-     * that stopped answering (process exited without us seeing it leave
-     * the bus). Title uses a targeted Properties.Get every poll (cheap,
-     * small string); IconPixmap is fetched the same way but only once
-     * `next_icon_poll_ms` is due -- pulled earlier by a NewIcon/
-     * NewAttentionIcon/NewOverlayIcon/NewStatus/NewTitle/NewToolTip signal
-     * for this specific item (see sni_mark_pending_signal()), or else the
-     * SNI_ICON_REFRESH_MS safety net. A GetAll-every-1.5s of a
-     * property that can carry tens of KB of raw pixel data per item,
-     * regardless of whether anything changed, was the original cause of
-     * xispanel's tray-widget CPU cost -- this way the expensive fetch only
-     * happens when there's reason to think it changed. A second, real cost
-     * showed up once real chatty items were involved (confirmed live:
-     * syncthingtray during active sync, qps as a live process-stats tray
-     * icon both re-signal roughly once a second): SNI_ICON_DEBOUNCE_MS
-     * floors how often *any single item* actually re-fetches even under a
-     * signal burst from just that one item, without capping responsiveness
-     * to a genuine one-off change from a quiet item. Liveness is judged
-     * from the Title call alone so an item that's merely between icon
-     * refreshes doesn't get dropped. */
-    int n_alive = 0;
-    SniItem alive[SNI_MAX_ITEMS];
+    /* Fetch only properties that are actually dirty.  Registration and
+     * NewTitle make title_dirty true; icon/status signals pull the icon
+     * deadline forward.  There is deliberately no Properties.Get on every
+     * tick anymore. */
+    int changed = 0;
     for (int i = 0; i < g_n_items; i++) {
         SniItem *it = &g_items[i];
 
-        char title[128];
-        title[0] = 0;
-        DBusMessage *treply =
-            sni_call2s(it->busname, it->path, "org.freedesktop.DBus.Properties", "Get", SNI_ITEM_IFACE, "Title");
-        if (!treply) {
-            if (it->icon) {
-                cairo_surface_destroy(it->icon);
+        if (it->title_dirty) {
+            char title[128] = "";
+            DBusMessage *treply =
+                sni_call2s(it->busname, it->path,
+                           "org.freedesktop.DBus.Properties", "Get",
+                           SNI_ITEM_IFACE, "Title");
+            if (!treply) {
+                continue; /* liveness is handled by the slow sweep below */
             }
-            continue;
-        }
-        extract_get_string(treply, title, sizeof(title));
-        p_dbus_message_unref(treply);
-        if (!title[0]) {
-            DBusMessage *nreply = sni_call2s(it->busname, it->path, "org.freedesktop.DBus.Properties", "Get",
-                                              SNI_ITEM_IFACE, "IconName");
-            if (nreply) {
-                extract_get_string(nreply, title, sizeof(title));
-                p_dbus_message_unref(nreply);
+            extract_get_string(treply, title, sizeof(title));
+            p_dbus_message_unref(treply);
+
+            if (!title[0]) {
+                DBusMessage *nreply =
+                    sni_call2s(it->busname, it->path,
+                               "org.freedesktop.DBus.Properties", "Get",
+                               SNI_ITEM_IFACE, "IconName");
+                if (nreply) {
+                    extract_get_string(nreply, title, sizeof(title));
+                    p_dbus_message_unref(nreply);
+                }
             }
+            if (strcmp(it->title, title) != 0) {
+                snprintf(it->title, sizeof(it->title), "%s", title);
+                changed = 1;
+            }
+            it->title_dirty = 0;
         }
 
-        SniItem *dst = &alive[n_alive++];
-        *dst = *it;
-        snprintf(dst->title, sizeof(dst->title), "%s", title);
+        if (now >= it->next_icon_poll_ms) {
+            it->next_icon_poll_ms = now + SNI_ICON_REFRESH_MS;
+            it->last_icon_fetch_ms = now;
 
-        if (now >= dst->next_icon_poll_ms) {
-            dst->next_icon_poll_ms = now + SNI_ICON_REFRESH_MS;
-            dst->last_icon_fetch_ms = now;
-            DBusMessage *ireply = sni_call2s(it->busname, it->path, "org.freedesktop.DBus.Properties", "Get",
-                                              SNI_ITEM_IFACE, "IconPixmap");
+            DBusMessage *ireply =
+                sni_call2s(it->busname, it->path,
+                           "org.freedesktop.DBus.Properties", "Get",
+                           SNI_ITEM_IFACE, "IconPixmap");
             cairo_surface_t *icon = NULL;
             if (ireply) {
                 icon = shrink_icon_surface(extract_get_icon_pixmap(ireply), g_icon_target_size);
                 p_dbus_message_unref(ireply);
             }
             if (!icon) {
-                /* No raw pixmap -- try IconName resolved against a theme
-                 * (see resolve_icon_theme_name()'s doc comment in ewmh.c).
-                 * Only bothered with when IconPixmap came up empty, so
-                 * items that do provide real pixmap data never pay for
-                 * this extra call. */
-                DBusMessage *nreply = sni_call2s(it->busname, it->path, "org.freedesktop.DBus.Properties", "Get",
-                                                  SNI_ITEM_IFACE, "IconName");
+                DBusMessage *nreply =
+                    sni_call2s(it->busname, it->path,
+                               "org.freedesktop.DBus.Properties", "Get",
+                               SNI_ITEM_IFACE, "IconName");
                 if (nreply) {
                     char iconname[128] = "";
                     extract_get_string(nreply, iconname, sizeof(iconname));
@@ -797,16 +893,41 @@ int sni_poll(uint64_t now)
                 }
             }
             if (icon) {
-                if (dst->icon) {
-                    cairo_surface_destroy(dst->icon);
+                if (it->icon) {
+                    cairo_surface_destroy(it->icon);
                 }
-                dst->icon = icon;
+                it->icon = icon;
+                changed = 1;
             }
         }
     }
-    memcpy(g_items, alive, sizeof(SniItem) * (size_t)n_alive);
-    g_n_items = n_alive;
 
+    /* Very slow safety net for clients/watchers that fail to emit the normal
+     * registration/unregistration signals.  This is intentionally rare and
+     * is not part of the normal update path. */
+    if (now >= g_next_liveness_ms) {
+        g_next_liveness_ms = now + SNI_LIVENESS_SWEEP_MS;
+        for (int i = 0; i < g_n_items; ) {
+            SniItem *it = &g_items[i];
+            DBusMessage *reply =
+                sni_call2s(it->busname, it->path,
+                           "org.freedesktop.DBus.Properties", "Get",
+                           SNI_ITEM_IFACE, "Title");
+            if (reply) {
+                p_dbus_message_unref(reply);
+                i++;
+                continue;
+            }
+            if (it->icon) {
+                cairo_surface_destroy(it->icon);
+            }
+            memmove(it, it + 1, (size_t)(g_n_items - i - 1) * sizeof(*it));
+            g_n_items--;
+            changed = 1;
+        }
+    }
+
+    (void)changed; /* sni_take_sig_change() below remains the single repaint gate */
     return sni_take_sig_change();
 }
 
