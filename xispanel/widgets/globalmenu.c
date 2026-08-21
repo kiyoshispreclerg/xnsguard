@@ -177,6 +177,9 @@ static int globalmenu_init(PanelWidget *w)
 
 static void globalmenu_destroy(PanelWidget *w)
 {
+    GlobalmenuPriv *gp = w->priv;
+    dbusmenu_free_item_icons(gp->top_items, gp->n_top);
+    dbusmenu_free_item_icons(gp->menu_items, gp->n_menu);
     hotkey_unregister_widget(w);
 }
 
@@ -214,6 +217,7 @@ static int globalmenu_passes_filters(PanelWidget *w, Window active)
 
 static void globalmenu_refetch_top(GlobalmenuPriv *gp)
 {
+    dbusmenu_free_item_icons(gp->top_items, gp->n_top);
     gp->n_top = 0;
     if (!gp->open_mode || !gp->has_menu) {
         return;
@@ -425,9 +429,11 @@ static void globalmenu_on_close(void *ctx)
 static void globalmenu_open_menu(PanelWidget *w, int parent_id, int anchor_x, int anchor_w)
 {
     GlobalmenuPriv *gp = w->priv;
+    dbusmenu_free_item_icons(gp->menu_items, gp->n_menu);
     int n = dbusmenu_fetch(gp->busname, gp->objpath, parent_id, -1, gp->menu_items, gp->menu_ids, gp->menu_depth,
                             MENU_TREE_MAX_ITEMS);
     if (n <= 0) {
+        gp->n_menu = 0;
         return;
     }
     gp->n_menu = n;

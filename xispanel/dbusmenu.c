@@ -38,10 +38,27 @@
 
 #include <dlfcn.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define DBUSMENU_IFACE "com.canonical.dbusmenu"
 #define DBUSMENU_CALL_TIMEOUT_MS 200
+/* Menu icons are drawn at a fixed size regardless of the eventual popup's
+ * item_h (unlike tasklist/tray/winctl, a DBusMenu item's icon is resolved
+ * long before any menu.c frame/item_h exists) -- 24px is the common
+ * freedesktop menu-icon convention (GTK/KDE both default around there),
+ * close enough to whatever item_h a real panel ends up with that
+ * draw_icon_scaled()'s own final fit is a minor adjustment, not a
+ * meaningful up/downscale. */
+#define DBUSMENU_ICON_TARGET_PX 24
+/* Cap on a single item's icon-data payload (raw embedded PNG bytes) --
+ * generous for a menu icon (real ones are a few KB at most) while still
+ * bounding how much a misbehaving app could make us buffer/write to disk
+ * for one icon. Buffered on the stack inside the (recursive)
+ * dbusmenu_parse_node(), so this also has to stay small enough that
+ * MENU_PARENT_STACK_DEPTH levels of nesting can't blow the stack. */
+#define DBUSMENU_ICON_DATA_MAX (32 * 1024)
 
 static void *g_libdbus = NULL;
 static int g_load_attempted = 0;
@@ -129,6 +146,39 @@ static int dbusmenu_ensure_connected(void)
     return g_conn != NULL;
 }
 
+/* icon-data is a raw embedded image file (PNG in every real implementation
+ * seen), not a decoded pixel array the way _NET_WM_ICON/SNI IconPixmap
+ * are -- Imlib2 (this codebase's only image decoder) has no "load from
+ * memory" entry point, so this writes it to a throwaway temp file and
+ * reuses load_icon_argb() exactly like loading any other icon file, then
+ * removes it immediately. One extra unlink()'d file per icon-data item
+ * per menu fetch -- menus are opened rarely enough (user click) that this
+ * isn't worth avoiding via a real in-memory PNG decoder. */
+static cairo_surface_t *decode_icon_data(const unsigned char *data, int len)
+{
+    if (!data || len <= 0) {
+        return NULL;
+    }
+    const char *rundir = getenv("XDG_RUNTIME_DIR");
+    if (!rundir || !rundir[0]) {
+        rundir = "/tmp";
+    }
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/xispanel-dbusmenu-icon-XXXXXX", rundir);
+    int fd = mkstemp(path);
+    if (fd < 0) {
+        return NULL;
+    }
+    ssize_t written = write(fd, data, (size_t)len);
+    close(fd);
+    cairo_surface_t *surf = NULL;
+    if (written == (ssize_t)len) {
+        surf = load_icon_argb(path, DBUSMENU_ICON_TARGET_PX);
+    }
+    unlink(path);
+    return surf;
+}
+
 /* Recursively flattens one (ia{sv}av) node (already positioned at a
  * DBUS_TYPE_VARIANT wrapping that struct) into out_items[]/out_ids[]/
  * out_depth[], recording each item's nesting depth (relative to the
@@ -161,6 +211,9 @@ static void dbusmenu_parse_node(DBusMessageIter *variant_iter, int depth, MenuIt
     p_dbus_message_iter_next(&node);
 
     char label[64] = "";
+    char icon_name[256] = "";
+    static unsigned char icon_data[DBUSMENU_ICON_DATA_MAX];
+    int icon_data_len = 0;
     int is_separator = 0, enabled = 1, visible = 1;
     if (p_dbus_message_iter_get_arg_type(&node) == DBUS_TYPE_ARRAY) {
         DBusMessageIter props;
@@ -206,6 +259,25 @@ static void dbusmenu_parse_node(DBusMessageIter *variant_iter, int depth, MenuIt
                     dbus_bool_t b = TRUE;
                     p_dbus_message_iter_get_basic(&val, &b);
                     visible = b;
+                } else if (!strcmp(key, "icon-name") && vt == DBUS_TYPE_STRING) {
+                    const char *s = NULL;
+                    p_dbus_message_iter_get_basic(&val, &s);
+                    if (s) {
+                        snprintf(icon_name, sizeof(icon_name), "%s", s);
+                    }
+                } else if (!strcmp(key, "icon-data") && vt == DBUS_TYPE_ARRAY) {
+                    DBusMessageIter bytes;
+                    p_dbus_message_iter_recurse(&val, &bytes);
+                    icon_data_len = 0;
+                    while (p_dbus_message_iter_get_arg_type(&bytes) == DBUS_TYPE_BYTE &&
+                           icon_data_len < DBUSMENU_ICON_DATA_MAX) {
+                        unsigned char b;
+                        p_dbus_message_iter_get_basic(&bytes, &b);
+                        icon_data[icon_data_len++] = b;
+                        if (!p_dbus_message_iter_next(&bytes)) {
+                            break;
+                        }
+                    }
                 }
             }
             if (!p_dbus_message_iter_next(&props)) {
@@ -222,6 +294,16 @@ static void dbusmenu_parse_node(DBusMessageIter *variant_iter, int depth, MenuIt
         mi->enabled = enabled;
         if (!is_separator) {
             snprintf(mi->label, sizeof(mi->label), "%s", label);
+            /* icon-data (an embedded image) wins over icon-name (a themed
+             * name to resolve) when an item somehow has both -- an app
+             * that bothered to embed actual pixel data presumably wants
+             * exactly that rendered, not a theme's substitute. */
+            if (icon_data_len > 0) {
+                mi->icon = decode_icon_data(icon_data, icon_data_len);
+            }
+            if (!mi->icon && icon_name[0]) {
+                mi->icon = resolve_icon_theme_name(icon_name, DBUSMENU_ICON_TARGET_PX);
+            }
         }
         out_ids[*n] = id;
         out_depth[*n] = depth;
@@ -239,6 +321,16 @@ static void dbusmenu_parse_node(DBusMessageIter *variant_iter, int depth, MenuIt
             if (!p_dbus_message_iter_next(&children)) {
                 break;
             }
+        }
+    }
+}
+
+void dbusmenu_free_item_icons(MenuItem *items, int n)
+{
+    for (int i = 0; i < n; i++) {
+        if (items[i].icon) {
+            cairo_surface_destroy(items[i].icon);
+            items[i].icon = NULL;
         }
     }
 }

@@ -1195,6 +1195,7 @@ static int tasklist_on_button(PanelWidget *w, int button, int local_x, int local
         }
         if (button == Button3) {
             MenuItem items[2];
+            memset(items, 0, sizeof(items));
             snprintf(items[0].label, sizeof(items[0].label), "Abrir");
             items[0].enabled = 1;
             items[0].is_separator = 0;
@@ -1238,6 +1239,7 @@ static int tasklist_on_button(PanelWidget *w, int button, int local_x, int local
 
     if (button == Button3) {
         MenuItem items[6];
+        memset(items, 0, sizeof(items));
         int n = 0;
         snprintf(items[n].label, sizeof(items[n].label), "%s", e->minimized ? "Restaurar" : "Minimizar");
         items[n].enabled = 1;

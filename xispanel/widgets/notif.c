@@ -276,6 +276,7 @@ static int notif_on_button(PanelWidget *w, int button, int local_x, int local_y,
 
     int n = notifd_count();
     MenuItem items[NOTIF_MENU_MAX];
+    memset(items, 0, sizeof(items));
     int nitems = 0;
     if (n == 0) {
         snprintf(items[0].label, sizeof(items[0].label), "Sem notifica\xc3\xa7\xc3\xb5""es");

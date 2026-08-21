@@ -500,6 +500,14 @@ typedef struct {
     char label[64];
     int enabled; /* 0 = greyed out, not selectable */
     int is_separator;
+    /* NULL = no icon (most callers never set this -- folder/notif's plain
+     * text menus, etc.). menu.c only ever *paints* this, never destroys
+     * it -- MenuItem is copied by value (menu.c memcpy()s the whole array
+     * at open time), so whoever fills in an icon here still owns its
+     * lifetime and must keep it valid for as long as the menu might still
+     * be open, then free it once done (see dbusmenu_free_item_icons() for
+     * the DBusMenu-backed case, which is the only current source of these). */
+    cairo_surface_t *icon;
 } MenuItem;
 
 typedef void (*MenuSelectFn)(Panel *panel, PanelWidget *widget, void *ctx, int index);
@@ -748,6 +756,16 @@ int dbusmenu_fetch(const char *busname, const char *path, int32_t parent_id, int
 /* Fire-and-forget Event(id, "clicked", ...) for one of the ids returned by
  * a prior dbusmenu_fetch() at the same busname/path. */
 void dbusmenu_send_event(const char *busname, const char *path, int32_t id);
+/* Destroys every non-NULL MenuItem::icon in items[0..n), then NULLs them
+ * (safe to call again on the same array). dbusmenu_fetch() resolves a
+ * fresh icon per item (see its doc comment) but never frees whatever was
+ * already sitting in out_items[] from a previous fetch into the same
+ * buffer -- callers that reuse a fixed MenuItem array across calls (every
+ * current caller: sni.c's tray-Menu popup, globalmenu.c's top-level/
+ * subtree buffers) must call this on the old contents before the next
+ * dbusmenu_fetch() overwrites them, and again at teardown for whatever
+ * the last fetch left behind. */
+void dbusmenu_free_item_icons(MenuItem *items, int n);
 
 /* ---- desktop notifications: org.freedesktop.Notifications server (notifd.c) ----
  *

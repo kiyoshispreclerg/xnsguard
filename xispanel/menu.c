@@ -105,6 +105,13 @@ typedef struct {
      * collapse away" for frames[i+1] relative to frames[i]. -1 for frame
      * 0 (no parent). */
     int spawned_from_pos;
+    /* 1 if any item shown in *this* frame has an icon -- reserves a
+     * left-hand icon column (see menu_icon_size()) for every item in the
+     * frame, icon or not, so labels all still line up in one column
+     * whether or not each individual item happens to have an icon. Set
+     * once by measure_frame_width(), alongside f->width. A frame with no
+     * icons at all keeps the old label-starts-at-10px layout untouched. */
+    int has_icon;
 } MenuFrame;
 
 typedef struct {
@@ -220,6 +227,9 @@ static int frame_pos_to_row(const MenuFrame *f, int pos)
     return f->paging ? (1 + pos - f->page * f->items_per_page) : pos;
 }
 
+static int menu_icon_size(const PanelMenu *m);
+static int menu_icon_column_w(const PanelMenu *m);
+
 static void paint_frame(PanelMenu *m, MenuFrame *f)
 {
     if (!f->win) {
@@ -278,8 +288,17 @@ static void paint_frame(PanelMenu *m, MenuFrame *f)
             cairo_rectangle(cr, 0, y, f->width, m->item_h);
             cairo_fill(cr);
         }
+        int text_x = 10;
+        if (f->has_icon) {
+            int icon_size = menu_icon_size(m);
+            if (it->icon) {
+                double icon_y = y + (m->item_h - icon_size) / 2.0;
+                draw_icon_scaled(cr, it->icon, 10, icon_y, icon_size);
+            }
+            text_x = 10 + menu_icon_column_w(m);
+        }
         cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, it->enabled ? 0.95 : 0.4);
-        pango_show_text_boxed(cr, 10, y, m->item_h, 0, m->font_size, it->label, NULL);
+        pango_show_text_boxed(cr, text_x, y, m->item_h, 0, m->font_size, it->label, NULL);
 
         if (m->has_children[idx]) {
             double ax = f->width - MENU_ARROW_RESERVE + 4;
@@ -369,12 +388,34 @@ static void expand_lazy(PanelMenu *m, int idx)
     }
 }
 
-static int measure_frame_width(PanelMenu *m, const int *idx, int n)
+/* Side length of an item's icon, plus the fixed 6px/left-margin gap it
+ * sits in -- see paint_frame()'s icon draw and menu_icon_column_w()'s doc
+ * comment for how this is used. Proportional to item_h like every other
+ * menu glyph (the arrow, separators), not a fixed pixel size, so a
+ * larger/smaller panel's menu rows scale the icon along with everything
+ * else instead of it looking undersized/oversized at either extreme. */
+static int menu_icon_size(const PanelMenu *m)
+{
+    int size = (int)(m->item_h * 0.6);
+    return size > 8 ? size : 8;
+}
+
+/* Extra left-hand width to reserve when a frame has at least one item
+ * with an icon: the icon column (menu_icon_size()) plus a 6px margin on
+ * the far side of it before the label starts, on top of the existing 10px
+ * left margin every label already had (see paint_frame()). */
+static int menu_icon_column_w(const PanelMenu *m)
+{
+    return menu_icon_size(m) + 6;
+}
+
+static int measure_frame_width(PanelMenu *m, const int *idx, int n, int *out_has_icon)
 {
     cairo_surface_t *probe_surf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
     cairo_t *probe_cr = cairo_create(probe_surf);
     int max_w = 80;
     int any_children = 0;
+    int any_icon = 0;
     for (int i = 0; i < n; i++) {
         int fi = idx[i];
         if (m->items[fi].is_separator) {
@@ -382,6 +423,9 @@ static int measure_frame_width(PanelMenu *m, const int *idx, int n)
         }
         if (m->has_children[fi]) {
             any_children = 1;
+        }
+        if (m->items[fi].icon) {
+            any_icon = 1;
         }
         double tw;
         pango_text_extents_ellipsized(probe_cr, m->items[fi].label, m->font_size, 0, &tw, NULL);
@@ -392,7 +436,12 @@ static int measure_frame_width(PanelMenu *m, const int *idx, int n)
     }
     cairo_destroy(probe_cr);
     cairo_surface_destroy(probe_surf);
-    return any_children ? max_w + MENU_ARROW_RESERVE : max_w;
+    *out_has_icon = any_icon;
+    int total = max_w;
+    if (any_icon) {
+        total += menu_icon_column_w(m);
+    }
+    return any_children ? total + MENU_ARROW_RESERVE : total;
 }
 
 /* Fills in f->width/height/paging/items_per_page/page_count/visible_rows
@@ -404,7 +453,7 @@ static int measure_frame_width(PanelMenu *m, const int *idx, int n)
 static void layout_frame(PanelMenu *m, MenuFrame *f)
 {
     Panel *p = m->owner_panel;
-    f->width = measure_frame_width(m, f->idx, f->n);
+    f->width = measure_frame_width(m, f->idx, f->n, &f->has_icon);
 
     int max_rows_fit = p->out_h / m->item_h;
     if (max_rows_fit < 1) {

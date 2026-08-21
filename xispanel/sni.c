@@ -1036,9 +1036,11 @@ int sni_menu_open(int idx, Panel *panel, PanelWidget *widget, int anchor_x, int 
         return 0;
     }
 
+    dbusmenu_free_item_icons(g_dbusmenu_items, g_dbusmenu_n);
     int n = dbusmenu_fetch(busname, menu_path, 0, -1, g_dbusmenu_items, g_dbusmenu_ids, g_dbusmenu_depth,
                             DBUSMENU_MAX_ITEMS);
     if (n <= 0) {
+        g_dbusmenu_n = 0;
         return 1; /* has a Menu property, just couldn't fetch/parse it right now -- still don't fall back */
     }
     g_dbusmenu_n = n;
