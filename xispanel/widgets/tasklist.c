@@ -636,9 +636,15 @@ static void tasklist_measure(PanelWidget *w, int cross_axis, int *out_len, int *
          * wide mode -- no title to show a title for would either draw
          * nothing in a title-sized gap or (worse) show the app name where
          * every other button shows the actual window title, so icon-only
-         * keeps them visually distinct from real task buttons at a glance. */
+         * keeps them visually distinct from real task buttons at a glance.
+         * Width is forced to exactly cross_axis (the panel's own
+         * thickness), not icon_px+8 -- icon_px never exceeds cross_axis
+         * (icon_size_for() only ever shrinks it further via icon_padding=),
+         * so this always leaves room to center the icon (see
+         * tasklist_paint()) while making every compact/placeholder button
+         * a true square, matching the panel's own height. */
         if (tp->compact || e->is_placeholder) {
-            bw = icon_px + 8;
+            bw = cross_axis;
         } else {
             double tw;
             pango_text_extents_ellipsized(p->cr, e->title, panel_text_size(p), 0, &tw, NULL);
@@ -652,10 +658,11 @@ static void tasklist_measure(PanelWidget *w, int cross_axis, int *out_len, int *
     }
     *out_len = tp->n_display > 0 ? cursor - TASKLIST_BTN_GAP : 0;
 
-    /* Minimum: room for exactly one task button (compact-sized, since that's
-     * the smallest a button can usefully be) plus the up/down arrow pair
-     * that tasklist_layout_visible() reserves once scrolling kicks in. */
-    *out_min_len = tp->n_display > 0 ? (icon_px + 8 + TASKLIST_ARROW_W + TASKLIST_ARROW_GAP) : 0;
+    /* Minimum: room for exactly one task button (a square, cross_axis wide,
+     * since that's the smallest a button can usefully be) plus the up/down
+     * arrow pair that tasklist_layout_visible() reserves once scrolling
+     * kicks in. */
+    *out_min_len = tp->n_display > 0 ? (cross_axis + TASKLIST_ARROW_W + TASKLIST_ARROW_GAP) : 0;
 }
 
 /* Recomputes which tasks are visible (tp->vis_*) from the widget's actual
@@ -935,11 +942,18 @@ static void tasklist_paint(PanelWidget *w, cairo_t *cr)
             cairo_fill(cr);
         }
 
+        /* Icon's left margin: centered within the square button in
+         * compact/placeholder mode (bw == w->thickness there, which can be
+         * wider than icon_px+8 whenever icon_padding= is in play), the
+         * usual fixed 4px in wide mode (bw already sized around exactly
+         * that in tasklist_measure()). */
+        int icon_x_off = (tp->compact || e->is_placeholder) ? (bw - icon_px) / 2 : 4;
         cairo_push_group(cr);
         if (e->icon) {
-            draw_icon_scaled(cr, e->icon, bx + 4, icon_y, icon_px);
+            draw_icon_scaled(cr, e->icon, bx + icon_x_off, icon_y, icon_px);
         } else {
-            draw_fallback_icon(cr, bx + 4, icon_y, icon_px, e->title, p->fg_r, p->fg_g, p->fg_b, panel_text_size(p));
+            draw_fallback_icon(cr, bx + icon_x_off, icon_y, icon_px, e->title, p->fg_r, p->fg_g, p->fg_b,
+                                panel_text_size(p));
         }
         if (!tp->compact && !e->is_placeholder) {
             /* Pango draws e->title directly -- no manual truncation
@@ -959,7 +973,7 @@ static void tasklist_paint(PanelWidget *w, cairo_t *cr)
             cairo_set_font_size(cr, badge_fs);
             cairo_text_extents_t bext;
             cairo_text_extents(cr, badge, &bext);
-            double bx2 = bx + icon_px + 4 - bext.width;
+            double bx2 = bx + icon_x_off + icon_px - bext.width;
             double by2 = icon_y + icon_px;
             cairo_set_source_rgba(cr, 0, 0, 0, 0.55);
             cairo_rectangle(cr, bx2 - 2, by2 - bext.height - 1, bext.width + 4, bext.height + 3);
@@ -979,7 +993,7 @@ static void tasklist_paint(PanelWidget *w, cairo_t *cr)
             cairo_set_font_size(cr, badge_fs);
             cairo_text_extents_t bext;
             cairo_text_extents(cr, badge, &bext);
-            double bx2 = bx + 2;
+            double bx2 = bx + icon_x_off;
             double by2 = icon_y + icon_px;
             cairo_set_source_rgba(cr, 0, 0, 0, 0.55);
             cairo_rectangle(cr, bx2 - 2, by2 - bext.height - 1, bext.width + 4, bext.height + 3);

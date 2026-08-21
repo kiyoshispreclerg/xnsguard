@@ -189,6 +189,14 @@ struct Panel {
     /* theme */
     double bg_r, bg_g, bg_b, bg_a;
     double fg_r, fg_g, fg_b, fg_a;
+    /* THEME's own h_color=<#rrggbbaa> -- the color widget_paint_hover_rect()
+     * uses for the generic hover-feedback highlight. has_h_color == 0 (no
+     * h_color= set) falls back to fg_r/g/b at a fixed low alpha, same as
+     * before this option existed; a configured h_color uses its own alpha
+     * as-is instead of forcing one, so a fully-opaque hover highlight is
+     * possible if that's what's wanted. */
+    double h_r, h_g, h_b, h_a;
+    int has_h_color;
     /* 0 = not detected/configured -- callers fall back to their own
      * existing size (usually thickness-proportional for in-panel widget
      * text, or a fixed constant for tooltip/menu popups). >0 = pixel font

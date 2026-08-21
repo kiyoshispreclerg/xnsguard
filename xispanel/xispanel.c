@@ -233,7 +233,11 @@ int panel_widget_hover_local_x(const PanelWidget *w, int *out_local_x)
 void widget_paint_hover_rect(PanelWidget *w, cairo_t *cr, int x, int width)
 {
     Panel *p = w->panel;
-    cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.12);
+    if (p->has_h_color) {
+        cairo_set_source_rgba(cr, p->h_r, p->h_g, p->h_b, p->h_a);
+    } else {
+        cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.12);
+    }
     cairo_rectangle(cr, x, 0, width, w->thickness);
     cairo_fill(cr);
 }
@@ -1692,6 +1696,10 @@ static void apply_theme_kv(Panel *p, const char *kvline)
     if (kv_get(kvline, "fg", buf, sizeof(buf))) {
         parse_hex_color(buf, &p->fg_r, &p->fg_g, &p->fg_b, &p->fg_a);
     }
+    if (kv_get(kvline, "h_color", buf, sizeof(buf))) {
+        parse_hex_color(buf, &p->h_r, &p->h_g, &p->h_b, &p->h_a);
+        p->has_h_color = 1;
+    }
     p->spacing = kv_get_int(kvline, "spacing", p->spacing);
     if (kv_get(kvline, "font_size", buf, sizeof(buf))) {
         p->font_size_px = atof(buf);
@@ -1809,8 +1817,168 @@ int config_widget_set_key(const char *panel_name, int order, const char *type_na
     return 1;
 }
 
+static int list_connected_outputs(char names[][64], int max)
+{
+    XRRScreenResources *res = XRRGetScreenResourcesCurrent(g_dpy, g_root);
+    if (!res) {
+        return 0;
+    }
+    int n = 0;
+    for (int i = 0; i < res->noutput && n < max; i++) {
+        XRROutputInfo *oi = XRRGetOutputInfo(g_dpy, res, res->outputs[i]);
+        if (oi && oi->connection == RR_Connected && oi->crtc) {
+            snprintf(names[n], 64, "%s", oi->name);
+            n++;
+        }
+        if (oi) {
+            XRRFreeOutputInfo(oi);
+        }
+    }
+    XRRFreeScreenResources(res);
+    return n;
+}
+
+typedef struct {
+    char from[64];
+    char to[64];
+} OutputRename;
+
+/* Reconciles the config's PANEL output= names against what's actually
+ * connected right now -- same fix and same reasoning as xisback's
+ * build_output_rename_map(): outputs get renamed by drivers/re-plugging
+ * often enough that a saved "HDMI-1" panel can silently stop matching
+ * anything on the next boot, and panel_resolve_geometry() then falls back
+ * to full-screen for it, stacking every per-output panel on top of each
+ * other on whatever output happens to come first.
+ *
+ * Names that already match exactly are left alone. The remaining (config
+ * name, real name) pairs are only auto-matched positionally when their
+ * counts agree -- i.e. the monitor count didn't change, just the names --
+ * since that's the one case where "just renumber them in order" is a safe
+ * guess rather than a coin flip. Returns the number of pairs written to
+ * `map` (possibly 0, meaning no remapping is needed or possible). */
+static int build_output_rename_map(const char *path, OutputRename *map, int max_map)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        return 0;
+    }
+
+    char cfg_outputs[MAX_PANELS][64];
+    int n_cfg = 0;
+    char line[LINE_MAX_LEN];
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[--len] = 0;
+        }
+        char *p = line;
+        while (*p == ' ' || *p == '\t') {
+            p++;
+        }
+        if (strncmp(p, "PANEL", 5) != 0 || (p[5] != ' ' && p[5] != '\t')) {
+            continue;
+        }
+        p += 5;
+        char *tok[3] = {NULL, NULL, NULL};
+        for (int i = 0; i < 3; i++) {
+            while (*p == ' ' || *p == '\t') {
+                p++;
+            }
+            if (!*p) {
+                break;
+            }
+            tok[i] = p;
+            while (*p && *p != ' ' && *p != '\t') {
+                p++;
+            }
+            if (*p) {
+                *p++ = 0;
+            }
+        }
+        const char *output = tok[1]; /* PANEL <name> <output> ... */
+        if (!output || strcmp(output, "*") == 0) {
+            continue;
+        }
+        int dup = 0;
+        for (int i = 0; i < n_cfg; i++) {
+            if (strcmp(cfg_outputs[i], output) == 0) {
+                dup = 1;
+                break;
+            }
+        }
+        if (!dup && n_cfg < MAX_PANELS) {
+            snprintf(cfg_outputs[n_cfg], sizeof(cfg_outputs[n_cfg]), "%s", output);
+            n_cfg++;
+        }
+    }
+    fclose(f);
+
+    char real_outputs[MAX_PANELS][64];
+    int n_real = list_connected_outputs(real_outputs, MAX_PANELS);
+
+    if (n_cfg == 0 || n_cfg != n_real) {
+        return 0;
+    }
+
+    char unmatched_cfg[MAX_PANELS][64];
+    char unmatched_real[MAX_PANELS][64];
+    int n_unmatched_cfg = 0, n_unmatched_real = 0;
+
+    for (int i = 0; i < n_cfg; i++) {
+        int found = 0;
+        for (int j = 0; j < n_real; j++) {
+            if (strcmp(cfg_outputs[i], real_outputs[j]) == 0) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            snprintf(unmatched_cfg[n_unmatched_cfg], sizeof(unmatched_cfg[0]), "%s", cfg_outputs[i]);
+            n_unmatched_cfg++;
+        }
+    }
+    for (int j = 0; j < n_real; j++) {
+        int found = 0;
+        for (int i = 0; i < n_cfg; i++) {
+            if (strcmp(real_outputs[j], cfg_outputs[i]) == 0) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            snprintf(unmatched_real[n_unmatched_real], sizeof(unmatched_real[0]), "%s", real_outputs[j]);
+            n_unmatched_real++;
+        }
+    }
+
+    /* n_unmatched_cfg == n_unmatched_real is guaranteed here: n_cfg == n_real
+     * and both lists remove the same exactly-matched names from equal-size
+     * pools. */
+    int n_map = 0;
+    for (int i = 0; i < n_unmatched_cfg && n_map < max_map; i++) {
+        snprintf(map[n_map].from, sizeof(map[n_map].from), "%s", unmatched_cfg[i]);
+        snprintf(map[n_map].to, sizeof(map[n_map].to), "%s", unmatched_real[i]);
+        n_map++;
+    }
+    return n_map;
+}
+
+static const char *apply_output_rename(const OutputRename *map, int n_map, const char *name)
+{
+    for (int i = 0; i < n_map; i++) {
+        if (strcmp(map[i].from, name) == 0) {
+            return map[i].to;
+        }
+    }
+    return name;
+}
+
 static void load_config(void)
 {
+    OutputRename rename_map[MAX_PANELS];
+    int n_rename = build_output_rename_map(g_configpath, rename_map, MAX_PANELS);
+
     FILE *f = fopen(g_configpath, "r");
     if (!f) {
         return;
@@ -1862,7 +2030,8 @@ static void load_config(void)
         }
 
         if (strcmp(fields[0], "PANEL") == 0 && nf >= 3) {
-            Panel *pan = alloc_panel(fields[1], fields[2]);
+            const char *output = apply_output_rename(rename_map, n_rename, fields[2]);
+            Panel *pan = alloc_panel(fields[1], output);
             if (!pan) {
                 fprintf(stderr, "xispanel: config: too many panels, ignoring '%s'\n", fields[1]);
                 continue;
