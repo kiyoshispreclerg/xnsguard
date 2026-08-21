@@ -316,6 +316,7 @@ static const PanelWidgetOps *g_widget_registry[] = {
     &folder_ops,
     &xisserve_ops,
     &notif_ops,
+    &pager_ops,
     NULL,
 };
 

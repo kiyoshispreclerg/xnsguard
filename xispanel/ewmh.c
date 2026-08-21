@@ -47,6 +47,21 @@ static Atom g_atom_net_wm_state_skip_taskbar;
 static Atom g_atom_net_wm_window_type_desktop;
 static Atom g_atom_net_wm_icon_geometry;
 
+/* kiwm's own per-output virtual-desktop extension -- see
+ * kiwm/PROTOCOL.md. Standard EWMH has exactly one global _NET_CURRENT_
+ * DESKTOP for the whole session; these are the only way to know "this
+ * output is showing desktop 2 while that one shows desktop 0", which the
+ * pager widget needs for same_output_only= and per-output switching.
+ * Harmless to intern under any other WM -- XInternAtom always succeeds,
+ * these atoms just never end up set on the root window, which is exactly
+ * how the pager widget detects "not running under kiwm" (see
+ * ewmh_kiwm_get_outputs()'s doc comment). */
+static Atom g_atom_kiwm_outputs;
+static Atom g_atom_kiwm_output_desktop;
+static Atom g_atom_kiwm_num_output_desktops;
+static Atom g_atom_kiwm_wm_output;
+static Atom g_atom_kiwm_set_output_desktop;
+
 #define ICON_PROP_MAX_LONGS 200000
 
 void ewmh_init_atoms(void)
@@ -78,6 +93,12 @@ void ewmh_init_atoms(void)
     g_atom_net_wm_state_skip_taskbar = XInternAtom(g_dpy, "_NET_WM_STATE_SKIP_TASKBAR", False);
     g_atom_net_wm_window_type_desktop = XInternAtom(g_dpy, "_NET_WM_WINDOW_TYPE_DESKTOP", False);
     g_atom_net_wm_icon_geometry = XInternAtom(g_dpy, "_NET_WM_ICON_GEOMETRY", False);
+
+    g_atom_kiwm_outputs = XInternAtom(g_dpy, "_KIWM_OUTPUTS", False);
+    g_atom_kiwm_output_desktop = XInternAtom(g_dpy, "_KIWM_OUTPUT_DESKTOP", False);
+    g_atom_kiwm_num_output_desktops = XInternAtom(g_dpy, "_KIWM_NUM_OUTPUT_DESKTOPS", False);
+    g_atom_kiwm_wm_output = XInternAtom(g_dpy, "_KIWM_WM_OUTPUT", False);
+    g_atom_kiwm_set_output_desktop = XInternAtom(g_dpy, "_KIWM_SET_OUTPUT_DESKTOP", False);
 }
 
 /* Tells the window manager/compositor where this task's taskbar button is
@@ -546,6 +567,142 @@ void ewmh_activate(Window w)
 void ewmh_close(Window w)
 {
     ewmh_send_client_message(w, g_atom_net_close_window, CurrentTime, 2, 0, 0, 0);
+}
+
+/* Global _NET_CURRENT_DESKTOP switch -- the plain-EWMH pager fallback
+ * (see ewmh_kiwm_get_outputs()'s doc comment on why the pager widget
+ * needs both this and the kiwm-specific ewmh_kiwm_set_output_desktop()).
+ * `w` is nominally the root window itself for this message (there's no
+ * specific client it's about), same convention _NET_CURRENT_DESKTOP's own
+ * spec text uses. */
+void ewmh_set_current_desktop(int desktop)
+{
+    ewmh_send_client_message(g_root, g_atom_net_current_desktop, desktop, CurrentTime, 0, 0, 0);
+}
+
+/* 1 if kiwm's per-output desktop extension looks present (root has a
+ * _KIWM_OUTPUTS property) -- the pager widget's cue to use the functions
+ * below instead of the plain global _NET_CURRENT_DESKTOP/_NET_NUMBER_OF_
+ * DESKTOPS pair, which is all any other EWMH WM has. Splits `_KIWM_
+ * OUTPUTS`'s NUL-separated byte string (see kiwm/PROTOCOL.md) into
+ * out_names[] and *out_n (capped at max); returns 0 (out_n left at 0) if the
+ * property is absent, meaning "not running under kiwm, use the plain
+ * EWMH path instead". */
+int ewmh_kiwm_get_outputs(char out_names[][64], int max, int *out_n)
+{
+    *out_n = 0;
+    Atom actual_type;
+    int actual_format;
+    unsigned long n_items, bytes_after;
+    unsigned char *prop = NULL;
+    if (XGetWindowProperty(g_dpy, g_root, g_atom_kiwm_outputs, 0, 4096, False, g_atom_utf8_string, &actual_type,
+                            &actual_format, &n_items, &bytes_after, &prop) != Success ||
+        !prop) {
+        if (prop) {
+            XFree(prop);
+        }
+        return 0;
+    }
+    if (n_items == 0) {
+        XFree(prop);
+        return 0;
+    }
+    const char *p = (const char *)prop;
+    unsigned long start = 0;
+    for (unsigned long i = 0; i < n_items && *out_n < max; i++) {
+        if (p[i] == 0) {
+            if (i > start) {
+                unsigned long len = i - start;
+                if (len >= 64) {
+                    len = 63;
+                }
+                memcpy(out_names[*out_n], p + start, len);
+                out_names[*out_n][len] = 0;
+                (*out_n)++;
+            }
+            start = i + 1;
+        }
+    }
+    XFree(prop);
+    return *out_n > 0;
+}
+
+/* One CARDINAL per output (same index order as ewmh_kiwm_get_outputs()) --
+ * the virtual desktop each output is currently showing. Returns the
+ * count actually read (0 if the property is absent/empty). */
+int ewmh_kiwm_get_output_desktops(int *out, int max)
+{
+    Atom actual_type;
+    int actual_format;
+    unsigned long n_items, bytes_after;
+    unsigned char *prop = NULL;
+    if (XGetWindowProperty(g_dpy, g_root, g_atom_kiwm_output_desktop, 0, (long)max, False, XA_CARDINAL, &actual_type,
+                            &actual_format, &n_items, &bytes_after, &prop) != Success ||
+        !prop) {
+        if (prop) {
+            XFree(prop);
+        }
+        return 0;
+    }
+    long *data = (long *)(void *)prop;
+    int n = (int)(n_items < (unsigned long)max ? n_items : (unsigned long)max);
+    for (int i = 0; i < n; i++) {
+        out[i] = (int)data[i];
+    }
+    XFree(prop);
+    return n;
+}
+
+/* How many virtual desktops *each* output has (same count for every one --
+ * see kiwm/PROTOCOL.md). -1 if the property is absent. */
+int ewmh_kiwm_get_num_output_desktops(void)
+{
+    Atom actual_type;
+    int actual_format;
+    unsigned long n_items, bytes_after;
+    unsigned char *prop = NULL;
+    int n = -1;
+    if (XGetWindowProperty(g_dpy, g_root, g_atom_kiwm_num_output_desktops, 0, 1, False, XA_CARDINAL, &actual_type,
+                            &actual_format, &n_items, &bytes_after, &prop) == Success &&
+        prop) {
+        if (n_items > 0) {
+            n = (int)*(long *)(void *)prop;
+        }
+        XFree(prop);
+    }
+    return n;
+}
+
+/* Which output (index into ewmh_kiwm_get_outputs()'s order) `w` currently
+ * belongs to -- companion to _NET_WM_DESKTOP, see kiwm/PROTOCOL.md's
+ * _KIWM_WM_OUTPUT section for why both are needed to place a window in
+ * its actual (output, desktop) cell. -1 if unset (not managed by kiwm, or
+ * queried before kiwm got around to setting it). */
+int ewmh_kiwm_get_wm_output(Window w)
+{
+    Atom actual_type;
+    int actual_format;
+    unsigned long n_items, bytes_after;
+    unsigned char *prop = NULL;
+    int out = -1;
+    if (XGetWindowProperty(g_dpy, w, g_atom_kiwm_wm_output, 0, 1, False, XA_CARDINAL, &actual_type, &actual_format,
+                            &n_items, &bytes_after, &prop) == Success &&
+        prop) {
+        if (n_items > 0) {
+            out = (int)*(long *)(void *)prop;
+        }
+        XFree(prop);
+    }
+    return out;
+}
+
+/* Sends _KIWM_SET_OUTPUT_DESKTOP(output_idx, desktop_idx) to the root
+ * window -- kiwm switches that output's current desktop in response (see
+ * kiwm/PROTOCOL.md). Out-of-range indices are silently ignored by kiwm,
+ * not by this function -- it just sends what it's given. */
+void ewmh_kiwm_set_output_desktop(int output_idx, int desktop_idx)
+{
+    ewmh_send_client_message(g_root, g_atom_kiwm_set_output_desktop, output_idx, desktop_idx, 0, 0, 0);
 }
 
 /* action: 0=remove, 1=add, 2=toggle (_NET_WM_STATE_TOGGLE). */

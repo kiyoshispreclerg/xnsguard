@@ -417,6 +417,22 @@ void ewmh_toggle_maximize(Window w);
 void ewmh_toggle_minimize(Window w, int minimized);
 void ewmh_move_interactive(Window w, int root_x, int root_y);
 cairo_surface_t *ewmh_get_icon_surface(Window w, int target_size); /* NULL if no icon */
+/* Plain-EWMH global desktop switch (_NET_CURRENT_DESKTOP client message)
+ * -- the pager widget's fallback when kiwm's per-output extension isn't
+ * detected (see ewmh_kiwm_get_outputs()). */
+void ewmh_set_current_desktop(int desktop);
+
+/* ---- kiwm's per-output virtual-desktop extension (see kiwm/PROTOCOL.md
+ * and ewmh_kiwm_get_outputs()'s own doc comment in ewmh.c for why this
+ * exists -- standard EWMH has no concept of "this output is on desktop 2
+ * while that one is on desktop 0"). Every read here returns a
+ * count/failure the pager widget can use to detect "not running under
+ * kiwm" and fall back to the plain global functions above instead. ---- */
+int ewmh_kiwm_get_outputs(char out_names[][64], int max, int *out_n); /* 1 if kiwm detected, out_n set either way */
+int ewmh_kiwm_get_output_desktops(int *out, int max); /* returns count read, one CARDINAL per output */
+int ewmh_kiwm_get_num_output_desktops(void);          /* -1 if absent */
+int ewmh_kiwm_get_wm_output(Window w);                /* -1 if unset */
+void ewmh_kiwm_set_output_desktop(int output_idx, int desktop_idx);
 
 /* ---- small drawing helpers built on top of the above (ewmh.c) ---- */
 int icon_size_for(int thickness, int padding); /* shared by tasklist/tray's icon_padding= */
@@ -929,5 +945,6 @@ extern const PanelWidgetOps globalmenu_ops;
 extern const PanelWidgetOps folder_ops;
 extern const PanelWidgetOps xisserve_ops;
 extern const PanelWidgetOps notif_ops;
+extern const PanelWidgetOps pager_ops;
 
 #endif
