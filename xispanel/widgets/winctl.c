@@ -295,7 +295,7 @@ static int winctl_on_tick(PanelWidget *w, uint64_t now)
         ewmh_get_state_flags(active, &wp->minimized, &wp->maximized);
         int icon_px = w->thickness > 8 ? w->thickness - 8 : 16;
         if (!wp->icon) {
-            wp->icon = ewmh_get_icon_surface(active, icon_px);
+            wp->icon = ewmh_get_icon_surface(active, icon_fetch_size_for(icon_px));
         }
         if (!wp->icon && !wp->icon_lookup_tried) {
             /* _NET_WM_ICON didn't supply one -- fall back to the same
@@ -307,7 +307,7 @@ static int winctl_on_tick(PanelWidget *w, uint64_t now)
             if (wm_class[0] &&
                 desktop_entry_find_by_wm_class(wm_class, NULL, 0, NULL, 0, icon_name, sizeof(icon_name)) &&
                 icon_name[0]) {
-                wp->icon = resolve_icon_theme_name(icon_name, icon_px);
+                wp->icon = resolve_icon_theme_name(icon_name, icon_fetch_size_for(icon_px));
             }
         }
     } else {

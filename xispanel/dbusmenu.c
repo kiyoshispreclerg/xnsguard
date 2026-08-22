@@ -173,7 +173,7 @@ static cairo_surface_t *decode_icon_data(const unsigned char *data, int len)
     close(fd);
     cairo_surface_t *surf = NULL;
     if (written == (ssize_t)len) {
-        surf = load_icon_argb(path, DBUSMENU_ICON_TARGET_PX);
+        surf = load_icon_argb(path, icon_fetch_size_for(DBUSMENU_ICON_TARGET_PX));
     }
     unlink(path);
     return surf;
@@ -302,7 +302,7 @@ static void dbusmenu_parse_node(DBusMessageIter *variant_iter, int depth, MenuIt
                 mi->icon = decode_icon_data(icon_data, icon_data_len);
             }
             if (!mi->icon && icon_name[0]) {
-                mi->icon = resolve_icon_theme_name(icon_name, DBUSMENU_ICON_TARGET_PX);
+                mi->icon = resolve_icon_theme_name(icon_name, icon_fetch_size_for(DBUSMENU_ICON_TARGET_PX));
             }
         }
         out_ids[*n] = id;

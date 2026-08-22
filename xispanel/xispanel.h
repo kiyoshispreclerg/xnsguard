@@ -268,6 +268,28 @@ struct Panel {
     PanelWidget *hover_widget;
     int hover_local_x;
     int hover_local_y; /* cross-axis position, same space on_button()'s local_y uses -- see panel_widget_hover_local_y() */
+
+    /* X-DENSITY (see TESTS/X-DENSITY.md and density.c): the density
+     * currently applied to this panel's own auxiliary pixmap, 1/1 when
+     * inactive (the default/vastly-common case -- no compositor has ever
+     * asked). density_pixmap/surface/cr are None/NULL whenever den == 1,
+     * created on demand the first time a compositor actually requests
+     * something else, and destroyed again the moment it drops back to
+     * 1/1 -- never kept around "just in case". */
+    int density_num, density_den;
+    int density_pixmap_w, density_pixmap_h; /* size the pixmap/surface were last (re)created at */
+    Pixmap density_pixmap;
+    cairo_surface_t *density_surface;
+    cairo_t *density_cr;
+    /* Offscreen CPU buffer the actual widget paint() calls draw into --
+     * only the single final blit below touches density_surface/pixmap
+     * itself, same "draw off-screen, one atomic blit" shape buf_surface/
+     * buf_cr uses for the real window and for the same reason: a Pixmap
+     * generates Damage per X request written to it (see density.c's doc
+     * comment), so drawing widgets directly onto it let a Damage-tracking
+     * compositor resample mid-frame -- visible as flicker. */
+    cairo_surface_t *density_img_surface;
+    cairo_t *density_img_cr;
 };
 
 /* ---- shared X connection state (defined in xispanel.c) ---- */
@@ -365,6 +387,19 @@ cairo_surface_t *load_png_argb(const char *path);
  * bitmap theme instead of always falling back to a flat color. */
 void panel_draw_9slice(cairo_t *cr, cairo_surface_t *src, int sw, int sh, int l, int t, int r, int b, double dw,
                         double dh);
+/* Paints `p`'s full content (background + every widget, in logical panel-
+ * local coordinates) into `cr` with an extra cairo_scale(scale, scale)
+ * pushed first -- the actual drawing code neither knows nor cares about
+ * `scale`, since it's just a transform on top of the same logical-unit
+ * calls panel_repaint() always made. Used for the normal on-screen buffer
+ * (scale=1) and by density.c's auxiliary-pixmap render (scale=density) --
+ * see TESTS/X-DENSITY.md. Vector/text content redraws crisp at any scale
+ * this way; pre-rendered icon bitmaps don't (see density.c's doc comment). */
+void panel_paint_content(Panel *p, cairo_t *cr, double scale);
+/* Calls cb(p, ctx) for every in-use panel -- lets density.c react to a
+ * compositor disappearing (reset every panel's density to 1/1) without
+ * needing xispanel.c's own g_panels[]/MAX_PANELS storage details exposed. */
+void panel_foreach(void (*cb)(Panel *p, void *ctx), void *ctx);
 /* Runs `cmd` via `sh -c`, detached (double-forked via setsid()) and never
  * waited on -- SIGCHLD is set to SIG_IGN in main() so the child is
  * auto-reaped by the kernel instead of becoming a zombie, same pattern
@@ -468,8 +503,54 @@ int ewmh_kiwm_current_desktop_for_output(const char *output_name, int *out_outpu
  * doing its own per-window kiwm filtering doesn't need a second query. */
 Window ewmh_resolve_active_for_output(const char *output_name, int *out_kiwm_output_idx, int *out_current_desktop);
 
+/* ---- X-DENSITY: per-window transient optical zoom (density.c) ----
+ *
+ * See TESTS/X-DENSITY.md for the full protocol spec. Client-side only --
+ * xispanel's panel windows are the ones that might get zoomed by a
+ * compositor, never the other way around. Opt-in entirely by the
+ * compositor: with no _X_DENSITY_MANAGER_S<screen> selection owner, none
+ * of this does anything (zero atoms touched beyond the one-time interns,
+ * zero pixmaps allocated) -- exactly the "identical to a plain X11 app"
+ * behavior the spec requires of a conforming client. */
+void density_init(void);                                 /* call once at startup, after ewmh_init_atoms() */
+int density_handle_xfixes_event(const XEvent *ev);        /* 1 if consumed (a manager-selection change) */
+int density_handle_property(Panel *p, const XPropertyEvent *ev); /* 1 if consumed (_X_DENSITY_REQUESTED on p->win) */
+void density_render(Panel *p);      /* call at the end of panel_repaint() -- no-op unless density != 1/1 */
+void density_panel_destroyed(Panel *p); /* frees the aux pixmap/surface/cr, if any -- call from panel_deactivate() */
+
+/* ---- X-INPUT-SCALE: per-CRTC cursor-confinement query (inputscale.c) ----
+ *
+ * See /home/kiyoshi/Downloads/kiyoshi-forks/xserver/doc/
+ * x11-per-output-scaling-extension.md -- this project's own experimental
+ * server extension. xispanel only ever reads confinement state, never
+ * sets it (that's a compositor's job) -- used by resolve_output_geometry()
+ * so a panel sizes itself to an output's actual usable desktop-space box
+ * instead of its raw physical CRTC size when a compositor has confined it
+ * smaller for HiDPI downscaling. */
+void inputscale_init(void); /* call once at startup */
+/* 1 (and fills *out_x/y/w/h, desktop-space pixels) if `crtc` (an RRCrtc)
+ * currently has an active confine box, else 0 (extension absent, or no
+ * confinement set for this CRTC right now). */
+int inputscale_get_confine(unsigned long crtc, int *out_x, int *out_y, int *out_w, int *out_h);
+/* fd of a dedicated connection used only for XISConfineNotify events (see
+ * inputscale.c's doc comment for why it's separate from xispanel's own
+ * Xlib connection) -- add to the main loop's select() set. -1 if
+ * unavailable (extension absent, or this server build has no event
+ * support yet -- xispanel.c's polling fallback is the only signal then). */
+int inputscale_fd(void);
+/* Drains every pending event on that connection -- call when its fd is
+ * readable. Returns 1 if at least one was an XISConfineNotify (any CRTC):
+ * caller should just re-check every panel's output geometry and reload if
+ * anything changed, same reaction the polling fallback already has. */
+int inputscale_poll_change(void);
+
 /* ---- small drawing helpers built on top of the above (ewmh.c) ---- */
 int icon_size_for(int thickness, int padding); /* shared by tasklist/tray's icon_padding= */
+/* Wraps a logical icon draw size for icon *fetch/cache* calls specifically
+ * (ewmh_get_icon_surface()/resolve_icon_theme_name()) -- see ewmh.c's doc
+ * comment. Never use this for layout/positioning math, only for the
+ * target_size argument passed to a fetch. */
+int icon_fetch_size_for(int logical_px);
 /* Downscales `src` to fit within target_size x target_size (aspect
  * preserved), replacing it with a new smaller surface and destroying the
  * original. Never upscales -- if `src` is already <= target_size on both

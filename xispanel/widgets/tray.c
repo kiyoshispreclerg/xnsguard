@@ -64,7 +64,7 @@ static int tray_on_tick(PanelWidget *w, uint64_t now)
      * see its doc comment. */
     int icon_px, slot, pad;
     tray_layout(w, &icon_px, &slot, &pad);
-    sni_set_icon_target_size(icon_px);
+    sni_set_icon_target_size(icon_fetch_size_for(icon_px));
     return 0;
 }
 

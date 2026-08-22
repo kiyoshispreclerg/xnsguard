@@ -983,6 +983,25 @@ int icon_size_for(int thickness, int padding)
     return size > 4 ? size : 4;
 }
 
+/* Every icon fetch/cache call site (ewmh_get_icon_surface()/
+ * resolve_icon_theme_name()) should pass icon_fetch_size_for(logical_px)
+ * instead of the plain logical draw size -- draw_icon_scaled() already
+ * scales whatever source surface it's given down to fit its `size`
+ * argument, so caching a bigger-than-needed source costs a bit of extra
+ * memory but lets both the normal 1x buffer *and* density.c's higher-
+ * density auxiliary render (see density.c's doc comment) draw the same
+ * cached surface crisply -- a high-quality downscale either way, instead
+ * of the 1x-cached bitmap being blurrily upscaled for density. The
+ * headroom is a fixed multiplier (not tied to any specific density
+ * request) since icons are cached once per ~1-2s poll tick, well before
+ * any given repaint knows what density (if any) it'll be asked to
+ * render at. */
+#define ICON_FETCH_HEADROOM 2
+int icon_fetch_size_for(int logical_px)
+{
+    return logical_px * ICON_FETCH_HEADROOM;
+}
+
 void draw_icon_scaled(cairo_t *cr, cairo_surface_t *icon, double x, double y, double size)
 {
     if (!icon || cairo_surface_status(icon) != CAIRO_STATUS_SUCCESS) {

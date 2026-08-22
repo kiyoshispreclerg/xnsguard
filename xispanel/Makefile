@@ -70,13 +70,53 @@ MODTAP_LDLIBS :=
 $(info xispanel: xtst not found via pkg-config -- building without bare-modifier ("tap Meta alone") hotkeys)
 endif
 
-CPPFLAGS := $(shell pkg-config --cflags $(PKGS)) $(DBUS_CPPFLAGS) $(THUMB_CPPFLAGS) $(MODTAP_CPPFLAGS)
-LDLIBS := $(shell pkg-config --libs $(PKGS)) $(THUMB_LDLIBS) $(MODTAP_LDLIBS) -lm -ldl
+# xfixes (density.c's X-DENSITY client support -- see TESTS/X-DENSITY.md --
+# needs XFixesSelectSelectionInput to track the _X_DENSITY_MANAGER_S<screen>
+# manager selection live) is linked normally like xcomposite/xtst above, no
+# dlopen equivalent for an X extension. Without libxfixes-dev, density_stub.c
+# (X-DENSITY support always reports absent, every entry point a no-op) is
+# linked instead.
+HAVE_XFIXES := $(shell pkg-config --exists xfixes && echo yes)
+ifeq ($(HAVE_XFIXES),yes)
+DENSITY_SRCS := density.c
+DENSITY_CPPFLAGS := $(shell pkg-config --cflags xfixes)
+DENSITY_LDLIBS := $(shell pkg-config --libs xfixes)
+else
+DENSITY_SRCS := density_stub.c
+DENSITY_CPPFLAGS :=
+DENSITY_LDLIBS :=
+$(info xispanel: xfixes not found via pkg-config -- building without X-DENSITY support)
+endif
+
+# xcb/xcb-randr/x11-xcb (inputscale.c's X-INPUT-SCALE client query -- see
+# that file's doc comment) are the one place this otherwise Xlib-only
+# codebase touches XCB, needed only because no Xlib-side client binding
+# exists yet for this project's own experimental server extension --
+# hand-rolling one raw extension request is far simpler via XCB's generic
+# xcb_send_request() than via Xlib's unexported extension-request
+# internals. XGetXCBConnection() (x11-xcb) shares xispanel's existing Xlib
+# connection rather than opening a second one. Without all three -dev
+# packages, inputscale_stub.c (always reports "no confinement active") is
+# linked instead.
+HAVE_XINPUTSCALE := $(shell pkg-config --exists xcb xcb-randr x11-xcb && echo yes)
+ifeq ($(HAVE_XINPUTSCALE),yes)
+INPUTSCALE_SRCS := inputscale.c
+INPUTSCALE_CPPFLAGS := $(shell pkg-config --cflags xcb xcb-randr x11-xcb)
+INPUTSCALE_LDLIBS := $(shell pkg-config --libs xcb xcb-randr x11-xcb)
+else
+INPUTSCALE_SRCS := inputscale_stub.c
+INPUTSCALE_CPPFLAGS :=
+INPUTSCALE_LDLIBS :=
+$(info xispanel: xcb/xcb-randr/x11-xcb not found via pkg-config -- building without X-INPUT-SCALE support)
+endif
+
+CPPFLAGS := $(shell pkg-config --cflags $(PKGS)) $(DBUS_CPPFLAGS) $(THUMB_CPPFLAGS) $(MODTAP_CPPFLAGS) $(DENSITY_CPPFLAGS) $(INPUTSCALE_CPPFLAGS)
+LDLIBS := $(shell pkg-config --libs $(PKGS)) $(THUMB_LDLIBS) $(MODTAP_LDLIBS) $(DENSITY_LDLIBS) $(INPUTSCALE_LDLIBS) -lm -ldl
 
 PREFIX ?= /usr/local
 BINDIR := $(PREFIX)/bin
 
-SRCS := xispanel.c ewmh.c menu.c tooltip.c toast.c hotkey.c $(MODTAP_SRCS) pulse.c pango_text.c $(DBUS_SRCS) $(THUMB_SRCS) widgets/spacer.c widgets/clock.c widgets/tasklist.c widgets/winctl.c widgets/tray.c widgets/launcher.c widgets/volume.c widgets/globalmenu.c widgets/folder.c widgets/xisserve.c widgets/notif.c widgets/pager.c
+SRCS := xispanel.c ewmh.c menu.c tooltip.c toast.c hotkey.c $(MODTAP_SRCS) pulse.c pango_text.c $(DBUS_SRCS) $(THUMB_SRCS) $(DENSITY_SRCS) $(INPUTSCALE_SRCS) widgets/spacer.c widgets/clock.c widgets/tasklist.c widgets/winctl.c widgets/tray.c widgets/launcher.c widgets/volume.c widgets/globalmenu.c widgets/folder.c widgets/xisserve.c widgets/notif.c widgets/pager.c
 OBJS := $(SRCS:.c=.o)
 
 xispanel: $(OBJS)

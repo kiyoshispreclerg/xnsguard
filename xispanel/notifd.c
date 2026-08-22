@@ -216,12 +216,12 @@ static cairo_surface_t *resolve_notif_icon(const char *app_icon)
         return NULL;
     }
     if (app_icon[0] == '/') {
-        return load_icon_argb(app_icon, NOTIFD_ICON_TARGET_PX);
+        return load_icon_argb(app_icon, icon_fetch_size_for(NOTIFD_ICON_TARGET_PX));
     }
     if (!strncmp(app_icon, "file://", 7)) {
-        return load_icon_argb(app_icon + 7, NOTIFD_ICON_TARGET_PX);
+        return load_icon_argb(app_icon + 7, icon_fetch_size_for(NOTIFD_ICON_TARGET_PX));
     }
-    return resolve_icon_theme_name(app_icon, NOTIFD_ICON_TARGET_PX);
+    return resolve_icon_theme_name(app_icon, icon_fetch_size_for(NOTIFD_ICON_TARGET_PX));
 }
 
 static void ring_append(const char *app_name, const char *app_icon, const char *summary, const char *body,

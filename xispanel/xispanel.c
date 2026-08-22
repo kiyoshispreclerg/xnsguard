@@ -630,6 +630,15 @@ static int resolve_output_geometry(const char *name, int *ox, int *oy, int *ow, 
                 *oy = ci->y;
                 *ow = (int)ci->width;
                 *oh = (int)ci->height;
+                /* X-INPUT-SCALE (see inputscale.c's doc comment): a
+                 * compositor doing per-output HiDPI downscaling can
+                 * confine this CRTC's cursor (and, by convention, its
+                 * actual usable desktop-space area) to a box smaller than
+                 * the raw physical scanout -- use that instead when
+                 * active, so the panel doesn't oversize itself relative
+                 * to everything else drawn at that output's logical
+                 * resolution. */
+                inputscale_get_confine((unsigned long)oi->crtc, ox, oy, ow, oh);
                 *out_hz = 0;
                 for (int m = 0; m < res->nmode; m++) {
                     if (res->modes[m].id != ci->mode) {
@@ -862,7 +871,10 @@ static Window panel_create_window(Panel *p, int x, int y, int w, int h)
     attrs.colormap = p->cmap;
     attrs.border_pixel = 0;
     attrs.background_pixel = 0;
-    attrs.event_mask = ButtonPressMask | EnterWindowMask | LeaveWindowMask | PointerMotionMask | ExposureMask;
+    /* PropertyChangeMask: needed for _X_DENSITY_REQUESTED (see density.c) --
+     * a compositor writes that directly onto this window. */
+    attrs.event_mask =
+        ButtonPressMask | EnterWindowMask | LeaveWindowMask | PointerMotionMask | ExposureMask | PropertyChangeMask;
 
     Window win = XCreateWindow(g_dpy, g_root, x, y, (unsigned)w, (unsigned)h, 0, p->depth, InputOutput, p->visual,
                                 CWOverrideRedirect | CWColormap | CWBorderPixel | CWBackPixel | CWEventMask, &attrs);
@@ -1282,63 +1294,48 @@ static void panel_layout(Panel *p)
     }
 }
 
-static void panel_repaint(Panel *p)
+/* Paints p's full content (background + every widget) into `cr`, with an
+ * extra cairo_scale(scale, scale) pushed first -- see this function's own
+ * doc comment in xispanel.h. Used for the normal on-screen buffer
+ * (scale=1, from panel_repaint() below) and by density.c's auxiliary-
+ * pixmap render (scale=density, see TESTS/X-DENSITY.md). */
+void panel_paint_content(Panel *p, cairo_t *cr, double scale)
 {
-    if (!p->cr || !p->buf_cr) {
-        return;
-    }
+    cairo_save(cr);
+    cairo_scale(cr, scale, scale);
 
-    /* Once a cairo_t enters an error state (e.g. CAIRO_STATUS_INVALID_STRING
-     * from passing malformed UTF-8 to cairo_show_text -- window titles are
-     * supposed to be UTF-8 but not every client is well-behaved), every
-     * subsequent call on it becomes a silent no-op *permanently*, even
-     * cairo_save()/cairo_restore(). Since these cairo_t's are reused across
-     * every repaint rather than recreated each time, one bad frame would
-     * otherwise blank the panel forever. Recreate here instead of trusting
-     * every current and future widget to never make this mistake. */
-    if (cairo_status(p->buf_cr) != CAIRO_STATUS_SUCCESS) {
-        fprintf(stderr, "xispanel: panel '%s': cairo error (%s), recreating drawing context\n", p->name,
-                cairo_status_to_string(cairo_status(p->buf_cr)));
-        cairo_destroy(p->buf_cr);
-        p->buf_cr = cairo_create(p->buf_surface);
-        if (g_font_face) {
-            cairo_set_font_face(p->buf_cr, g_font_face);
-        }
-        cairo_set_font_size(p->buf_cr, panel_text_size(p));
-    }
-
-    /* Every widget paints into the offscreen buf_cr/buf_surface first. Only
-     * the single cairo_paint() below (blitting the finished buffer onto the
-     * real, on-screen p->cr/surface) touches the window itself -- painting
-     * straight onto the xlib surface instead sent each widget's fills/
-     * strokes as its own X request, which a compositor could pick up
-     * mid-repaint and show as flicker (worst on tasklist, which repaints on
-     * every ~800ms poll tick even with nothing visibly different). */
-    cairo_save(p->buf_cr);
-    cairo_set_operator(p->buf_cr, CAIRO_OPERATOR_SOURCE);
+    /* Only the single cairo_paint() at the end of panel_repaint() (blitting
+     * the finished buffer onto the real, on-screen p->cr/surface) touches
+     * the window itself -- painting straight onto the xlib surface instead
+     * sent each widget's fills/strokes as its own X request, which a
+     * compositor could pick up mid-repaint and show as flicker (worst on
+     * tasklist, which repaints on every ~800ms poll tick even with nothing
+     * visibly different). */
+    cairo_save(cr);
+    cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
     if (p->bg_image_surface) {
         /* Clear first: the 9-slice draw below is itself CAIRO_OPERATOR_SOURCE
          * per region, but only actually covers the panel rect once (no
          * overlap/gaps by construction), so no separate clear is needed --
          * kept anyway for a defined background on any 1px seam from
          * floating-point scaling error. */
-        cairo_set_source_rgba(p->buf_cr, 0, 0, 0, 0);
-        cairo_paint(p->buf_cr);
+        cairo_set_source_rgba(cr, 0, 0, 0, 0);
+        cairo_paint(cr);
         int sw = cairo_image_surface_get_width(p->bg_image_surface);
         int sh = cairo_image_surface_get_height(p->bg_image_surface);
-        panel_draw_9slice(p->buf_cr, p->bg_image_surface, sw, sh, p->bg_slice_l, p->bg_slice_t, p->bg_slice_r,
+        panel_draw_9slice(cr, p->bg_image_surface, sw, sh, p->bg_slice_l, p->bg_slice_t, p->bg_slice_r,
                            p->bg_slice_b, p->w, p->h);
     } else {
-        cairo_set_source_rgba(p->buf_cr, p->bg_r, p->bg_g, p->bg_b, p->bg_a);
-        cairo_paint(p->buf_cr);
+        cairo_set_source_rgba(cr, p->bg_r, p->bg_g, p->bg_b, p->bg_a);
+        cairo_paint(cr);
     }
-    cairo_restore(p->buf_cr);
+    cairo_restore(cr);
 
-    cairo_set_operator(p->buf_cr, CAIRO_OPERATOR_OVER);
+    cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
     for (int i = 0; i < p->n_widgets; i++) {
         PanelWidget *w = &p->widgets[i];
         if (w->ops->paint) {
-            cairo_save(p->buf_cr);
+            cairo_save(cr);
             /* This widget's real, physical, un-rotated on-panel rectangle
              * -- same shape widget_get_rect() always used to report
              * before rotation existed. Rotating *about its center* by any
@@ -1367,15 +1364,53 @@ static void panel_repaint(Panel *p)
             int transposed = (p->rotate == 90 || p->rotate == 270);
             double content_w = transposed ? ph : pw;
             double content_h = transposed ? pw : ph;
-            cairo_translate(p->buf_cr, cx, cy);
+            cairo_translate(cr, cx, cy);
             if (p->rotate) {
-                cairo_rotate(p->buf_cr, p->rotate * M_PI / 180.0);
+                cairo_rotate(cr, p->rotate * M_PI / 180.0);
             }
-            cairo_translate(p->buf_cr, -content_w / 2.0, -content_h / 2.0);
-            w->ops->paint(w, p->buf_cr);
-            cairo_restore(p->buf_cr);
+            cairo_translate(cr, -content_w / 2.0, -content_h / 2.0);
+            w->ops->paint(w, cr);
+            cairo_restore(cr);
         }
     }
+    cairo_restore(cr); /* pops the scale pushed at the top */
+}
+
+void panel_foreach(void (*cb)(Panel *p, void *ctx), void *ctx)
+{
+    for (int i = 0; i < MAX_PANELS; i++) {
+        if (g_panels[i].in_use) {
+            cb(&g_panels[i], ctx);
+        }
+    }
+}
+
+static void panel_repaint(Panel *p)
+{
+    if (!p->cr || !p->buf_cr) {
+        return;
+    }
+
+    /* Once a cairo_t enters an error state (e.g. CAIRO_STATUS_INVALID_STRING
+     * from passing malformed UTF-8 to cairo_show_text -- window titles are
+     * supposed to be UTF-8 but not every client is well-behaved), every
+     * subsequent call on it becomes a silent no-op *permanently*, even
+     * cairo_save()/cairo_restore(). Since these cairo_t's are reused across
+     * every repaint rather than recreated each time, one bad frame would
+     * otherwise blank the panel forever. Recreate here instead of trusting
+     * every current and future widget to never make this mistake. */
+    if (cairo_status(p->buf_cr) != CAIRO_STATUS_SUCCESS) {
+        fprintf(stderr, "xispanel: panel '%s': cairo error (%s), recreating drawing context\n", p->name,
+                cairo_status_to_string(cairo_status(p->buf_cr)));
+        cairo_destroy(p->buf_cr);
+        p->buf_cr = cairo_create(p->buf_surface);
+        if (g_font_face) {
+            cairo_set_font_face(p->buf_cr, g_font_face);
+        }
+        cairo_set_font_size(p->buf_cr, panel_text_size(p));
+    }
+
+    panel_paint_content(p, p->buf_cr, 1.0);
     cairo_surface_flush(p->buf_surface);
 
     /* p->cr is also used directly by widgets' measure() (cairo_text_extents
@@ -1401,6 +1436,8 @@ static void panel_repaint(Panel *p)
     cairo_surface_flush(p->surface);
     XFlush(g_dpy);
     p->dirty = 0;
+
+    density_render(p);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1500,6 +1537,7 @@ static void panel_destroy_widgets(Panel *p)
 static void panel_deactivate(Panel *p)
 {
     panel_destroy_widgets(p);
+    density_panel_destroyed(p);
     if (p->bg_image_surface) {
         cairo_surface_destroy(p->bg_image_surface);
         p->bg_image_surface = NULL;
@@ -1611,6 +1649,8 @@ static Panel *alloc_panel(const char *name, const char *output)
              * existing size" (see the field's doc comment in xispanel.h). */
             p->font_size_px = detect_system_font_size_px();
             p->spacing = 4;
+            p->density_num = 1;
+            p->density_den = 1;
             return p;
         }
     }
@@ -2114,6 +2154,57 @@ static void reload_all_panels(void)
     }
 }
 
+/* Re-resolves every panel's output geometry (RandR CRTC box, or
+ * X-INPUT-SCALE's confine box when active -- see resolve_output_geometry())
+ * and reloads everything from config the instant any of them disagrees
+ * with what's currently applied. Shared by the event-driven path
+ * (inputscale_fd()/inputscale_poll_change() -- XISConfineNotify, when the
+ * running server build supports it) and the polling fallback below (for
+ * older server builds with no event support yet). Reuses reload_all_panels() wholesale
+ * rather than a bespoke resize path, same tradeoff RandR hotplug already
+ * makes. Returns 1 if it reloaded. */
+static int check_output_geometry_changed(void)
+{
+    for (int i = 0; i < MAX_PANELS; i++) {
+        Panel *p = &g_panels[i];
+        if (!p->in_use) {
+            continue;
+        }
+        int nx, ny, nw, nh;
+        double nhz;
+        if (!resolve_output_geometry(p->output, &nx, &ny, &nw, &nh, &nhz)) {
+            continue;
+        }
+        if (nx != p->out_x || ny != p->out_y || nw != p->out_w || nh != p->out_h) {
+            fprintf(stderr,
+                    "xispanel: output '%s' usable area changed (%dx%d+%d+%d -> %dx%d+%d+%d) -- reloading panels\n",
+                    p->output, p->out_w, p->out_h, p->out_x, p->out_y, nw, nh, nx, ny);
+            reload_all_panels();
+            return 1; /* reload_all_panels() already rebuilt every panel from config */
+        }
+    }
+    return 0;
+}
+
+/* Slow-poll fallback only, for a server build with no XISConfineNotify
+ * event support yet (see inputscale.c's doc comment) -- setting/clearing
+ * X-INPUT-SCALE confinement raises no RandR event on its own, so without
+ * either this or the live event, a compositor toggling per-output HiDPI
+ * confinement while xispanel is already running would go unnoticed until
+ * the next unrelated reload. Deliberately slow (confinement toggling is a
+ * rare, deliberate compositor action, not something worth reacting to
+ * instantly) since this is the fallback path, not the primary one. */
+#define CONFINE_POLL_MS 1500
+static void poll_output_geometry_changes(uint64_t now)
+{
+    static uint64_t next_poll_ms = 0;
+    if (now < next_poll_ms) {
+        return;
+    }
+    next_poll_ms = now + CONFINE_POLL_MS;
+    check_output_geometry_changed();
+}
+
 /* ------------------------------------------------------------------ */
 /* IPC (line-JSON over $XDG_RUNTIME_DIR/xispanel-ctl.sock)              */
 /* ------------------------------------------------------------------ */
@@ -2273,6 +2364,20 @@ static Panel *find_panel_by_window(Window win, int *is_sensor)
     return NULL;
 }
 
+/* density_handle_property() (density.c) needs the Panel a PropertyNotify's
+ * window belongs to, which find_panel_by_window() above is only known to
+ * this file -- 0 if the event isn't on any panel's own window (or is its
+ * autohide sensor window, which never gets a density request). */
+static int density_property_dispatch(const XPropertyEvent *ev)
+{
+    int is_sensor = 0;
+    Panel *p = find_panel_by_window(ev->window, &is_sensor);
+    if (!p || is_sensor) {
+        return 0;
+    }
+    return density_handle_property(p, ev);
+}
+
 static void dispatch_button(Panel *p, int button, int x, int y, int root_x, int root_y)
 {
     int axis_pos = (p->edge == EDGE_TOP || p->edge == EDGE_BOTTOM) ? x : y;
@@ -2405,6 +2510,8 @@ static int run_as_daemon(const char *sockpath)
     pango_text_init(g_font_family);
 
     ewmh_init_atoms();
+    density_init();     /* X-DENSITY (see TESTS/X-DENSITY.md) -- must come after g_screen/g_root are set above */
+    inputscale_init();  /* X-INPUT-SCALE (see inputscale.c) -- same ordering requirement */
     if (!disable_modtap) {
         modtap_init(); /* bare-modifier ("tap Meta alone") hotkeys, see hotkey.c/modtap.c */
     }
@@ -2457,6 +2564,7 @@ static int run_as_daemon(const char *sockpath)
 
     int xfd = ConnectionNumber(g_dpy);
     int modtapfd = modtap_fd();
+    int xisfd = inputscale_fd();
     while (!g_quit) {
         fd_set rfds;
         FD_ZERO(&rfds);
@@ -2467,6 +2575,12 @@ static int run_as_daemon(const char *sockpath)
             FD_SET(modtapfd, &rfds);
             if (modtapfd > maxfd) {
                 maxfd = modtapfd;
+            }
+        }
+        if (xisfd >= 0) {
+            FD_SET(xisfd, &rfds);
+            if (xisfd > maxfd) {
+                maxfd = xisfd;
             }
         }
 
@@ -2582,6 +2696,9 @@ static int run_as_daemon(const char *sockpath)
                     XRRUpdateConfiguration(&ev);
                     reload_all_panels();
                     XFlush(g_dpy);
+                } else if (density_handle_xfixes_event(&ev)) {
+                    /* the _X_DENSITY_MANAGER_S<screen> selection appeared/
+                     * disappeared -- see density.c/TESTS/X-DENSITY.md */
                 } else if (hotkey_handle_event(&ev)) {
                     /* consumed by a registered global hotkey -- see hotkey.c */
                 } else if (thumb_handle_event(&ev)) {
@@ -2630,6 +2747,9 @@ static int run_as_daemon(const char *sockpath)
                     if (p && !is_sensor) {
                         p->dirty = 1;
                     }
+                } else if (ev.type == PropertyNotify && density_property_dispatch(&ev.xproperty)) {
+                    /* consumed: _X_DENSITY_REQUESTED on one of our own panel
+                     * windows -- see density.c/TESTS/X-DENSITY.md */
                 } else if (ev.type == PropertyNotify) {
                     /* A WM property the polling widgets depend on changed
                      * (active window, client list, current desktop, or a
@@ -2662,7 +2782,15 @@ static int run_as_daemon(const char *sockpath)
             modtap_process();
         }
 
+        if (xisfd >= 0 && r > 0 && FD_ISSET(xisfd, &rfds) && inputscale_poll_change()) {
+            /* a CRTC's X-INPUT-SCALE confine box was set/reset -- react
+             * immediately instead of waiting for
+             * poll_output_geometry_changes()'s next tick. */
+            check_output_geometry_changed();
+        }
+
         now = now_ms();
+        poll_output_geometry_changes(now);
         tooltip_tick(now);
         panel_menu_tick(now);
         toast_tick(now);

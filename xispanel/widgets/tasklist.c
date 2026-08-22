@@ -233,7 +233,7 @@ static void tasklist_pin_class(PanelWidget *w, const char *cls)
          * via the right-click "Fixar" menu runs on an already-laid-out
          * panel, where w->thickness is the real thing. */
         int thickness = w->thickness > 0 ? w->thickness : w->panel->thickness_cfg;
-        pa->icon = resolve_icon_theme_name(icon_name, icon_size_for(thickness, tp->icon_padding));
+        pa->icon = resolve_icon_theme_name(icon_name, icon_fetch_size_for(icon_size_for(thickness, tp->icon_padding)));
     }
 }
 
@@ -477,7 +477,7 @@ static int tasklist_on_tick(PanelWidget *w, uint64_t now)
             tp->tasks[old_idx].icon = NULL;
             e->icon_lookup_tried = tp->tasks[old_idx].icon_lookup_tried;
         } else {
-            e->icon = ewmh_get_icon_surface(win, icon_px);
+            e->icon = ewmh_get_icon_surface(win, icon_fetch_size_for(icon_px));
         }
         if (!e->icon && !e->icon_lookup_tried && e->wm_class[0]) {
             /* _NET_WM_ICON didn't supply one (some GTK/Electron apps
@@ -493,7 +493,7 @@ static int tasklist_on_tick(PanelWidget *w, uint64_t now)
             char icon_name[256] = "";
             if (desktop_entry_find_by_wm_class(e->wm_class, NULL, 0, NULL, 0, icon_name, sizeof(icon_name)) &&
                 icon_name[0]) {
-                e->icon = resolve_icon_theme_name(icon_name, icon_px);
+                e->icon = resolve_icon_theme_name(icon_name, icon_fetch_size_for(icon_px));
             }
         }
     }
