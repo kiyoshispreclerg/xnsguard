@@ -646,6 +646,21 @@ static int resolve_output_geometry(const char *name, int *ox, int *oy, int *ow, 
     return found;
 }
 
+/* Public wrapper around resolve_output_geometry() for widgets that only
+ * need an output's real pixel size by name (pager.c's proportional-square
+ * mode) -- 0 if the output isn't currently connected. */
+int panel_lookup_output_size(const char *name, int *out_w, int *out_h)
+{
+    int ox, oy, ow, oh;
+    double hz;
+    if (!resolve_output_geometry(name, &ox, &oy, &ow, &oh, &hz)) {
+        return 0;
+    }
+    *out_w = ow;
+    *out_h = oh;
+    return 1;
+}
+
 /* Name of the RandR-designated primary output (xrandr --output X --primary),
  * or 0 if none is set/RandR is unavailable -- used only when writing a
  * first-run default config (see write_default_config_if_missing()), so a

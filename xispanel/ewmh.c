@@ -41,6 +41,7 @@ static Atom g_atom_net_wm_icon;
 static Atom g_atom_net_wm_moveresize;
 static Atom g_atom_net_number_of_desktops;
 static Atom g_atom_net_current_desktop;
+static Atom g_atom_net_desktop_layout;
 static Atom g_atom_wm_state; /* ICCCM WM_STATE, distinct from _NET_WM_STATE */
 static Atom g_atom_wm_change_state;
 static Atom g_atom_net_wm_state_skip_taskbar;
@@ -88,6 +89,7 @@ void ewmh_init_atoms(void)
     g_atom_net_wm_moveresize = XInternAtom(g_dpy, "_NET_WM_MOVERESIZE", False);
     g_atom_net_number_of_desktops = XInternAtom(g_dpy, "_NET_NUMBER_OF_DESKTOPS", False);
     g_atom_net_current_desktop = XInternAtom(g_dpy, "_NET_CURRENT_DESKTOP", False);
+    g_atom_net_desktop_layout = XInternAtom(g_dpy, "_NET_DESKTOP_LAYOUT", False);
     g_atom_wm_state = XInternAtom(g_dpy, "WM_STATE", False);
     g_atom_wm_change_state = XInternAtom(g_dpy, "WM_CHANGE_STATE", False);
     g_atom_net_wm_state_skip_taskbar = XInternAtom(g_dpy, "_NET_WM_STATE_SKIP_TASKBAR", False);
@@ -462,6 +464,39 @@ int ewmh_get_current_desktop(void)
         XFree(prop);
     }
     return desktop;
+}
+
+/* Reads _NET_DESKTOP_LAYOUT (the pager's own choice of grid shape -- see
+ * pager.c's file comment -- not something every WM sets). *out_cols/rows
+ * come back exactly as published, which per the spec may have one of the
+ * two at 0 ("as many as needed" for the given desktop count) -- deriving
+ * the real grid from that plus n_desktops is pager.c's job, not this
+ * reader's. *out_orientation is 0 (_NET_WM_ORIENTATION_HORZ) or 1 (_VERT);
+ * *out_starting_corner is 0..3 (TOPLEFT/TOPRIGHT/BOTTOMRIGHT/BOTTOMLEFT),
+ * defaulting to 0 (TOPLEFT) when the property only has 3 values (that
+ * field is optional in the spec). Returns 0 if the property isn't set at
+ * all -- callers should fall back to a single row of n_desktops. */
+int ewmh_get_desktop_layout(int *out_cols, int *out_rows, int *out_orientation, int *out_starting_corner)
+{
+    Atom actual_type;
+    int actual_format;
+    unsigned long n_items, bytes_after;
+    unsigned char *prop = NULL;
+    int ok = 0;
+    if (XGetWindowProperty(g_dpy, g_root, g_atom_net_desktop_layout, 0, 4, False, XA_CARDINAL, &actual_type,
+                            &actual_format, &n_items, &bytes_after, &prop) == Success &&
+        prop && n_items >= 3) {
+        long *v = (long *)(void *)prop;
+        *out_orientation = (int)v[0];
+        *out_cols = (int)v[1];
+        *out_rows = (int)v[2];
+        *out_starting_corner = n_items >= 4 ? (int)v[3] : 0;
+        ok = 1;
+    }
+    if (prop) {
+        XFree(prop);
+    }
+    return ok;
 }
 
 /* --- event-driven property watching (see the doc comments in xispanel.h) ---

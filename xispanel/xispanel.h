@@ -333,6 +333,10 @@ void widget_paint_hover_bg(PanelWidget *w, cairo_t *cr);
  * once per repaint and any widget code that needs to restore it after a
  * temporary override (see tasklist.c's badges). */
 double panel_text_size(const Panel *p);
+/* RandR real pixel size of a connected output by name (pager.c's
+ * proportional-square mode) -- 0 if that output isn't currently
+ * connected. */
+int panel_lookup_output_size(const char *name, int *out_w, int *out_h);
 /* Decodes any format Imlib2 understands (PNG, SVG if librsvg's loader is
  * present at runtime, etc.) into a premultiplied-alpha ARGB32 Cairo
  * surface, or NULL on any failure (missing file, decode error, larger
@@ -385,6 +389,12 @@ void ewmh_get_state_flags(Window w, int *minimized, int *maximized);
 Window ewmh_get_active_window(void);
 int ewmh_get_number_of_desktops(void);
 int ewmh_get_current_desktop(void); /* -1 if unavailable */
+/* Reads _NET_DESKTOP_LAYOUT: 0 if unset (caller should fall back to a
+ * single row of n_desktops), else 1 with *out_cols/rows as published (one
+ * may be 0, meaning "derive from desktop count"), *out_orientation 0=horz/
+ * 1=vert, *out_starting_corner 0..3 (TOPLEFT/TOPRIGHT/BOTTOMRIGHT/
+ * BOTTOMLEFT). See ewmh.c's doc comment. */
+int ewmh_get_desktop_layout(int *out_cols, int *out_rows, int *out_orientation, int *out_starting_corner);
 /* ---- event-driven property watching (ewmh.c) ----
  *
  * Lets the polling widgets (tasklist/winctl/globalmenu) react the instant
