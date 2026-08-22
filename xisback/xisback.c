@@ -67,6 +67,13 @@
 #include <time.h>
 #include <unistd.h>
 
+/* xisback_inputscale.c (or xisback_inputscale_stub.c, see Makefile) --
+ * X-INPUT-SCALE per-CRTC confinement, used by resolve_output_geometry(). */
+void xis_init(Display *dpy, Window root);
+int xis_get_confine(unsigned long crtc, int *out_x, int *out_y, int *out_w, int *out_h);
+int xis_fd(void);
+int xis_poll_change(void);
+
 #define XISBACK_VERSION "0.3.0"
 #define MAX_LAYERS 32
 #define LINE_MAX_LEN (PATH_MAX + 256)
@@ -475,6 +482,15 @@ static int resolve_output_geometry(const char *name, int *ox, int *oy, int *ow, 
                 *oy = ci->y;
                 *ow = (int)ci->width;
                 *oh = (int)ci->height;
+                /* X-INPUT-SCALE: a compositor doing per-output HiDPI
+                 * downscaling can confine this CRTC's usable desktop-space
+                 * area to a box smaller than the raw physical scanout --
+                 * use that instead when active, so the wallpaper stays
+                 * inside the actually-visible area instead of spilling
+                 * past it at the CRTC's full physical size. Leaves the
+                 * CRTC geometry set above untouched when no confinement is
+                 * active. */
+                xis_get_confine((unsigned long)oi->crtc, ox, oy, ow, oh);
                 found = 1;
                 XRRFreeCrtcInfo(ci);
             }
@@ -807,14 +823,25 @@ static int layer_fade_tick(Layer *l, const struct timespec *now)
     return 1;
 }
 
-static void layer_advance(Layer *l, time_t now)
+/* Renders whatever l->img_idx currently points at and (re)schedules the
+ * next slideshow tick, without changing which slide is "current" -- used
+ * right after a fresh SET (img_idx is freshly 0 from layer_load_sources,
+ * nothing to advance from yet) so that l->img_idx always means "the slide
+ * presently on screen", never "the slide that's about to be shown".
+ * Getting that invariant right matters beyond just this function: any
+ * geometry-only re-render (layer_render(), called by RandR/X-INPUT-SCALE
+ * handling on a resize) reads l->img_idx directly to redraw the same
+ * slide at a new size -- if img_idx ever pointed at the *next* slide
+ * instead of the current one, a resize would visibly jump the slideshow
+ * ahead by one without any of the bookkeeping (next_switch, shuffle-on-
+ * wrap) that a real advance does, which is exactly the bug this split
+ * fixes (previously layer_advance() rendered-then-incremented, so
+ * img_idx spent almost its entire life one slide ahead of what was
+ * actually being displayed). */
+static void layer_show_current(Layer *l, time_t now)
 {
     layer_render_current(l);
     if (l->n_images > 1 && l->interval > 0) {
-        l->img_idx = (l->img_idx + 1) % l->n_images;
-        if (l->img_idx == 0 && l->shuffle) {
-            shuffle_images(l->images, l->n_images);
-        }
         l->next_switch = now + l->interval;
     } else {
         l->next_switch = 0;
@@ -823,6 +850,42 @@ static void layer_advance(Layer *l, time_t now)
      * won't hand back to the OS on its own; force it so RSS actually
      * drops after a slideshow switch instead of just sitting there. */
     malloc_trim(0);
+}
+
+/* The actual "a slideshow transition happened" operation: moves to the
+ * next slide (reshuffling on wraparound if configured) and shows it, so
+ * l->img_idx reflects the new current slide both during and after this
+ * call. Used by the slideshow timer and by NEXT -- never by a
+ * geometry-only re-render, which must show the *current* slide via
+ * layer_show_current()/layer_render() instead. */
+static void layer_advance(Layer *l, time_t now)
+{
+    if (l->n_images > 1 && l->interval > 0) {
+        l->img_idx = (l->img_idx + 1) % l->n_images;
+        if (l->img_idx == 0 && l->shuffle) {
+            shuffle_images(l->images, l->n_images);
+        }
+    }
+    layer_show_current(l, now);
+}
+
+/* Re-resolves every layer's geometry and redraws at its (possibly new) size
+ * -- shared by the RandR handler (a monitor was reconfigured) and the
+ * X-INPUT-SCALE handler (a CRTC's confinement box changed without the CRTC
+ * itself changing, so no RRScreenChangeNotify fires for it). Any in-flight
+ * crossfade is snapped to its final state first: an animated transition
+ * doesn't make sense for a geometry change forced from outside. */
+static void refresh_all_layer_geometries(void)
+{
+    for (int i = 0; i < MAX_LAYERS; i++) {
+        if (g_layers[i].in_use) {
+            layer_finish_fade(&g_layers[i]);
+            layer_ensure_window(&g_layers[i]);
+            layer_render(&g_layers[i], 0);
+        }
+    }
+    malloc_trim(0);
+    XFlush(g_dpy);
 }
 
 /* ------------------------------------------------------------------ */
@@ -862,7 +925,7 @@ static int layer_apply_set(const char *output, int desktop, enum mode mode, int 
         destroy_layer(l);
         return -1;
     }
-    layer_advance(l, time(NULL));
+    layer_show_current(l, time(NULL));
     return 0;
 }
 
@@ -1415,6 +1478,8 @@ static int run_as_daemon(const char *sockpath, const char *configpath, const Com
         XRRSelectInput(g_dpy, g_root, RRScreenChangeNotifyMask);
     }
 
+    xis_init(g_dpy, g_root);
+
     unlink(sockpath);
     int listenfd = socket(AF_UNIX, SOCK_STREAM, 0);
     struct sockaddr_un addr;
@@ -1438,6 +1503,9 @@ static int run_as_daemon(const char *sockpath, const char *configpath, const Com
      * click action execs -- they'd otherwise inherit them across fork(). */
     fcntl(listenfd, F_SETFD, FD_CLOEXEC);
     fcntl(ConnectionNumber(g_dpy), F_SETFD, FD_CLOEXEC);
+    if (xis_fd() >= 0) {
+        fcntl(xis_fd(), F_SETFD, FD_CLOEXEC);
+    }
 
     snprintf(g_configpath, sizeof(g_configpath), "%s", configpath);
     load_config();
@@ -1450,12 +1518,19 @@ static int run_as_daemon(const char *sockpath, const char *configpath, const Com
     }
 
     int xfd = ConnectionNumber(g_dpy);
+    int xisfd = xis_fd();
     while (!g_quit) {
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(listenfd, &rfds);
         FD_SET(xfd, &rfds);
         int maxfd = listenfd > xfd ? listenfd : xfd;
+        if (xisfd >= 0) {
+            FD_SET(xisfd, &rfds);
+            if (xisfd > maxfd) {
+                maxfd = xisfd;
+            }
+        }
 
         time_t now = time(NULL);
         time_t soonest = 0;
@@ -1543,19 +1618,7 @@ static int run_as_daemon(const char *sockpath, const char *configpath, const Com
                 XNextEvent(g_dpy, &ev);
                 if (g_rr_event_base >= 0 && ev.type == g_rr_event_base + RRScreenChangeNotify) {
                     XRRUpdateConfiguration(&ev);
-                    for (int i = 0; i < MAX_LAYERS; i++) {
-                        if (g_layers[i].in_use) {
-                            /* Snap any in-flight crossfade to its final state
-                             * first: an animated transition doesn't make
-                             * sense for a geometry change forced by a
-                             * monitor reconfiguration. */
-                            layer_finish_fade(&g_layers[i]);
-                            layer_ensure_window(&g_layers[i]);
-                            layer_render(&g_layers[i], 0);
-                        }
-                    }
-                    malloc_trim(0);
-                    XFlush(g_dpy);
+                    refresh_all_layer_geometries();
                 } else if (ev.type == ButtonPress) {
                     /* Button2 is the middle button in X11's numbering (not
                      * Button3 -- that's right). Wheel scroll shows up as
@@ -1606,6 +1669,14 @@ static int run_as_daemon(const char *sockpath, const char *configpath, const Com
                     }
                 }
             }
+        }
+
+        if (xisfd >= 0 && r > 0 && FD_ISSET(xisfd, &rfds) && xis_poll_change()) {
+            /* A CRTC's X-INPUT-SCALE confinement box was set/resized/
+             * cleared -- react immediately instead of waiting for a
+             * RandR event that, for a confinement-only change, never
+             * comes. */
+            refresh_all_layer_geometries();
         }
 
         if (g_click_pending_button) {
