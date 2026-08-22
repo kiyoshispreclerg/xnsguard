@@ -267,6 +267,7 @@ struct Panel {
      * NULL = pointer isn't over any widget on this panel right now. */
     PanelWidget *hover_widget;
     int hover_local_x;
+    int hover_local_y; /* cross-axis position, same space on_button()'s local_y uses -- see panel_widget_hover_local_y() */
 };
 
 /* ---- shared X connection state (defined in xispanel.c) ---- */
@@ -293,6 +294,10 @@ void pango_text_extents_ellipsized(cairo_t *cr, const char *text, double size_px
                                     double *out_h);
 void pango_show_text_boxed(cairo_t *cr, double x, double top_y, double box_h, double max_width_px, double size_px,
                             const char *text, double *out_w);
+/* pango_show_text_boxed(), with `bold` drawn bold -- see pango_text.c's doc
+ * comment. */
+void pango_show_text_boxed_bold(cairo_t *cr, double x, double top_y, double box_h, double max_width_px,
+                                 double size_px, const char *text, int bold, double *out_w);
 
 /* ---- small helpers widgets rely on (xispanel.c) ---- */
 uint64_t now_ms(void);
@@ -312,6 +317,12 @@ void widget_get_rect(const PanelWidget *w, int *x, int *y, int *width, int *heig
  * widget_paint_hover_bg()/widget_paint_hover_rect() for the actual
  * paint step most widgets want. */
 int panel_widget_hover_local_x(const PanelWidget *w, int *out_local_x);
+/* Cross-axis counterpart of panel_widget_hover_local_x() -- *out_local_y
+ * is in the same space on_button()'s local_y already uses (0 at the
+ * widget's own thickness-axis start). Only widgets with a genuinely 2D
+ * layout of sub-items (pager's grid) need this; everything else only
+ * varies along the length axis and uses local_x alone. */
+int panel_widget_hover_local_y(const PanelWidget *w, int *out_local_y);
 /* Fills the sub-rect [x, x+width) x [0, w->thickness) of `w`'s own
  * content (natural, un-rotated local coordinates -- same space every
  * paint() already draws in) with a very transparent fg-colored
@@ -320,6 +331,10 @@ int panel_widget_hover_local_x(const PanelWidget *w, int *out_local_x);
  * hovered should gate on panel_widget_hover_local_x() themselves (see
  * widget_paint_hover_bg() for the common whole-widget case). */
 void widget_paint_hover_rect(PanelWidget *w, cairo_t *cr, int x, int width);
+/* Same fill as widget_paint_hover_rect(), but over an arbitrary [x,
+ * x+width) x [y, y+height) sub-rect instead of the full thickness --
+ * for widgets whose sub-items aren't full-height (pager's grid cells). */
+void widget_paint_hover_cell(PanelWidget *w, cairo_t *cr, int x, int y, int width, int height);
 /* widget_paint_hover_rect() over the whole widget (0..w->len), only
  * while panel_widget_hover_local_x() is true -- what a widget with no
  * sub-items of its own (launcher, clock, globalmenu, xisserve) wants:
@@ -386,6 +401,7 @@ void ewmh_get_title(Window w, char *buf, size_t bufsz);
 void ewmh_get_class(Window w, char *buf, size_t bufsz);
 int ewmh_get_desktop(Window w); /* -1 = sticky/not set */
 void ewmh_get_state_flags(Window w, int *minimized, int *maximized);
+int ewmh_get_urgent(Window w); /* 1 if demanding attention -- see ewmh.c's doc comment */
 Window ewmh_get_active_window(void);
 int ewmh_get_number_of_desktops(void);
 int ewmh_get_current_desktop(void); /* -1 if unavailable */
@@ -443,6 +459,14 @@ int ewmh_kiwm_get_output_desktops(int *out, int max); /* returns count read, one
 int ewmh_kiwm_get_num_output_desktops(void);          /* -1 if absent */
 int ewmh_kiwm_get_wm_output(Window w);                /* -1 if unset */
 void ewmh_kiwm_set_output_desktop(int output_idx, int desktop_idx);
+/* Per-output same_desktop_only filter helper (tasklist.c) -- -1 (leaving
+ * *out_output_idx at -1) if kiwm isn't running or output_name matches no
+ * known output, else that output's current desktop index. */
+int ewmh_kiwm_current_desktop_for_output(const char *output_name, int *out_output_idx);
+/* Kiwm-aware "active window, for this panel's own current view" -- see
+ * ewmh.c's doc comment. Also exposes the output/desktop lookup so a caller
+ * doing its own per-window kiwm filtering doesn't need a second query. */
+Window ewmh_resolve_active_for_output(const char *output_name, int *out_kiwm_output_idx, int *out_current_desktop);
 
 /* ---- small drawing helpers built on top of the above (ewmh.c) ---- */
 int icon_size_for(int thickness, int padding); /* shared by tasklist/tray's icon_padding= */

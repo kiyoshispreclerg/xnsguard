@@ -230,7 +230,18 @@ int panel_widget_hover_local_x(const PanelWidget *w, int *out_local_x)
     return 1;
 }
 
-void widget_paint_hover_rect(PanelWidget *w, cairo_t *cr, int x, int width)
+int panel_widget_hover_local_y(const PanelWidget *w, int *out_local_y)
+{
+    if (w->panel->hover_widget != w) {
+        return 0;
+    }
+    if (out_local_y) {
+        *out_local_y = w->panel->hover_local_y;
+    }
+    return 1;
+}
+
+void widget_paint_hover_cell(PanelWidget *w, cairo_t *cr, int x, int y, int width, int height)
 {
     Panel *p = w->panel;
     if (p->has_h_color) {
@@ -238,8 +249,13 @@ void widget_paint_hover_rect(PanelWidget *w, cairo_t *cr, int x, int width)
     } else {
         cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.12);
     }
-    cairo_rectangle(cr, x, 0, width, w->thickness);
+    cairo_rectangle(cr, x, y, width, height);
     cairo_fill(cr);
+}
+
+void widget_paint_hover_rect(PanelWidget *w, cairo_t *cr, int x, int width)
+{
+    widget_paint_hover_cell(w, cr, x, 0, width, w->thickness);
 }
 
 void widget_paint_hover_bg(PanelWidget *w, cairo_t *cr)
@@ -2273,13 +2289,13 @@ static void dispatch_button(Panel *p, int button, int x, int y, int root_x, int 
     }
 }
 
-/* Updates p's generic hover-highlight state (see panel_widget_hover_local_x()
- * in xispanel.h) from a MotionNotify's axis position -- same widget
- * lookup dispatch_button() uses for clicks. Only marks the panel dirty
- * when the hovered widget or its local_x actually changed, so a stream
- * of MotionNotify events over the *same* spot (X can resend these) isn't
- * a repaint each time. */
-static void panel_update_hover(Panel *p, int axis_pos)
+/* Updates p's generic hover-highlight state (see panel_widget_hover_local_x()/
+ * panel_widget_hover_local_y() in xispanel.h) from a MotionNotify's axis/
+ * cross-axis position -- same widget lookup dispatch_button() uses for
+ * clicks. Only marks the panel dirty when the hovered widget or its
+ * local_x/local_y actually changed, so a stream of MotionNotify events
+ * over the *same* spot (X can resend these) isn't a repaint each time. */
+static void panel_update_hover(Panel *p, int axis_pos, int cross_pos)
 {
     PanelWidget *hit = NULL;
     int local_x = 0;
@@ -2291,9 +2307,10 @@ static void panel_update_hover(Panel *p, int axis_pos)
             break;
         }
     }
-    if (hit != p->hover_widget || (hit && local_x != p->hover_local_x)) {
+    if (hit != p->hover_widget || (hit && (local_x != p->hover_local_x || cross_pos != p->hover_local_y))) {
         p->hover_widget = hit;
         p->hover_local_x = local_x;
+        p->hover_local_y = cross_pos;
         p->dirty = 1;
     }
 }
@@ -2589,8 +2606,9 @@ static int run_as_daemon(const char *sockpath)
                     Panel *p = find_panel_by_window(ev.xmotion.window, &is_sensor);
                     if (p && !is_sensor) {
                         int axis_pos = (p->edge == EDGE_TOP || p->edge == EDGE_BOTTOM) ? ev.xmotion.x : ev.xmotion.y;
+                        int cross_pos = (p->edge == EDGE_TOP || p->edge == EDGE_BOTTOM) ? ev.xmotion.y : ev.xmotion.x;
                         tooltip_notice_motion(p, axis_pos);
-                        panel_update_hover(p, axis_pos);
+                        panel_update_hover(p, axis_pos, cross_pos);
                     }
                 } else if (ev.type == EnterNotify) {
                     int is_sensor = 0;

@@ -249,13 +249,8 @@ static void pager_paint(PanelWidget *w, cairo_t *cr)
     (void)oheight;
     pager_compute_geometry(pp, w->thickness);
 
-    /* Hover tracking is along-panel-axis only (see
-     * panel_widget_hover_local_x()'s doc comment), so a hovered column
-     * highlights its full height rather than just the cell under the
-     * pointer -- an acceptable approximation, and exact for the common
-     * single-row case. */
-    int hover_local_x;
-    int has_hover = panel_widget_hover_local_x(w, &hover_local_x);
+    int hover_local_x, hover_local_y;
+    int has_hover = panel_widget_hover_local_x(w, &hover_local_x) && panel_widget_hover_local_y(w, &hover_local_y);
 
     for (int g = 0; g < pp->n_groups; g++) {
         for (int r = 0; r < pp->rows; r++) {
@@ -267,9 +262,11 @@ static void pager_paint(PanelWidget *w, cairo_t *cr)
                 int bx = ox + pp->group_x[g] + c * pp->btn_w[g];
                 int by = oy + r * pp->row_h;
                 int local_x = pp->group_x[g] + c * pp->btn_w[g];
+                int local_y = r * pp->row_h;
 
-                if (r == 0 && has_hover && hover_local_x >= local_x && hover_local_x < local_x + pp->btn_w[g]) {
-                    widget_paint_hover_rect(w, cr, local_x, pp->btn_w[g]);
+                if (has_hover && hover_local_x >= local_x && hover_local_x < local_x + pp->btn_w[g] &&
+                    hover_local_y >= local_y && hover_local_y < local_y + pp->row_h) {
+                    widget_paint_hover_cell(w, cr, local_x, local_y, pp->btn_w[g], pp->row_h);
                 }
                 if (d == pp->active_desktop[g]) {
                     cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.18);

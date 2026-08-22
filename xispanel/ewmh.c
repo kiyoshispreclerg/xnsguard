@@ -35,6 +35,7 @@ static Atom g_atom_net_wm_state;
 static Atom g_atom_net_wm_state_hidden;
 static Atom g_atom_net_wm_state_maximized_vert;
 static Atom g_atom_net_wm_state_maximized_horz;
+static Atom g_atom_net_wm_state_demands_attention;
 static Atom g_atom_net_active_window;
 static Atom g_atom_net_close_window;
 static Atom g_atom_net_wm_icon;
@@ -83,6 +84,7 @@ void ewmh_init_atoms(void)
     g_atom_net_wm_state_hidden = XInternAtom(g_dpy, "_NET_WM_STATE_HIDDEN", False);
     g_atom_net_wm_state_maximized_vert = XInternAtom(g_dpy, "_NET_WM_STATE_MAXIMIZED_VERT", False);
     g_atom_net_wm_state_maximized_horz = XInternAtom(g_dpy, "_NET_WM_STATE_MAXIMIZED_HORZ", False);
+    g_atom_net_wm_state_demands_attention = XInternAtom(g_dpy, "_NET_WM_STATE_DEMANDS_ATTENTION", False);
     g_atom_net_active_window = XInternAtom(g_dpy, "_NET_ACTIVE_WINDOW", False);
     g_atom_net_close_window = XInternAtom(g_dpy, "_NET_CLOSE_WINDOW", False);
     g_atom_net_wm_icon = XInternAtom(g_dpy, "_NET_WM_ICON", False);
@@ -351,6 +353,39 @@ void ewmh_get_state_flags(Window w, int *minimized, int *maximized)
     }
 }
 
+/* 1 if `w` is asking for attention -- either the modern
+ * _NET_WM_STATE_DEMANDS_ATTENTION or the legacy ICCCM XUrgencyHint bit in
+ * WM_HINTS, since not every toolkit sets the former (older GTK2/Xlib apps
+ * in particular still only ever set the WM_HINTS bit). Cleared by
+ * whichever the app itself clears on focus -- this is a plain read, not a
+ * tracked/latched state, so tasklist.c re-checks it every poll. */
+int ewmh_get_urgent(Window w)
+{
+    Atom actual_type;
+    int actual_format;
+    unsigned long n_items, bytes_after;
+    unsigned char *prop = NULL;
+    if (XGetWindowProperty(g_dpy, w, g_atom_net_wm_state, 0, 32, False, XA_ATOM, &actual_type, &actual_format,
+                            &n_items, &bytes_after, &prop) == Success &&
+        prop) {
+        Atom *atoms = (Atom *)(void *)prop;
+        for (unsigned long i = 0; i < n_items; i++) {
+            if (atoms[i] == g_atom_net_wm_state_demands_attention) {
+                XFree(prop);
+                return 1;
+            }
+        }
+        XFree(prop);
+    }
+    XWMHints *hints = XGetWMHints(g_dpy, w);
+    if (hints) {
+        int urgent = (hints->flags & XUrgencyHint) != 0;
+        XFree(hints);
+        return urgent;
+    }
+    return 0;
+}
+
 /* 1 if `w` (or a descendant of it, e.g. an app's internal focus proxy
  * window -- Qt/GTK sometimes focus a child rather than the toplevel EWMH
  * clients enumerate) currently holds real X input focus, as opposed to
@@ -564,17 +599,19 @@ int ewmh_property_event_is_relevant(const XPropertyEvent *ev, int *out_client_li
             return 1;
         }
         return a == g_atom_net_active_window || a == g_atom_net_current_desktop ||
-               a == g_atom_net_number_of_desktops;
+               a == g_atom_net_number_of_desktops || a == g_atom_kiwm_output_desktop;
     }
     /* A watched client window: title, max/min-state, or which virtual
      * desktop it's on (_NET_WM_DESKTOP -- tasklist's same_desktop filter
-     * and desktop badge, winctl/globalmenu's same_desktop filter). Which
-     * *output* a window is on has no property to watch -- it's derived
-     * from the window's geometry against the RandR layout, so an output
-     * change arrives as a ConfigureNotify, not a PropertyNotify; see the
-     * SubstructureNotify handling in xispanel.c. */
+     * and desktop badge, winctl/globalmenu's same_desktop filter) --
+     * _KIWM_WM_OUTPUT is that same filter's kiwm-mode companion (see
+     * tasklist.c's same_desktop_only handling and kiwm/PROTOCOL.md). Which
+     * *output* a window is on has no *standard* property to watch -- it's
+     * derived from the window's geometry against the RandR layout, so a
+     * plain-EWMH output change arrives as a ConfigureNotify, not a
+     * PropertyNotify; see the SubstructureNotify handling in xispanel.c. */
     return a == g_atom_net_wm_state || a == g_atom_wm_state || a == g_atom_net_wm_name || a == XA_WM_NAME ||
-           a == g_atom_net_wm_desktop;
+           a == g_atom_net_wm_desktop || a == g_atom_kiwm_wm_output;
 }
 
 static void ewmh_send_client_message(Window w, Atom message_type, long l0, long l1, long l2, long l3, long l4)
@@ -729,6 +766,66 @@ int ewmh_kiwm_get_wm_output(Window w)
         XFree(prop);
     }
     return out;
+}
+
+/* Convenience wrapper for a per-output same_desktop_only filter (tasklist's
+ * kiwm-aware mode): looks `output_name` up in _KIWM_OUTPUTS, fills
+ * *out_output_idx and returns that output's current desktop -- or returns
+ * -1 (leaving *out_output_idx at -1) if kiwm isn't running or the name
+ * doesn't match any known output (e.g. a panel configured with output=*,
+ * which spans every output and so has no single one to filter by). */
+int ewmh_kiwm_current_desktop_for_output(const char *output_name, int *out_output_idx)
+{
+    *out_output_idx = -1;
+    char names[64][64];
+    int n_outputs = 0;
+    if (!ewmh_kiwm_get_outputs(names, 64, &n_outputs)) {
+        return -1;
+    }
+    for (int i = 0; i < n_outputs; i++) {
+        if (strcmp(names[i], output_name) == 0) {
+            int desktops[64];
+            int n_read = ewmh_kiwm_get_output_desktops(desktops, 64);
+            *out_output_idx = i;
+            return i < n_read ? desktops[i] : 0;
+        }
+    }
+    return -1;
+}
+
+/* Resolves which window tasklist.c should treat as "the active one" for a
+ * panel bound to `output_name` -- plain _NET_ACTIVE_WINDOW under normal
+ * EWMH, but under kiwm that raw value can point to a window on a
+ * *different* output, or a desktop of this same output that isn't the one
+ * currently showing (e.g. it was focused right before a desktop switch,
+ * and kiwm hasn't re-focused anything on the new one yet) -- returns None
+ * in that case instead of wrongly highlighting/bold-suppressing a window
+ * that isn't actually visible on this panel's own current view. Also
+ * returns the output/desktop lookup via *out_kiwm_output_idx (-1 if not
+ * kiwm) and *out_current_desktop so callers with their own per-window
+ * same_desktop_only-style filtering (tasklist.c) can reuse it instead of
+ * a second _KIWM_OUTPUTS/_KIWM_OUTPUT_DESKTOP round trip. */
+Window ewmh_resolve_active_for_output(const char *output_name, int *out_kiwm_output_idx, int *out_current_desktop)
+{
+    Window active = ewmh_get_active_window();
+    int output_idx;
+    int current_desktop = ewmh_kiwm_current_desktop_for_output(output_name, &output_idx);
+    if (out_kiwm_output_idx) {
+        *out_kiwm_output_idx = output_idx;
+    }
+    if (out_current_desktop) {
+        *out_current_desktop = current_desktop;
+    }
+    if (output_idx < 0) {
+        return active; /* not kiwm (or output=* matches no single output) -- plain EWMH semantics as-is */
+    }
+    if (active == None) {
+        return None;
+    }
+    if (ewmh_kiwm_get_wm_output(active) != output_idx || ewmh_get_desktop(active) != current_desktop) {
+        return None;
+    }
+    return active;
 }
 
 /* Sends _KIWM_SET_OUTPUT_DESKTOP(output_idx, desktop_idx) to the root

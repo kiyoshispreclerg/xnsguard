@@ -37,9 +37,10 @@ void pango_text_init(const char *family)
 /* Shared setup for both the measuring and drawing entry points below --
  * a PangoLayout carrying `text` at `size_px`, ellipsized to max_width_px
  * if positive. Caller owns the returned layout (g_object_unref() it). */
-static PangoLayout *build_layout(cairo_t *cr, const char *text, double size_px, double max_width_px)
+static PangoLayout *build_layout(cairo_t *cr, const char *text, double size_px, double max_width_px, int bold)
 {
     pango_font_description_set_absolute_size(g_desc, size_px * PANGO_SCALE);
+    pango_font_description_set_weight(g_desc, bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL);
     PangoLayout *layout = pango_cairo_create_layout(cr);
     pango_layout_set_font_description(layout, g_desc);
     pango_layout_set_single_paragraph_mode(layout, TRUE);
@@ -62,7 +63,7 @@ static PangoLayout *build_layout(cairo_t *cr, const char *text, double size_px, 
 void pango_text_extents_ellipsized(cairo_t *cr, const char *text, double size_px, double max_width_px, double *out_w,
                                     double *out_h)
 {
-    PangoLayout *layout = build_layout(cr, text, size_px, max_width_px);
+    PangoLayout *layout = build_layout(cr, text, size_px, max_width_px, 0);
     int lw, lh;
     pango_layout_get_pixel_size(layout, &lw, &lh);
     if (out_w) {
@@ -84,7 +85,17 @@ void pango_text_extents_ellipsized(cairo_t *cr, const char *text, double size_px
 void pango_show_text_boxed(cairo_t *cr, double x, double top_y, double box_h, double max_width_px, double size_px,
                             const char *text, double *out_w)
 {
-    PangoLayout *layout = build_layout(cr, text, size_px, max_width_px);
+    pango_show_text_boxed_bold(cr, x, top_y, box_h, max_width_px, size_px, text, 0, out_w);
+}
+
+/* pango_show_text_boxed(), with the title drawn bold when `bold` is set --
+ * tasklist.c's urgent-window look (see ewmh_get_urgent()). Its own
+ * function rather than a param on pango_show_text_boxed() so none of that
+ * function's other ~15 call sites need touching. */
+void pango_show_text_boxed_bold(cairo_t *cr, double x, double top_y, double box_h, double max_width_px,
+                                 double size_px, const char *text, int bold, double *out_w)
+{
+    PangoLayout *layout = build_layout(cr, text, size_px, max_width_px, bold);
     int lw, lh;
     pango_layout_get_pixel_size(layout, &lw, &lh);
     if (out_w) {

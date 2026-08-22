@@ -34,6 +34,12 @@
 #define TASKLIST_WIDE_MAXW 180
 #define TASKLIST_ARROW_W 14
 #define TASKLIST_ARROW_GAP 4
+/* Urgent-task hover-blink: half-period (2fps = 500ms on, 500ms off) and how
+ * often on_tick() re-runs while any task is urgent, fast enough for the
+ * blink transitions to actually land visibly (the normal 2000ms fallback
+ * poll below is far too coarse for that). */
+#define TASKLIST_URGENT_BLINK_PERIOD_MS 500
+#define TASKLIST_URGENT_TICK_MS 150
 
 typedef struct {
     Window win;
@@ -50,6 +56,11 @@ typedef struct {
      * per-tick icon cleanup in tasklist_on_tick() -- see that loop's
      * is_placeholder check). */
     int is_placeholder;
+    /* 1 if the window is demanding attention (_NET_WM_STATE_DEMANDS_
+     * ATTENTION or the legacy ICCCM XUrgencyHint -- see
+     * ewmh_get_urgent()). Drives tasklist_paint()'s bold title + 2fps
+     * hover-blink; never set on a placeholder (no real window to ask). */
+    int urgent;
     cairo_surface_t *icon;
     /* 1 once a .desktop-entry icon fallback lookup has been attempted for
      * this window (see tasklist_on_tick()'s icon fallback) -- carried
@@ -164,6 +175,7 @@ static unsigned long tasklist_display_sig(TasklistPriv *tp, Window active)
         SIG_MIX(e->minimized);
         SIG_MIX(e->maximized);
         SIG_MIX(e->pinned);
+        SIG_MIX(e->urgent);
         SIG_MIX_INT((uintptr_t)e->icon);
     }
 #undef SIG_MIX
@@ -397,8 +409,26 @@ static int tasklist_on_tick(PanelWidget *w, uint64_t now)
     if (n > MAX_TASKS) {
         n = MAX_TASKS;
     }
-
-    int current_desktop = tp->same_desktop_only ? ewmh_get_current_desktop() : -1;
+    /* Suppresses the urgent look for whichever window is already focused,
+     * regardless of what its own _NET_WM_STATE_DEMANDS_ATTENTION/
+     * XUrgencyHint says -- not every app is diligent about clearing it the
+     * instant it's actually focused, and "already looking at it" should
+     * always read as attended-to. Under kiwm, "active" here already means
+     * "active *and* actually visible on this panel's own current output/
+     * desktop" -- see ewmh_resolve_active_for_output()'s doc comment --
+     * not just whatever _NET_ACTIVE_WINDOW says globally, which can be a
+     * window on a different output or a desktop that isn't current right
+     * now. kiwm_output_idx/current_desktop come back from the same call so
+     * the same_desktop_only filter below doesn't need a second query. */
+    int kiwm_output_idx = -1;
+    int current_desktop = -1;
+    Window active_now = ewmh_resolve_active_for_output(w->panel->output, &kiwm_output_idx, &current_desktop);
+    /* _NET_CURRENT_DESKTOP doesn't exist under kiwm (it mirrors only the
+     * primary output, per kiwm/PROTOCOL.md) -- ewmh_get_current_desktop()
+     * would return -1 and silently disable this filter entirely. */
+    if (tp->same_desktop_only && kiwm_output_idx < 0) {
+        current_desktop = ewmh_get_current_desktop();
+    }
 
     TaskEntry real_windows[MAX_TASKS];
     int n_real = 0;
@@ -412,9 +442,18 @@ static int tasklist_on_tick(PanelWidget *w, uint64_t now)
         int minimized, maximized;
         ewmh_get_state_flags(win, &minimized, &maximized);
         /* current_desktop == -1 means either the filter is off, or no WM
-         * ever set _NET_CURRENT_DESKTOP -- either way, don't filter. */
-        if (tp->same_desktop_only && current_desktop >= 0 && desktop >= 0 && desktop != current_desktop) {
-            continue;
+         * ever set _NET_CURRENT_DESKTOP -- either way, don't filter. Under
+         * kiwm (kiwm_output_idx >= 0), _NET_WM_DESKTOP is only unique
+         * within a window's own output, so the filter also requires
+         * _KIWM_WM_OUTPUT to match this panel's output. */
+        if (tp->same_desktop_only && current_desktop >= 0 && desktop >= 0) {
+            if (kiwm_output_idx >= 0) {
+                if (ewmh_kiwm_get_wm_output(win) != kiwm_output_idx || desktop != current_desktop) {
+                    continue;
+                }
+            } else if (desktop != current_desktop) {
+                continue;
+            }
         }
         if (tp->same_output_only && !ewmh_window_in_rect(win, w->panel->out_x, w->panel->out_y, w->panel->out_w,
                                                            w->panel->out_h)) {
@@ -432,6 +471,7 @@ static int tasklist_on_tick(PanelWidget *w, uint64_t now)
         e->desktop = desktop;
         e->minimized = minimized;
         e->maximized = maximized;
+        e->urgent = win != active_now && ewmh_get_urgent(win);
         if (old_idx >= 0) {
             e->icon = tp->tasks[old_idx].icon; /* ownership moves to `real_windows` */
             tp->tasks[old_idx].icon = NULL;
@@ -543,11 +583,25 @@ static int tasklist_on_tick(PanelWidget *w, uint64_t now)
     tp->n_tasks = n_fresh;
     tp->n_desktops = ewmh_get_number_of_desktops();
 
-    /* Repaint only when the drawn task state actually changed -- the
-     * active window (highlight) is fetched here purely for the signature,
-     * matching what tasklist_paint() reads. */
-    unsigned long sig = tasklist_display_sig(tp, ewmh_get_active_window());
-    if (sig == tp->last_sig) {
+    int any_urgent = 0;
+    for (int i = 0; i < tp->n_tasks; i++) {
+        if (tp->tasks[i].urgent) {
+            any_urgent = 1;
+            break;
+        }
+    }
+    if (any_urgent) {
+        /* Force a repaint every fast tick regardless of the signature
+         * below -- the blink phase (see tasklist_paint()) changes even
+         * when nothing else about the drawn state does. */
+        w->next_tick_ms = now + TASKLIST_URGENT_TICK_MS;
+    }
+
+    /* Repaint only when the drawn task state actually changed -- reuses
+     * the same active_now resolved above so this matches exactly what
+     * tasklist_paint() will highlight. */
+    unsigned long sig = tasklist_display_sig(tp, active_now);
+    if (sig == tp->last_sig && !any_urgent) {
         return 0;
     }
     tp->last_sig = sig;
@@ -575,9 +629,9 @@ static int tasklist_on_tick(PanelWidget *w, uint64_t now)
  * shows) is the group's currently-active window if it has one, else
  * simply the first member found -- so focusing a different window of an
  * already-grouped app updates what the button displays. */
-static void tasklist_build_display(TasklistPriv *tp)
+static void tasklist_build_display(TasklistPriv *tp, const char *output_name)
 {
-    Window active = tp->group_apps ? ewmh_get_active_window() : None;
+    Window active = tp->group_apps ? ewmh_resolve_active_for_output(output_name, NULL, NULL) : None;
     int assigned[MAX_TASKS] = {0};
     tp->n_display = 0;
 
@@ -627,7 +681,7 @@ static void tasklist_measure(PanelWidget *w, int cross_axis, int *out_len, int *
     TasklistPriv *tp = w->priv;
     Panel *p = w->panel;
     int icon_px = icon_size_for(cross_axis, tp->icon_padding);
-    tasklist_build_display(tp);
+    tasklist_build_display(tp, p->output);
     int cursor = 0;
     for (int d = 0; d < tp->n_display; d++) {
         TaskEntry *e = &tp->tasks[tp->display_repr[d]];
@@ -901,7 +955,7 @@ static void tasklist_paint(PanelWidget *w, cairo_t *cr)
 
     tasklist_layout_visible(w);
 
-    Window active = ewmh_get_active_window();
+    Window active = ewmh_resolve_active_for_output(p->output, NULL, NULL);
     int icon_px = icon_size_for(w->thickness, tp->icon_padding);
     int icon_y = oy + (w->thickness - icon_px) / 2;
     /* Root-window-space mapping for _NET_WM_ICON_GEOMETRY below. Uses the
@@ -931,12 +985,21 @@ static void tasklist_paint(PanelWidget *w, cairo_t *cr)
         /* Hover feedback drawn first, active-window highlight on top of
          * it -- both are the same fg-colored translucent rect, layering
          * just makes an active *and* hovered button a bit more opaque
-         * rather than fighting for the same pixels. */
-        if (has_hover && hover_local_x >= tp->vis_x[vi] && hover_local_x < tp->vis_x[vi] + bw) {
+         * rather than fighting for the same pixels. An urgent task blinks
+         * the same hover look at 2fps regardless of the real pointer
+         * position -- see ewmh_get_urgent()/TASKLIST_URGENT_BLINK_PERIOD_MS. */
+        int real_hover = has_hover && hover_local_x >= tp->vis_x[vi] && hover_local_x < tp->vis_x[vi] + bw;
+        int urgent_blink_on = e->urgent && (now_ms() / TASKLIST_URGENT_BLINK_PERIOD_MS) % 2 == 0;
+        if (real_hover || urgent_blink_on) {
             widget_paint_hover_rect(w, cr, tp->vis_x[vi], bw);
         }
 
-        if (e->win == active) {
+        /* active != None guards against every placeholder (pinned-but-
+         * not-running app, win == None) matching at once whenever nothing
+         * actually has focus -- e.g. right after switching to an empty
+         * desktop -- which would otherwise paint this same highlight on
+         * every one of them simultaneously. */
+        if (active != None && e->win == active) {
             cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.18);
             cairo_rectangle(cr, bx, oy, bw, w->thickness);
             cairo_fill(cr);
@@ -963,8 +1026,8 @@ static void tasklist_paint(PanelWidget *w, cairo_t *cr)
              * font doesn't cover still renders instead of showing tofu
              * boxes. See pango_text.c. */
             cairo_set_source_rgba(cr, p->fg_r, p->fg_g, p->fg_b, 0.95);
-            pango_show_text_boxed(cr, bx + icon_px + 10, oy, w->thickness, bw - icon_px - 16, panel_text_size(p),
-                                   e->title, NULL);
+            pango_show_text_boxed_bold(cr, bx + icon_px + 10, oy, w->thickness, bw - icon_px - 16, panel_text_size(p),
+                                        e->title, e->urgent, NULL);
         }
         if (tp->show_desktop_badge && tp->n_desktops > 1 && e->desktop >= 0) {
             char badge[16];
